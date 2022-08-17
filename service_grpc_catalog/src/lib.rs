@@ -135,12 +135,12 @@ mod tests {
             let mut repos = catalog.repositories().await;
             let kafka = repos
                 .kafka_topics()
-                .create_or_get("iox_shared")
+                .create_or_get("iox-shared")
                 .await
                 .unwrap();
             let pool = repos
                 .query_pools()
-                .create_or_get("iox_shared")
+                .create_or_get("iox-shared")
                 .await
                 .unwrap();
             let sequencer = repos
@@ -216,12 +216,12 @@ mod tests {
             let mut repos = catalog.repositories().await;
             let kafka = repos
                 .kafka_topics()
-                .create_or_get("iox_shared")
+                .create_or_get("iox-shared")
                 .await
                 .unwrap();
             let pool = repos
                 .query_pools()
-                .create_or_get("iox_shared")
+                .create_or_get("iox-shared")
                 .await
                 .unwrap();
             let sequencer = repos
