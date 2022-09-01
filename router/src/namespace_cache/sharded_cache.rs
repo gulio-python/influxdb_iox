@@ -12,10 +12,10 @@ pub struct ShardedCache<T> {
 impl<T> ShardedCache<T> {
     /// initialise a [`ShardedCache`] splitting the keyspace over the given
     /// instances of `T`.
-    pub fn new(shards: impl IntoIterator<Item = T>) -> Result<Self, sharder::Error> {
-        Ok(Self {
-            shards: JumpHash::new(shards)?,
-        })
+    pub fn new(shards: impl IntoIterator<Item = T>) -> Self {
+        Self {
+            shards: JumpHash::new(shards),
+        }
     }
 }
 
@@ -40,7 +40,7 @@ where
 mod tests {
     use super::*;
     use crate::namespace_cache::MemoryNamespaceCache;
-    use data_types::{KafkaTopicId, NamespaceId, QueryPoolId};
+    use data_types::{NamespaceId, QueryPoolId, TopicId};
     use rand::{distributions::Alphanumeric, thread_rng, Rng};
     use std::{collections::HashMap, iter};
 
@@ -57,7 +57,7 @@ mod tests {
     fn schema_with_id(id: i64) -> NamespaceSchema {
         NamespaceSchema {
             id: NamespaceId::new(id),
-            kafka_topic_id: KafkaTopicId::new(1),
+            topic_id: TopicId::new(1),
             query_pool_id: QueryPoolId::new(1),
             tables: Default::default(),
         }
@@ -71,12 +71,9 @@ mod tests {
         // The number of shards to hash into.
         const SHARDS: usize = 10;
 
-        let cache = Arc::new(
-            ShardedCache::new(
-                iter::repeat_with(|| Arc::new(MemoryNamespaceCache::default())).take(SHARDS),
-            )
-            .unwrap(),
-        );
+        let cache = Arc::new(ShardedCache::new(
+            iter::repeat_with(|| Arc::new(MemoryNamespaceCache::default())).take(SHARDS),
+        ));
 
         // Build a set of namespace -> unique integer to validate the shard
         // mapping later.

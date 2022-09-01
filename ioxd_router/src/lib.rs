@@ -25,10 +25,14 @@ use router::{
     namespace_cache::{
         metrics::InstrumentedCache, MemoryNamespaceCache, NamespaceCache, ShardedCache,
     },
-    sequencer::Sequencer,
-    server::{grpc::GrpcDelegate, http::HttpDelegate, RouterServer},
+    server::{
+        grpc::{sharder::ShardService, GrpcDelegate},
+        http::HttpDelegate,
+        RouterServer,
+    },
+    shard::Shard,
 };
-use sharder::JumpHash;
+use sharder::{JumpHash, Sharder};
 use std::{
     collections::BTreeSet,
     fmt::{Debug, Display},
@@ -50,20 +54,26 @@ pub enum Error {
     #[error("Catalog DSN error: {0}")]
     CatalogDsn(#[from] clap_blocks::catalog_dsn::Error),
 
-    #[error("failed to initialize sharded cache: {0}")]
-    Sharder(#[from] sharder::Error),
+    #[error("No shards found in Catalog")]
+    Sharder,
+
+    #[error("No topic named '{topic_name}' found in the catalog")]
+    TopicCatalogLookup { topic_name: String },
+
+    #[error("Failed to init shard grpc service: {0}")]
+    ShardServiceInit(iox_catalog::interface::Error),
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-pub struct RouterServerType<D> {
-    server: RouterServer<D>,
+pub struct RouterServerType<D, S> {
+    server: RouterServer<D, S>,
     shutdown: CancellationToken,
     trace_collector: Option<Arc<dyn TraceCollector>>,
 }
 
-impl<D> RouterServerType<D> {
-    pub fn new(server: RouterServer<D>, common_state: &CommonServerState) -> Self {
+impl<D, S> RouterServerType<D, S> {
+    pub fn new(server: RouterServer<D, S>, common_state: &CommonServerState) -> Self {
         Self {
             server,
             shutdown: CancellationToken::new(),
@@ -72,16 +82,17 @@ impl<D> RouterServerType<D> {
     }
 }
 
-impl<D> std::fmt::Debug for RouterServerType<D> {
+impl<D, S> std::fmt::Debug for RouterServerType<D, S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Router")
     }
 }
 
 #[async_trait]
-impl<D> ServerType for RouterServerType<D>
+impl<D, S> ServerType for RouterServerType<D, S>
 where
     D: DmlHandler<WriteInput = HashMap<String, MutableBatch>, WriteOutput = WriteSummary> + 'static,
+    S: Sharder<(), Item = Arc<Shard>> + Clone + 'static,
 {
     /// Return the [`metric::Registry`] used by the router.
     fn metric_registry(&self) -> Arc<Registry> {
@@ -117,6 +128,7 @@ where
         add_service!(builder, self.server.grpc().schema_service());
         add_service!(builder, self.server.grpc().catalog_service());
         add_service!(builder, self.server.grpc().object_store_service());
+        add_service!(builder, self.server.grpc().shard_service());
         serve_builder!(builder);
 
         Ok(())
@@ -163,7 +175,7 @@ pub async fn create_router_server_type(
 ) -> Result<Arc<dyn ServerType>> {
     // Initialise the sharded write buffer and instrument it with DML handler
     // metrics.
-    let write_buffer = init_write_buffer(
+    let (write_buffer, sharder) = init_write_buffer(
         write_buffer_config,
         Arc::clone(&metrics),
         common_state.trace_collector(),
@@ -178,7 +190,7 @@ pub async fn create_router_server_type(
     let ns_cache = Arc::new(InstrumentedCache::new(
         Arc::new(ShardedCache::new(
             std::iter::repeat_with(|| Arc::new(MemoryNamespaceCache::default())).take(10),
-        )?),
+        )),
         &*metrics,
     ));
 
@@ -203,12 +215,12 @@ pub async fn create_router_server_type(
     //
     // THIS CODE IS FOR TESTING ONLY.
     //
-    // The source of truth for the kafka topics & query pools will be read from
+    // The source of truth for the topics & query pools will be read from
     // the DB, rather than CLI args for a prod deployment.
     //
     ////////////////////////////////////////////////////////////////////////////
     //
-    // Look up the kafka topic ID needed to populate namespace creation
+    // Look up the topic ID needed to populate namespace creation
     // requests.
     //
     // This code / auto-creation is for architecture testing purposes only - a
@@ -217,16 +229,11 @@ pub async fn create_router_server_type(
     let schema_catalog = Arc::clone(&catalog);
     let mut txn = catalog.start_transaction().await?;
     let topic_id = txn
-        .kafka_topics()
+        .topics()
         .get_by_name(write_buffer_config.topic())
         .await?
         .map(|v| v.id)
-        .unwrap_or_else(|| {
-            panic!(
-                "no kafka topic named {} in catalog",
-                write_buffer_config.topic()
-            )
-        });
+        .unwrap_or_else(|| panic!("no topic named {} in catalog", write_buffer_config.topic()));
     let query_id = txn
         .query_pools()
         .create_or_get(query_pool_name)
@@ -242,7 +249,7 @@ pub async fn create_router_server_type(
     txn.commit().await?;
 
     let ns_creator = NamespaceAutocreation::new(
-        catalog,
+        Arc::clone(&catalog),
         ns_cache,
         topic_id,
         query_id,
@@ -274,6 +281,9 @@ pub async fn create_router_server_type(
     // Record the overall request handling latency
     let handler_stack = InstrumentationDecorator::new("request", &*metrics, handler_stack);
 
+    // Initialise the shard-mapping gRPC service.
+    let shard_service = init_shard_service(sharder, write_buffer_config, catalog).await?;
+
     // Initialise the API delegates, sharing the handler stack between them.
     let handler_stack = Arc::new(handler_stack);
     let http = HttpDelegate::new(
@@ -287,6 +297,7 @@ pub async fn create_router_server_type(
         schema_catalog,
         object_store,
         Arc::clone(&metrics),
+        shard_service,
     );
 
     let router_server = RouterServer::new(http, grpc, metrics, common_state.trace_collector());
@@ -297,23 +308,28 @@ pub async fn create_router_server_type(
 /// Initialise the [`ShardedWriteBuffer`] with one shard per Kafka partition,
 /// using [`JumpHash`] to shard operations by their destination namespace &
 /// table name.
+///
+/// Returns both the DML handler and the sharder it uses.
 async fn init_write_buffer(
     write_buffer_config: &WriteBufferConfig,
     metrics: Arc<metric::Registry>,
     trace_collector: Option<Arc<dyn TraceCollector>>,
-) -> Result<ShardedWriteBuffer<JumpHash<Arc<Sequencer>>>> {
+) -> Result<(
+    ShardedWriteBuffer<Arc<JumpHash<Arc<Shard>>>>,
+    Arc<JumpHash<Arc<Shard>>>,
+)> {
     let write_buffer = Arc::new(
         write_buffer_config
             .writing(Arc::clone(&metrics), trace_collector)
             .await?,
     );
 
-    // Construct the (ordered) set of sequencers.
+    // Construct the (ordered) set of shards.
     //
     // The sort order must be deterministic in order for all nodes to shard to
-    // the same sequencers, therefore we type assert the returned set is of the
+    // the same shard indexes, therefore we type assert the returned set is of the
     // ordered variety.
-    let shards: BTreeSet<_> = write_buffer.sequencer_ids();
+    let shards: BTreeSet<_> = write_buffer.shard_indexes();
     //          ^ don't change this to an unordered set
 
     info!(
@@ -322,12 +338,44 @@ async fn init_write_buffer(
         "connected to write buffer topic",
     );
 
-    Ok(ShardedWriteBuffer::new(JumpHash::new(
+    if shards.is_empty() {
+        return Err(Error::Sharder);
+    }
+
+    // Initialise the sharder that maps (table, namespace, payload) to shards.
+    let sharder = Arc::new(JumpHash::new(
         shards
             .into_iter()
-            .map(|id| Sequencer::new(id as _, Arc::clone(&write_buffer), &metrics))
+            .map(|shard_index| Shard::new(shard_index, Arc::clone(&write_buffer), &metrics))
             .map(Arc::new),
-    )?))
+    ));
+
+    Ok((ShardedWriteBuffer::new(Arc::clone(&sharder)), sharder))
+}
+
+async fn init_shard_service<S>(
+    sharder: S,
+    write_buffer_config: &WriteBufferConfig,
+    catalog: Arc<dyn Catalog>,
+) -> Result<ShardService<S>>
+where
+    S: Send + Sync,
+{
+    // Get the TopicMetadata from the catalog for the configured topic.
+    let topic = catalog
+        .repositories()
+        .await
+        .topics()
+        .get_by_name(write_buffer_config.topic())
+        .await?
+        .ok_or_else(|| Error::TopicCatalogLookup {
+            topic_name: write_buffer_config.topic().to_string(),
+        })?;
+
+    // Initialise the sharder
+    ShardService::new(sharder, topic, catalog)
+        .await
+        .map_err(Error::ShardServiceInit)
 }
 
 /// Pre-populate `cache` with the all existing schemas in `catalog`.
@@ -362,11 +410,11 @@ mod tests {
         let catalog = Arc::new(MemCatalog::new(Default::default()));
 
         let mut repos = catalog.repositories().await;
-        let kafka = repos.kafka_topics().create_or_get("foo").await.unwrap();
+        let topic = repos.topics().create_or_get("foo").await.unwrap();
         let pool = repos.query_pools().create_or_get("foo").await.unwrap();
         let namespace = repos
             .namespaces()
-            .create("test_ns", "inf", kafka.id, pool.id)
+            .create("test_ns", "inf", topic.id, pool.id)
             .await
             .unwrap();
 

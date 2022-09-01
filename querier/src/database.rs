@@ -6,13 +6,13 @@ use crate::{
 };
 use async_trait::async_trait;
 use backoff::{Backoff, BackoffConfig};
-use data_types::{KafkaPartition, Namespace};
+use data_types::{Namespace, ShardIndex};
 use iox_catalog::interface::Catalog;
 use iox_query::exec::Executor;
 use parquet_file::storage::ParquetStorage;
 use service_common::QueryDatabaseProvider;
 use sharder::JumpHash;
-use snafu::{ResultExt, Snafu};
+use snafu::Snafu;
 use std::{collections::BTreeSet, sync::Arc};
 use trace::span::{Span, SpanRecorder};
 use tracker::{
@@ -31,9 +31,8 @@ pub enum Error {
     Catalog {
         source: iox_catalog::interface::Error,
     },
-
-    #[snafu(display("Sharder error: {source}"))]
-    Sharder { source: sharder::Error },
+    #[snafu(display("No shards loaded"))]
+    NoShards,
 }
 
 /// Database for the querier.
@@ -71,7 +70,7 @@ pub struct QuerierDatabase {
     query_execution_semaphore: Arc<InstrumentedAsyncSemaphore>,
 
     /// Sharder to determine which ingesters to query for a particular table and namespace.
-    sharder: Arc<JumpHash<Arc<KafkaPartition>>>,
+    sharder: Arc<JumpHash<Arc<ShardIndex>>>,
 
     /// Max combined chunk size for all chunks returned to the query subsystem by a single table.
     max_table_query_bytes: usize,
@@ -165,10 +164,10 @@ impl QuerierDatabase {
     pub async fn namespace(&self, name: &str, span: Option<Span>) -> Option<Arc<QuerierNamespace>> {
         let span_recorder = SpanRecorder::new(span);
         let name = Arc::from(name.to_owned());
-        let schema = self
+        let ns = self
             .catalog_cache
             .namespace()
-            .schema(
+            .get(
                 Arc::clone(&name),
                 // we have no specific need for any tables or columns at this point, so nothing to cover
                 &[],
@@ -177,7 +176,7 @@ impl QuerierDatabase {
             .await?;
         Some(Arc::new(QuerierNamespace::new(
             Arc::clone(&self.chunk_adapter),
-            schema,
+            ns,
             name,
             Arc::clone(&self.exec),
             self.ingester_connection.clone(),
@@ -213,26 +212,30 @@ impl QuerierDatabase {
 pub async fn create_sharder(
     catalog: &dyn Catalog,
     backoff_config: BackoffConfig,
-) -> Result<JumpHash<Arc<KafkaPartition>>, Error> {
-    let sequencers = Backoff::new(&backoff_config)
-        .retry_all_errors("get sequencers", || async {
-            catalog.repositories().await.sequencers().list().await
+) -> Result<JumpHash<Arc<ShardIndex>>, Error> {
+    let shards = Backoff::new(&backoff_config)
+        .retry_all_errors("get shards", || async {
+            catalog.repositories().await.shards().list().await
         })
         .await
         .expect("retry forever");
 
-    // Construct the (ordered) set of sequencers.
+    // Construct the (ordered) set of shard indexes.
     //
     // The sort order must be deterministic in order for all nodes to shard to
-    // the same sequencers, therefore we type assert the returned set is of the
+    // the same indexes, therefore we type assert the returned set is of the
     // ordered variety.
-    let shards: BTreeSet<_> = sequencers
-        //          ^ don't change this to an unordered set
+    let shard_indexes: BTreeSet<_> = shards
+        //             ^ don't change this to an unordered set
         .into_iter()
-        .map(|sequencer| sequencer.kafka_partition)
+        .map(|shard| shard.shard_index)
         .collect();
 
-    JumpHash::new(shards.into_iter().map(Arc::new)).context(SharderSnafu)
+    if shard_indexes.is_empty() {
+        return Err(Error::NoShards);
+    }
+
+    Ok(JumpHash::new(shard_indexes.into_iter().map(Arc::new)))
 }
 
 #[cfg(test)]
@@ -241,6 +244,7 @@ mod tests {
     use crate::create_ingester_connection_for_testing;
     use iox_tests::util::TestCatalog;
     use test_helpers::assert_error;
+    use tokio::runtime::Handle;
 
     #[tokio::test]
     #[should_panic(
@@ -253,6 +257,7 @@ mod tests {
             catalog.catalog(),
             catalog.time_provider(),
             catalog.metric_registry(),
+            &Handle::current(),
         ));
         QuerierDatabase::new(
             catalog_cache,
@@ -268,13 +273,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sequencers_in_catalog_are_required_for_startup() {
+    async fn shards_in_catalog_are_required_for_startup() {
         let catalog = TestCatalog::new();
 
         let catalog_cache = Arc::new(CatalogCache::new_testing(
             catalog.catalog(),
             catalog.time_provider(),
             catalog.metric_registry(),
+            &Handle::current(),
         ));
 
         assert_error!(
@@ -288,22 +294,21 @@ mod tests {
                 usize::MAX,
             )
             .await,
-            Error::Sharder {
-                source: sharder::Error::NoShards
-            },
+            Error::NoShards
         );
     }
 
     #[tokio::test]
     async fn test_namespace() {
         let catalog = TestCatalog::new();
-        // QuerierDatabase::new returns an error if there are no sequencers in the catalog
-        catalog.create_sequencer(0).await;
+        // QuerierDatabase::new returns an error if there are no shards in the catalog
+        catalog.create_shard(0).await;
 
         let catalog_cache = Arc::new(CatalogCache::new_testing(
             catalog.catalog(),
             catalog.time_provider(),
             catalog.metric_registry(),
+            &Handle::current(),
         ));
         let db = QuerierDatabase::new(
             catalog_cache,
@@ -326,13 +331,14 @@ mod tests {
     #[tokio::test]
     async fn test_namespaces() {
         let catalog = TestCatalog::new();
-        // QuerierDatabase::new returns an error if there are no sequencers in the catalog
-        catalog.create_sequencer(0).await;
+        // QuerierDatabase::new returns an error if there are no shards in the catalog
+        catalog.create_shard(0).await;
 
         let catalog_cache = Arc::new(CatalogCache::new_testing(
             catalog.catalog(),
             catalog.time_provider(),
             catalog.metric_registry(),
+            &Handle::current(),
         ));
         let db = QuerierDatabase::new(
             catalog_cache,

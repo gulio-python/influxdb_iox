@@ -18,6 +18,7 @@ use schema::{
     builder::SchemaBuilder, sort::SortKey, InfluxColumnType, InfluxFieldType, Schema,
     TIME_COLUMN_NAME,
 };
+use serde::Deserialize;
 use snafu::{ResultExt, Snafu};
 use sqlx::postgres::PgHasArrayType;
 use std::{
@@ -75,13 +76,13 @@ impl std::fmt::Display for NamespaceId {
     }
 }
 
-/// Unique ID for a `KafkaTopic`
+/// Unique ID for a Topic, assigned by the catalog and used in [`TopicMetadata`]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, sqlx::Type)]
 #[sqlx(transparent)]
-pub struct KafkaTopicId(i64);
+pub struct TopicId(i64);
 
 #[allow(missing_docs)]
-impl KafkaTopicId {
+impl TopicId {
     pub fn new(v: i64) -> Self {
         Self(v)
     }
@@ -90,7 +91,7 @@ impl KafkaTopicId {
     }
 }
 
-impl std::fmt::Display for KafkaTopicId {
+impl std::fmt::Display for TopicId {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(f, "{}", self.0)
     }
@@ -153,17 +154,14 @@ impl PgHasArrayType for ColumnId {
     }
 }
 
-/// Unique ID for a `Sequencer`. Note this is NOT the same as the
-/// "sequencer_id" in the `write_buffer` which currently means
-/// "kafka partition".
-///
-/// <https://github.com/influxdata/influxdb_iox/issues/4237>
+/// Unique ID for a `Shard`, assigned by the catalog. Joins to other catalog tables to uniquely
+/// identify shards independently of the underlying write buffer implementation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, sqlx::Type)]
 #[sqlx(transparent)]
-pub struct SequencerId(i64);
+pub struct ShardId(i64);
 
 #[allow(missing_docs)]
-impl SequencerId {
+impl ShardId {
     pub fn new(v: i64) -> Self {
         Self(v)
     }
@@ -172,19 +170,22 @@ impl SequencerId {
     }
 }
 
-impl std::fmt::Display for SequencerId {
+impl std::fmt::Display for ShardId {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(f, "{}", self.0)
     }
 }
 
-/// The kafka partition identifier. This is in the actual Kafka cluster.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, sqlx::Type)]
+/// The index of the shard in the set of shards. When Kafka is used as the write buffer, this is
+/// the Kafka Partition ID. Used by the router and write buffer to shard requests to a particular
+/// index in a set of shards.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, sqlx::Type)]
 #[sqlx(transparent)]
-pub struct KafkaPartition(i32);
+#[serde(transparent)]
+pub struct ShardIndex(i32);
 
 #[allow(missing_docs)]
-impl KafkaPartition {
+impl ShardIndex {
     pub const fn new(v: i32) -> Self {
         Self(v)
     }
@@ -193,22 +194,31 @@ impl KafkaPartition {
     }
 }
 
-impl std::fmt::Display for KafkaPartition {
+impl std::fmt::Display for ShardIndex {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(f, "{}", self.0)
     }
 }
 
-/// Potential configurations of ingester connections for the querier to associate with a sequencer.
+impl std::str::FromStr for ShardIndex {
+    type Err = std::num::ParseIntError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let v: i32 = s.parse()?;
+        Ok(Self(v))
+    }
+}
+
+/// Potential configurations of ingester connections for the querier to associate with a shard.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IngesterMapping {
-    /// Deliberately not mapping this sequencer to an ingester. If the querier gets a query for
-    /// this sequencer, it should return an error.
+    /// Deliberately not mapping this shard to an ingester. If the querier gets a query for
+    /// this shard, it should return an error.
     NotMapped,
-    /// Deliberately not contacting ingesters for this sequencer. If the querier gets a query for
-    /// this sequencer, it should only return persisted data.
+    /// Deliberately not contacting ingesters for this shard. If the querier gets a query for
+    /// this shard, it should only return persisted data.
     Ignore,
-    /// The address of the ingester to contact for this sequencer.
+    /// The address of the ingester to contact for this shard.
     Addr(Arc<str>),
 }
 
@@ -233,12 +243,12 @@ impl std::fmt::Display for PartitionId {
     }
 }
 
-/// Combination of Sequencer ID, Table ID, and Partition ID useful for identifying groups of
+/// Combination of Shard ID, Table ID, and Partition ID useful for identifying groups of
 /// Parquet files to be compacted together.
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Eq, Ord)]
 pub struct TablePartition {
-    /// The sequencer ID
-    pub sequencer_id: SequencerId,
+    /// The shard ID
+    pub shard_id: ShardId,
     /// The table ID
     pub table_id: TableId,
     /// The partition ID
@@ -247,9 +257,9 @@ pub struct TablePartition {
 
 impl TablePartition {
     /// Combine the relevant parts
-    pub fn new(sequencer_id: SequencerId, table_id: TableId, partition_id: PartitionId) -> Self {
+    pub fn new(shard_id: ShardId, table_id: TableId, partition_id: PartitionId) -> Self {
         Self {
-            sequencer_id,
+            shard_id,
             table_id,
             partition_id,
         }
@@ -277,7 +287,7 @@ impl std::fmt::Display for TombstoneId {
     }
 }
 
-/// A sequence number from a `Sequencer` (kafka partition)
+/// A sequence number from a `router::Shard` (kafka partition)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, sqlx::Type)]
 #[sqlx(transparent)]
 pub struct SequenceNumber(i64);
@@ -377,11 +387,12 @@ impl std::fmt::Display for ParquetFileId {
     }
 }
 
-/// Data object for a kafka topic
+/// Data object for a topic. When Kafka is used as the write buffer, this is the Kafka topic name
+/// plus a catalog-assigned ID.
 #[derive(Debug, Clone, Eq, PartialEq, sqlx::FromRow)]
-pub struct KafkaTopic {
+pub struct TopicMetadata {
     /// The id of the topic
-    pub id: KafkaTopicId,
+    pub id: TopicId,
     /// The unique name of the topic
     pub name: String,
 }
@@ -402,11 +413,13 @@ pub struct Namespace {
     pub id: NamespaceId,
     /// The unique name of the namespace
     pub name: String,
-    /// The retention duration as a string. 'inf' or not present represents infinite duration (i.e. never drop data).
+    /// The retention duration as a string. 'inf' or not present represents infinite duration (i.e.
+    /// never drop data).
     #[sqlx(default)]
     pub retention_duration: Option<String>,
-    /// The kafka topic that writes to this namespace will land in
-    pub kafka_topic_id: KafkaTopicId,
+    /// The topic that writes to this namespace will land in
+    #[sqlx(rename = "kafka_topic_id")]
+    pub topic_id: TopicId,
     /// The query pool assigned to answer queries for this namespace
     pub query_pool_id: QueryPoolId,
     /// The maximum number of tables that can exist in this namespace
@@ -421,8 +434,8 @@ pub struct Namespace {
 pub struct NamespaceSchema {
     /// the namespace id
     pub id: NamespaceId,
-    /// the kafka topic this namespace gets data written to
-    pub kafka_topic_id: KafkaTopicId,
+    /// the topic this namespace gets data written to
+    pub topic_id: TopicId,
     /// the query pool assigned to answer queries for this namespace
     pub query_pool_id: QueryPoolId,
     /// the tables in the namespace by name
@@ -431,11 +444,11 @@ pub struct NamespaceSchema {
 
 impl NamespaceSchema {
     /// Create a new `NamespaceSchema`
-    pub fn new(id: NamespaceId, kafka_topic_id: KafkaTopicId, query_pool_id: QueryPoolId) -> Self {
+    pub fn new(id: NamespaceId, topic_id: TopicId, query_pool_id: QueryPoolId) -> Self {
         Self {
             id,
             tables: BTreeMap::new(),
-            kafka_topic_id,
+            topic_id,
             query_pool_id,
         }
     }
@@ -710,16 +723,19 @@ pub fn column_type_from_field(field_value: &FieldValue) -> ColumnType {
     }
 }
 
-/// Data object for a sequencer. Only one sequencer record can exist for a given
-/// kafka topic and partition (enforced via uniqueness constraint).
+/// Data object for a shard. Only one shard record can exist for a given topic and shard
+/// index (enforced via uniqueness constraint).
 #[derive(Debug, Copy, Clone, PartialEq, Eq, sqlx::FromRow)]
-pub struct Sequencer {
-    /// the id of the sequencer
-    pub id: SequencerId,
-    /// the topic the sequencer is reading from
-    pub kafka_topic_id: KafkaTopicId,
-    /// the kafka partition the sequencer is reading from
-    pub kafka_partition: KafkaPartition,
+pub struct Shard {
+    /// the id of the shard, assigned by the catalog
+    pub id: ShardId,
+    /// the topic the shard is reading from
+    #[sqlx(rename = "kafka_topic_id")]
+    pub topic_id: TopicId,
+    /// the shard index of the shard the sequence numbers are coming from, sharded by the router
+    /// and write buffer
+    #[sqlx(rename = "kafka_partition")]
+    pub shard_index: ShardIndex,
     /// The minimum unpersisted sequence number. Because different tables
     /// can be persisted at different times, it is possible some data has been persisted
     /// with a higher sequence number than this. However, all data with a sequence number
@@ -784,14 +800,15 @@ impl sqlx::Decode<'_, sqlx::Postgres> for PartitionKey {
     }
 }
 
-/// Data object for a partition. The combination of sequencer, table and key are unique (i.e. only
+/// Data object for a partition. The combination of shard, table and key are unique (i.e. only
 /// one record can exist for each combo)
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
 pub struct Partition {
     /// the id of the partition
     pub id: PartitionId,
-    /// the sequencer the data in the partition arrived from
-    pub sequencer_id: SequencerId,
+    /// the shard the data in the partition arrived from
+    #[sqlx(rename = "sequencer_id")]
+    pub shard_id: ShardId,
     /// the table the partition is under
     pub table_id: TableId,
     /// the string key of the partition
@@ -849,8 +866,9 @@ pub struct PartitionInfo {
 pub struct PartitionParam {
     /// the partition
     pub partition_id: PartitionId,
-    /// the partition's sequencer
-    pub sequencer_id: SequencerId,
+    /// the partition's shard
+    #[sqlx(rename = "sequencer_id")]
+    pub shard_id: ShardId,
     /// the partition's namespace
     pub namespace_id: NamespaceId,
     /// the partition's table
@@ -864,9 +882,10 @@ pub struct Tombstone {
     pub id: TombstoneId,
     /// the table the tombstone is associated with
     pub table_id: TableId,
-    /// the sequencer the tombstone was sent through
-    pub sequencer_id: SequencerId,
-    /// the sequence nubmer assigned to the tombstone from the sequencer
+    /// the shard the tombstone was sent through
+    #[sqlx(rename = "sequencer_id")]
+    pub shard_id: ShardId,
+    /// the sequence number assigned to the tombstone from the `router::Shard`
     pub sequence_number: SequenceNumber,
     /// the min time (inclusive) that the delete applies to
     pub min_time: Timestamp,
@@ -880,6 +899,24 @@ impl Tombstone {
     /// Estimate the memory consumption of this object and its contents
     pub fn size(&self) -> usize {
         std::mem::size_of_val(self) + self.serialized_predicate.capacity()
+    }
+}
+/// Map of a column type to its count
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, sqlx::FromRow)]
+pub struct ColumnTypeCount {
+    /// column type
+    pub col_type: i16,
+    /// count of the column type
+    pub count: i64,
+}
+
+impl ColumnTypeCount {
+    /// make a new ColumnTypeCount
+    pub fn new(col_type: ColumnType, count: i64) -> Self {
+        Self {
+            col_type: col_type as i16,
+            count,
+        }
     }
 }
 
@@ -937,8 +974,9 @@ impl Deref for ColumnSet {
 pub struct ParquetFile {
     /// the id of the file in the catalog
     pub id: ParquetFileId,
-    /// the sequencer that sequenced writes that went into this file
-    pub sequencer_id: SequencerId,
+    /// the shard that sequenced writes that went into this file
+    #[sqlx(rename = "sequencer_id")]
+    pub shard_id: ShardId,
     /// the namespace
     pub namespace_id: NamespaceId,
     /// the table
@@ -1003,8 +1041,8 @@ impl ParquetFile {
 /// Data for a parquet file to be inserted into the catalog.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParquetFileParams {
-    /// the sequencer that sequenced writes that went into this file
-    pub sequencer_id: SequencerId,
+    /// the shard that sequenced writes that went into this file
+    pub shard_id: ShardId,
     /// the namespace
     pub namespace_id: NamespaceId,
     /// the table
@@ -2059,20 +2097,20 @@ impl TableSummary {
     }
 }
 
-/// Kafka partition ID plus offset
+/// Shard index plus offset
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub struct Sequence {
-    /// The sequencer id (kafka partition id)
-    pub sequencer_id: u32,
-    /// The sequence number (kafka offset)
+    /// The shard index
+    pub shard_index: ShardIndex,
+    /// The sequence number
     pub sequence_number: SequenceNumber,
 }
 
 impl Sequence {
     /// Create a new Sequence
-    pub fn new(sequencer_id: u32, sequence_number: SequenceNumber) -> Self {
+    pub fn new(shard_index: ShardIndex, sequence_number: SequenceNumber) -> Self {
         Self {
-            sequencer_id,
+            shard_index,
             sequence_number,
         }
     }
@@ -2201,10 +2239,10 @@ impl TimestampMinMax {
 
 /// Specifies the status of data in the ingestion process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KafkaPartitionWriteStatus {
-    /// Nothing is known about this write (e.g. it refers to a kafka
-    /// partition for which we have no information)
-    KafkaPartitionUnknown,
+pub enum ShardWriteStatus {
+    /// Nothing is known about this write (e.g. it refers to a shard for which we have no
+    /// information)
+    ShardUnknown,
     /// The data has not yet been processed by the ingester, and thus is unreadable
     Durable,
     /// The data is readable, but not yet persisted
@@ -3275,13 +3313,13 @@ mod tests {
     fn test_namespace_schema_size() {
         let schema1 = NamespaceSchema {
             id: NamespaceId::new(1),
-            kafka_topic_id: KafkaTopicId::new(2),
+            topic_id: TopicId::new(2),
             query_pool_id: QueryPoolId::new(3),
             tables: BTreeMap::from([]),
         };
         let schema2 = NamespaceSchema {
             id: NamespaceId::new(1),
-            kafka_topic_id: KafkaTopicId::new(2),
+            topic_id: TopicId::new(2),
             query_pool_id: QueryPoolId::new(3),
             tables: BTreeMap::from([(String::from("foo"), TableSchema::new(TableId::new(1)))]),
         };

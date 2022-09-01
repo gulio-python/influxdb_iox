@@ -3,22 +3,22 @@
 use crate::handler::CompactorConfig;
 use backoff::BackoffConfig;
 use data_types::{
-    Namespace, NamespaceId, PartitionId, PartitionKey, PartitionParam, SequencerId, Table, TableId,
-    TableSchema,
+    ColumnTypeCount, Namespace, NamespaceId, PartitionId, PartitionKey, PartitionParam, ShardId,
+    Table, TableId, TableSchema,
 };
 use iox_catalog::interface::{get_schema_by_id, Catalog};
 use iox_query::exec::Executor;
 use iox_time::TimeProvider;
 use metric::{
-    Attributes, DurationHistogram, DurationHistogramOptions, Metric, U64Counter, U64Gauge,
-    DURATION_MAX,
+    Attributes, DurationHistogram, DurationHistogramOptions, Metric, U64Gauge, U64Histogram,
+    U64HistogramOptions, DURATION_MAX,
 };
 use observability_deps::tracing::debug;
 use parquet_file::storage::ParquetStorage;
 use schema::sort::SortKey;
 use snafu::{OptionExt, ResultExt, Snafu};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     sync::Arc,
     time::Duration,
 };
@@ -33,6 +33,11 @@ pub enum Error {
 
     #[snafu(display("Error querying table {}", source))]
     QueryingTable {
+        source: iox_catalog::interface::Error,
+    },
+
+    #[snafu(display("Error querying column {}", source))]
+    QueryingColumn {
         source: iox_catalog::interface::Error,
     },
 
@@ -51,23 +56,23 @@ pub enum Error {
     NamespaceNotFound { namespace_id: NamespaceId },
 
     #[snafu(display(
-        "Error getting the most recent highest ingested throughput partitions for sequencer {}. {}",
-        sequencer_id,
+        "Error getting the most recent highest ingested throughput partitions for shard {}. {}",
+        shard_id,
         source
     ))]
     HighestThroughputPartitions {
         source: iox_catalog::interface::Error,
-        sequencer_id: SequencerId,
+        shard_id: ShardId,
     },
 
     #[snafu(display(
-        "Error getting the most level 0 file partitions for sequencer {}. {}",
-        sequencer_id,
+        "Error getting the most level 0 file partitions for shard {}. {}",
+        shard_id,
         source
     ))]
     MostL0Partitions {
         source: iox_catalog::interface::Error,
-        sequencer_id: SequencerId,
+        shard_id: ShardId,
     },
 }
 
@@ -77,8 +82,8 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// Data points needed to run a compactor
 #[derive(Debug)]
 pub struct Compactor {
-    /// Sequencers assigned to this compactor
-    sequencers: Vec<SequencerId>,
+    /// Shards assigned to this compactor
+    shards: Vec<ShardId>,
 
     /// Object store for reading and persistence of parquet files
     pub(crate) store: ParquetStorage,
@@ -98,20 +103,21 @@ pub struct Compactor {
     /// Configuration options for the compactor
     pub(crate) config: CompactorConfig,
 
-    /// Counter for the number of files compacted
-    pub(crate) compaction_counter: Metric<U64Counter>,
-
-    /// Gauge for the number of compaction partition candidates
+    /// Gauge for the number of compaction partition candidates before filtering
     compaction_candidate_gauge: Metric<U64Gauge>,
 
-    /// Gauge for the number of Parquet file candidates. The recorded values have attributes for
-    /// the compaction level of the file and whether the file was selected for compaction or not.
+    /// Gauge for the number of Parquet file candidates after filtering. The recorded values have
+    /// attributes for the compaction level of the file and whether the file was selected for
+    /// compaction or not.
     pub(crate) parquet_file_candidate_gauge: Metric<U64Gauge>,
 
-    /// Gauge for the number of bytes of Parquet file candidates. The recorded values have
-    /// attributes for  the compaction level of the file and whether the file was selected for
-    /// compaction or not.
-    pub(crate) parquet_file_candidate_bytes_gauge: Metric<U64Gauge>,
+    /// Histogram for the number of bytes of Parquet files selected for compaction. The recorded
+    /// values have attributes for the compaction level of the file.
+    pub(crate) parquet_file_candidate_bytes: Metric<U64Histogram>,
+
+    /// After a successful compaction operation, track the sizes of the files that were used as the
+    /// inputs of the compaction operation by compaction level.
+    pub(crate) compaction_input_file_bytes: Metric<U64Histogram>,
 
     /// Histogram for tracking the time to compact a partition
     pub(crate) compaction_duration: Metric<DurationHistogram>,
@@ -119,8 +125,8 @@ pub struct Compactor {
     /// Histogram for tracking time to select partition candidates to compact.
     /// Even though we choose partitions to compact, we have to read parquet_file catalog
     /// table to see which partitions have the most recent L0 files. This time is for tracking
-    /// reading that. This includes time to get candidates for all sequencers
-    /// this compactor manages and for each sequencer the process invokes
+    /// reading that. This includes time to get candidates for all shard
+    /// this compactor manages and for each shard the process invokes
     /// at most 3 three different SQLs and at least one.
     /// The expectation is small (a second or less) otherwise we have to improve it
     pub(crate) candidate_selection_duration: Metric<DurationHistogram>,
@@ -143,7 +149,7 @@ impl Compactor {
     /// Initialize the Compactor Data
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        sequencers: Vec<SequencerId>,
+        shards: Vec<ShardId>,
         catalog: Arc<dyn Catalog>,
         store: ParquetStorage,
         exec: Arc<Executor>,
@@ -152,11 +158,6 @@ impl Compactor {
         config: CompactorConfig,
         registry: Arc<metric::Registry>,
     ) -> Self {
-        let compaction_counter = registry.register_metric(
-            "compactor_compacted_files_total",
-            "counter for the number of files compacted",
-        );
-
         let compaction_candidate_gauge = registry.register_metric(
             "compactor_candidates",
             "gauge for the number of compaction candidates that are found when checked",
@@ -167,9 +168,25 @@ impl Compactor {
             "Number of Parquet file candidates",
         );
 
-        let parquet_file_candidate_bytes_gauge = registry.register_metric(
+        let file_size_buckets = U64HistogramOptions::new([
+            500 * 1024,       // 500 KB
+            1024 * 1024,      // 1 MB
+            3 * 1024 * 1024,  // 3 MB
+            10 * 1024 * 1024, // 10 MB
+            30 * 1024 * 1024, // 30 MB
+            u64::MAX,         // Inf
+        ]);
+
+        let parquet_file_candidate_bytes = registry.register_metric_with_options(
             "parquet_file_candidate_bytes",
-            "Number of bytes of Parquet file candidates",
+            "Number of bytes of Parquet file compaction candidates",
+            || file_size_buckets.clone(),
+        );
+
+        let compaction_input_file_bytes = registry.register_metric_with_options(
+            "compaction_input_file_bytes",
+            "Number of bytes of Parquet files used as inputs to a successful compaction operation",
+            || file_size_buckets.clone(),
         );
 
         let duration_histogram_options = DurationHistogramOptions::new([
@@ -208,17 +225,17 @@ impl Compactor {
             );
 
         Self {
-            sequencers,
+            shards,
             catalog,
             store,
             exec,
             time_provider,
             backoff_config,
             config,
-            compaction_counter,
             compaction_candidate_gauge,
             parquet_file_candidate_gauge,
-            parquet_file_candidate_bytes_gauge,
+            parquet_file_candidate_bytes,
+            compaction_input_file_bytes,
             compaction_duration,
             candidate_selection_duration,
             partitions_extra_info_reading_duration,
@@ -235,25 +252,24 @@ impl Compactor {
     ///     with any new ingested files in the past.
     ///
     /// * New ingested files means non-deleted L0 files
-    /// * In all cases above, for each sequencer, N partitions with the most new ingested files
+    /// * In all cases above, for each shard, N partitions with the most new ingested files
     ///   will be selected and the return list will include at most, P = N * S, partitions where S
-    ///   is the number of sequencers this compactor handles.
+    ///   is the number of shards this compactor handles.
     pub async fn hot_partitions_to_compact(
         &self,
         // Max number of the most recent highest ingested throughput partitions
-        // per sequencer we want to read
-        max_num_partitions_per_sequencer: usize,
+        // per shard we want to read
+        max_num_partitions_per_shard: usize,
         // Minimum number of the most recent writes per partition we want to count
         // to prioritize partitions
         min_recent_ingested_files: usize,
     ) -> Result<Vec<PartitionParam>> {
-        let mut candidates =
-            Vec::with_capacity(self.sequencers.len() * max_num_partitions_per_sequencer);
+        let mut candidates = Vec::with_capacity(self.shards.len() * max_num_partitions_per_shard);
         let mut repos = self.catalog.repositories().await;
 
-        for sequencer_id in &self.sequencers {
+        for shard_id in &self.shards {
             let attributes = Attributes::from([
-                ("sequencer_id", format!("{}", *sequencer_id).into()),
+                ("shard_id", format!("{}", *shard_id).into()),
                 ("partition_type", "hot".into()),
             ]);
 
@@ -264,19 +280,19 @@ impl Compactor {
                 let mut partitions = repos
                     .parquet_files()
                     .recent_highest_throughput_partitions(
-                        *sequencer_id,
+                        *shard_id,
                         num_hours,
                         min_recent_ingested_files,
-                        max_num_partitions_per_sequencer,
+                        max_num_partitions_per_shard,
                     )
                     .await
                     .context(HighestThroughputPartitionsSnafu {
-                        sequencer_id: *sequencer_id,
+                        shard_id: *shard_id,
                     })?;
 
                 if !partitions.is_empty() {
                     debug!(
-                        sequencer_id = sequencer_id.get(),
+                        shard_id = shard_id.get(),
                         num_hours,
                         n = partitions.len(),
                         "found high-throughput partitions"
@@ -287,9 +303,9 @@ impl Compactor {
                 }
             }
 
-            // Record metric for candidates per sequencer
+            // Record metric for candidates per shard
             debug!(
-                sequencer_id = sequencer_id.get(),
+                shard_id = shard_id.get(),
                 n = num_partitions,
                 "hot compaction candidates",
             );
@@ -307,33 +323,32 @@ impl Compactor {
     /// - Have some level 0 parquet files that need to be upgraded or compacted
     pub async fn cold_partitions_to_compact(
         &self,
-        // Max number of cold partitions per sequencer we want to compact
-        max_num_partitions_per_sequencer: usize,
+        // Max number of cold partitions per shard we want to compact
+        max_num_partitions_per_shard: usize,
     ) -> Result<Vec<PartitionParam>> {
-        let mut candidates =
-            Vec::with_capacity(self.sequencers.len() * max_num_partitions_per_sequencer);
+        let mut candidates = Vec::with_capacity(self.shards.len() * max_num_partitions_per_shard);
         let mut repos = self.catalog.repositories().await;
 
-        for sequencer_id in &self.sequencers {
+        for shard_id in &self.shards {
             let attributes = Attributes::from([
-                ("sequencer_id", format!("{}", *sequencer_id).into()),
+                ("shard_id", format!("{}", *shard_id).into()),
                 ("partition_type", "cold".into()),
             ]);
 
             let mut partitions = repos
                 .parquet_files()
-                .most_level_0_files_partitions(*sequencer_id, 24, max_num_partitions_per_sequencer)
+                .most_level_0_files_partitions(*shard_id, 24, max_num_partitions_per_shard)
                 .await
                 .context(MostL0PartitionsSnafu {
-                    sequencer_id: *sequencer_id,
+                    shard_id: *shard_id,
                 })?;
 
             let num_partitions = partitions.len();
             candidates.append(&mut partitions);
 
-            // Record metric for candidates per sequencer
+            // Record metric for candidates per shard
             debug!(
-                sequencer_id = sequencer_id.get(),
+                shard_id = shard_id.get(),
                 n = num_partitions,
                 "cold compaction candidates",
             );
@@ -344,11 +359,36 @@ impl Compactor {
         Ok(candidates)
     }
 
+    /// Get column types for tables of given partitions
+    pub async fn table_columns(
+        &self,
+        partitions: &[PartitionParam],
+    ) -> Result<HashMap<TableId, Vec<ColumnTypeCount>>> {
+        use std::collections::hash_map::Entry::Vacant; // this can be moved to the imports at the top if you want
+        let mut repos = self.catalog.repositories().await;
+
+        let mut result = HashMap::with_capacity(partitions.len());
+
+        for table_id in partitions.iter().map(|p| p.table_id) {
+            let entry = result.entry(table_id);
+            if let Vacant(entry) = entry {
+                let cols = repos
+                    .columns()
+                    .list_type_count_by_table_id(table_id)
+                    .await
+                    .context(QueryingColumnSnafu)?;
+                entry.insert(cols);
+            }
+        }
+
+        Ok(result)
+    }
+
     /// Add namespace and table information to partition candidates.
     pub async fn add_info_to_partitions(
         &self,
         partitions: &[PartitionParam],
-    ) -> Result<Vec<PartitionCompactionCandidateWithInfo>> {
+    ) -> Result<VecDeque<PartitionCompactionCandidateWithInfo>> {
         let mut repos = self.catalog.repositories().await;
 
         let table_ids: HashSet<_> = partitions.iter().map(|p| p.table_id).collect();
@@ -417,12 +457,12 @@ impl Compactor {
                     partition_key: part.partition_key.clone(),
                 }
             })
-            .collect())
+            .collect::<VecDeque<_>>())
     }
 }
 
 /// [`PartitionParam`] with some information about its table and namespace.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PartitionCompactionCandidateWithInfo {
     /// Partition compaction candidate.
     pub candidate: PartitionParam,
@@ -449,9 +489,9 @@ impl PartitionCompactionCandidateWithInfo {
         self.candidate.partition_id
     }
 
-    /// Partition sequencer ID
-    pub fn sequencer_id(&self) -> SequencerId {
-        self.candidate.sequencer_id
+    /// Partition shard ID
+    pub fn shard_id(&self) -> ShardId {
+        self.candidate.shard_id
     }
 
     /// Partition namespace ID
@@ -469,7 +509,7 @@ impl PartitionCompactionCandidateWithInfo {
 mod tests {
     use super::*;
     use data_types::{
-        ColumnId, ColumnSet, CompactionLevel, KafkaPartition, ParquetFileParams, SequenceNumber,
+        ColumnId, ColumnSet, CompactionLevel, ParquetFileParams, SequenceNumber, ShardIndex,
         Timestamp,
     };
     use iox_tests::util::TestCatalog;
@@ -481,18 +521,18 @@ mod tests {
     async fn test_hot_partitions_to_compact() {
         let catalog = TestCatalog::new();
 
-        // Create a db with 2 sequencers, one with 4 empty partitions and the other one with one
+        // Create a db with 2 shards, one with 4 empty partitions and the other one with one
         // empty partition
         let mut txn = catalog.catalog.start_transaction().await.unwrap();
 
-        let kafka = txn.kafka_topics().create_or_get("foo").await.unwrap();
+        let topic = txn.topics().create_or_get("foo").await.unwrap();
         let pool = txn.query_pools().create_or_get("foo").await.unwrap();
         let namespace = txn
             .namespaces()
             .create(
                 "namespace_hot_partitions_to_compact",
                 "inf",
-                kafka.id,
+                topic.id,
                 pool.id,
             )
             .await
@@ -502,47 +542,47 @@ mod tests {
             .create_or_get("test_table", namespace.id)
             .await
             .unwrap();
-        let sequencer = txn
-            .sequencers()
-            .create_or_get(&kafka, KafkaPartition::new(1))
+        let shard = txn
+            .shards()
+            .create_or_get(&topic, ShardIndex::new(1))
             .await
             .unwrap();
         let partition1 = txn
             .partitions()
-            .create_or_get("one".into(), sequencer.id, table.id)
+            .create_or_get("one".into(), shard.id, table.id)
             .await
             .unwrap();
         let partition2 = txn
             .partitions()
-            .create_or_get("two".into(), sequencer.id, table.id)
+            .create_or_get("two".into(), shard.id, table.id)
             .await
             .unwrap();
         let partition3 = txn
             .partitions()
-            .create_or_get("three".into(), sequencer.id, table.id)
+            .create_or_get("three".into(), shard.id, table.id)
             .await
             .unwrap();
         let partition4 = txn
             .partitions()
-            .create_or_get("four".into(), sequencer.id, table.id)
+            .create_or_get("four".into(), shard.id, table.id)
             .await
             .unwrap();
-        // other sequencer
+        // other shard
         let another_table = txn
             .tables()
             .create_or_get("another_test_table", namespace.id)
             .await
             .unwrap();
-        let another_sequencer = txn
-            .sequencers()
-            .create_or_get(&kafka, KafkaPartition::new(2))
+        let another_shard = txn
+            .shards()
+            .create_or_get(&topic, ShardIndex::new(2))
             .await
             .unwrap();
         let another_partition = txn
             .partitions()
             .create_or_get(
                 "another_partition".into(),
-                another_sequencer.id,
+                another_shard.id,
                 another_table.id,
             )
             .await
@@ -559,7 +599,7 @@ mod tests {
         let time_provider = Arc::new(SystemProvider::new());
         let config = make_compactor_config();
         let compactor = Compactor::new(
-            vec![sequencer.id, another_sequencer.id],
+            vec![shard.id, another_shard.id],
             Arc::clone(&catalog.catalog),
             ParquetStorage::new(Arc::clone(&catalog.object_store)),
             Arc::new(Executor::new(1)),
@@ -583,7 +623,7 @@ mod tests {
 
         // Basic parquet info
         let p1 = ParquetFileParams {
-            sequencer_id: sequencer.id,
+            shard_id: shard.id,
             namespace_id: namespace.id,
             table_id: table.id,
             partition_id: partition1.id,
@@ -696,13 +736,13 @@ mod tests {
         assert_eq!(candidates[0].partition_id, partition3.id);
 
         // --------------------------------------
-        // Case 6: has partition candidates for 2 sequencers
+        // Case 6: has partition candidates for 2 shards
         //
-        // The another_sequencer now has non-deleted level-0 file ingested 5 hours ago
+        // The another_shard now has non-deleted level-0 file ingested 5 hours ago
         let mut txn = catalog.catalog.start_transaction().await.unwrap();
         let p6 = ParquetFileParams {
             object_store_id: Uuid::new_v4(),
-            sequencer_id: another_sequencer.id,
+            shard_id: another_shard.id,
             table_id: another_table.id,
             partition_id: another_partition.id,
             created_at: time_five_hour_ago,
@@ -711,14 +751,14 @@ mod tests {
         let _pf6 = txn.parquet_files().create(p6).await.unwrap();
         txn.commit().await.unwrap();
         //
-        // Will have 2 candidates, one for each sequencer
+        // Will have 2 candidates, one for each shard
         let mut candidates = compactor.hot_partitions_to_compact(1, 1).await.unwrap();
         candidates.sort();
         assert_eq!(candidates.len(), 2);
         assert_eq!(candidates[0].partition_id, partition3.id);
-        assert_eq!(candidates[0].sequencer_id, sequencer.id);
+        assert_eq!(candidates[0].shard_id, shard.id);
         assert_eq!(candidates[1].partition_id, another_partition.id);
-        assert_eq!(candidates[1].sequencer_id, another_sequencer.id);
+        assert_eq!(candidates[1].shard_id, another_shard.id);
 
         // Add info to partition
         let partitions_with_info = compactor.add_info_to_partitions(&candidates).await.unwrap();
@@ -748,26 +788,24 @@ mod tests {
         let max_desired_file_size_bytes = 10_000;
         let percentage_max_file_size = 30;
         let split_percentage = 80;
-        let max_concurrent_size_bytes = 100_000;
         let max_cold_concurrent_size_bytes = 90_000;
-        let max_number_partitions_per_sequencer = 1;
+        let max_number_partitions_per_shard = 1;
         let min_number_recent_ingested_per_partition = 1;
-        let input_size_threshold_bytes = 300 * 1024 * 1024;
         let cold_input_size_threshold_bytes = 600 * 1024 * 1024;
-        let input_file_count_threshold = 100;
+        let cold_input_file_count_threshold = 100;
         let hot_multiple = 4;
+        let memory_budget_bytes = 10 * 1024 * 1024;
         CompactorConfig::new(
             max_desired_file_size_bytes,
             percentage_max_file_size,
             split_percentage,
-            max_concurrent_size_bytes,
             max_cold_concurrent_size_bytes,
-            max_number_partitions_per_sequencer,
+            max_number_partitions_per_shard,
             min_number_recent_ingested_per_partition,
-            input_size_threshold_bytes,
             cold_input_size_threshold_bytes,
-            input_file_count_threshold,
+            cold_input_file_count_threshold,
             hot_multiple,
+            memory_budget_bytes,
         )
     }
 
@@ -775,18 +813,18 @@ mod tests {
     async fn test_cold_partitions_to_compact() {
         let catalog = TestCatalog::new();
 
-        // Create a db with 2 sequencers, one with 4 empty partitions and the other one with one
+        // Create a db with 2 shards, one with 4 empty partitions and the other one with one
         // empty partition
         let mut txn = catalog.catalog.start_transaction().await.unwrap();
 
-        let kafka = txn.kafka_topics().create_or_get("foo").await.unwrap();
+        let topic = txn.topics().create_or_get("foo").await.unwrap();
         let pool = txn.query_pools().create_or_get("foo").await.unwrap();
         let namespace = txn
             .namespaces()
             .create(
                 "namespace_hot_partitions_to_compact",
                 "inf",
-                kafka.id,
+                topic.id,
                 pool.id,
             )
             .await
@@ -796,52 +834,52 @@ mod tests {
             .create_or_get("test_table", namespace.id)
             .await
             .unwrap();
-        let sequencer = txn
-            .sequencers()
-            .create_or_get(&kafka, KafkaPartition::new(1))
+        let shard = txn
+            .shards()
+            .create_or_get(&topic, ShardIndex::new(1))
             .await
             .unwrap();
         let partition1 = txn
             .partitions()
-            .create_or_get("one".into(), sequencer.id, table.id)
+            .create_or_get("one".into(), shard.id, table.id)
             .await
             .unwrap();
         let partition2 = txn
             .partitions()
-            .create_or_get("two".into(), sequencer.id, table.id)
+            .create_or_get("two".into(), shard.id, table.id)
             .await
             .unwrap();
         let partition3 = txn
             .partitions()
-            .create_or_get("three".into(), sequencer.id, table.id)
+            .create_or_get("three".into(), shard.id, table.id)
             .await
             .unwrap();
         let partition4 = txn
             .partitions()
-            .create_or_get("four".into(), sequencer.id, table.id)
+            .create_or_get("four".into(), shard.id, table.id)
             .await
             .unwrap();
         let partition5 = txn
             .partitions()
-            .create_or_get("five".into(), sequencer.id, table.id)
+            .create_or_get("five".into(), shard.id, table.id)
             .await
             .unwrap();
-        // other sequencer
+        // other shard
         let another_table = txn
             .tables()
             .create_or_get("another_test_table", namespace.id)
             .await
             .unwrap();
-        let another_sequencer = txn
-            .sequencers()
-            .create_or_get(&kafka, KafkaPartition::new(2))
+        let another_shard = txn
+            .shards()
+            .create_or_get(&topic, ShardIndex::new(2))
             .await
             .unwrap();
         let another_partition = txn
             .partitions()
             .create_or_get(
                 "another_partition".into(),
-                another_sequencer.id,
+                another_shard.id,
                 another_table.id,
             )
             .await
@@ -858,7 +896,7 @@ mod tests {
         let time_provider = Arc::new(SystemProvider::new());
         let config = make_compactor_config();
         let compactor = Compactor::new(
-            vec![sequencer.id, another_sequencer.id],
+            vec![shard.id, another_shard.id],
             Arc::clone(&catalog.catalog),
             ParquetStorage::new(Arc::clone(&catalog.object_store)),
             Arc::new(Executor::new(1)),
@@ -878,7 +916,7 @@ mod tests {
 
         // Basic parquet info
         let p1 = ParquetFileParams {
-            sequencer_id: sequencer.id,
+            shard_id: shard.id,
             namespace_id: namespace.id,
             table_id: table.id,
             partition_id: partition1.id,
@@ -1003,26 +1041,26 @@ mod tests {
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].partition_id, partition4.id);
 
-        // Ask for 2 partitions per sequencer; get partition4 and partition2
+        // Ask for 2 partitions per shard; get partition4 and partition2
         let candidates = compactor.cold_partitions_to_compact(2).await.unwrap();
         assert_eq!(candidates.len(), 2);
         assert_eq!(candidates[0].partition_id, partition4.id);
         assert_eq!(candidates[1].partition_id, partition2.id);
 
-        // Ask for 3 partitions per sequencer; still get only partition4 and partition2
+        // Ask for 3 partitions per shard; still get only partition4 and partition2
         let candidates = compactor.cold_partitions_to_compact(3).await.unwrap();
         assert_eq!(candidates.len(), 2);
         assert_eq!(candidates[0].partition_id, partition4.id);
         assert_eq!(candidates[1].partition_id, partition2.id);
 
         // --------------------------------------
-        // Case 6: has partition candidates for 2 sequencers
+        // Case 6: has partition candidates for 2 shards
         //
-        // The another_sequencer now has non-deleted level-0 file ingested 38 hours ago
+        // The another_shard now has non-deleted level-0 file ingested 38 hours ago
         let mut txn = catalog.catalog.start_transaction().await.unwrap();
         let p6 = ParquetFileParams {
             object_store_id: Uuid::new_v4(),
-            sequencer_id: another_sequencer.id,
+            shard_id: another_shard.id,
             table_id: another_table.id,
             partition_id: another_partition.id,
             created_at: time_38_hour_ago,
@@ -1031,25 +1069,25 @@ mod tests {
         let _pf6 = txn.parquet_files().create(p6).await.unwrap();
         txn.commit().await.unwrap();
 
-        // Will have 2 candidates, one for each sequencer
+        // Will have 2 candidates, one for each shard
         let mut candidates = compactor.cold_partitions_to_compact(1).await.unwrap();
         candidates.sort();
         assert_eq!(candidates.len(), 2);
         assert_eq!(candidates[0].partition_id, partition4.id);
-        assert_eq!(candidates[0].sequencer_id, sequencer.id);
+        assert_eq!(candidates[0].shard_id, shard.id);
         assert_eq!(candidates[1].partition_id, another_partition.id);
-        assert_eq!(candidates[1].sequencer_id, another_sequencer.id);
+        assert_eq!(candidates[1].shard_id, another_shard.id);
 
-        // Ask for 2 candidates per sequencer; get back 3: 2 from sequencer and 1 from
-        // another_sequencer
+        // Ask for 2 candidates per shard; get back 3: 2 from shard and 1 from
+        // another_shard
         let mut candidates = compactor.cold_partitions_to_compact(2).await.unwrap();
         candidates.sort();
         assert_eq!(candidates.len(), 3);
         assert_eq!(candidates[0].partition_id, partition2.id);
-        assert_eq!(candidates[0].sequencer_id, sequencer.id);
+        assert_eq!(candidates[0].shard_id, shard.id);
         assert_eq!(candidates[1].partition_id, partition4.id);
-        assert_eq!(candidates[1].sequencer_id, sequencer.id);
+        assert_eq!(candidates[1].shard_id, shard.id);
         assert_eq!(candidates[2].partition_id, another_partition.id);
-        assert_eq!(candidates[2].sequencer_id, another_sequencer.id);
+        assert_eq!(candidates[2].shard_id, another_shard.id);
     }
 }

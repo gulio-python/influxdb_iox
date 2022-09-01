@@ -10,6 +10,7 @@ use iox_query::exec::Executor;
 use metric::Attributes;
 use observability_deps::tracing::*;
 use std::sync::Arc;
+
 use thiserror::Error;
 use tokio::{
     task::{JoinError, JoinHandle},
@@ -17,7 +18,7 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::compact::Compactor;
+use crate::{compact::Compactor, compact_hot_partitions};
 
 #[derive(Debug, Error)]
 #[allow(missing_copy_implementations, missing_docs)]
@@ -107,47 +108,45 @@ pub struct CompactorConfig {
     /// This value must be between (0, 100)
     split_percentage: u16,
 
-    /// The compactor will limit the number of simultaneous hot partition compaction jobs based on
-    /// the size of the input files to be compacted.  This number should be less than 1/10th of the
-    /// available memory to ensure compactions have enough space to run.
-    max_concurrent_size_bytes: u64,
-
     /// The compactor will limit the number of simultaneous cold partition compaction jobs based on
     /// the size of the input files to be compacted. This number should be less than 1/10th of the
     /// available memory to ensure compactions have enough space to run.
     max_cold_concurrent_size_bytes: u64,
 
-    /// Max number of partitions per sequencer we want to compact per cycle
-    max_number_partitions_per_sequencer: usize,
+    /// Max number of partitions per shard we want to compact per cycle
+    max_number_partitions_per_shard: usize,
 
     /// Min number of recent ingested files a partition needs to be considered for compacting
     min_number_recent_ingested_files_per_partition: usize,
-
-    /// A compaction operation for hot partitions will gather as many L0 files with their
-    /// overlapping L1 files to compact together until the total size of input files crosses this
-    /// threshold. Later compactions will pick up the remaining L0 files.
-    ///
-    /// A compaction operation will be limited by this or by the file count threshold, whichever is
-    /// hit first.
-    input_size_threshold_bytes: u64,
 
     /// A compaction operation for cold partitions will gather as many L0 files with their
     /// overlapping L1 files to compact together until the total size of input files crosses this
     /// threshold. Later compactions will pick up the remaining L0 files.
     cold_input_size_threshold_bytes: u64,
 
-    /// A compaction operation will gather as many L0 files with their overlapping L1 files to
-    /// compact together until the total number of L0 + L1 files crosses this threshold. Later
-    /// compactions will pick up the remaining L0 files.
+    /// A compaction operation or cold partitions  will gather as many L0 files with their
+    /// overlapping L1 files to compact together until the total number of L0 + L1 files crosses this
+    /// threshold. Later compactions will pick up the remaining L0 files.
     ///
     /// A compaction operation will be limited by this or by the input size threshold, whichever is
     /// hit first.
-    input_file_count_threshold: usize,
+    cold_input_file_count_threshold: usize,
 
     /// The multiple of times that compacting hot partitions should run for every one time that
     /// compacting cold partitions runs. Set to 1 to compact hot partitions and cold partitions
     /// equally.
     hot_multiple: usize,
+
+    /// The memory budget asigned to this compactor.
+    /// For each partition candidate, we will esimate the memory needed to compact each file
+    /// and only add more files if their needed estimated memory is below this memory budget.
+    /// Since we must compact L1 files that overlapped with L0 files, if their total estimated
+    /// memory do not allow us to compact a part of a partition at all, we will not compact
+    /// it and will log the partition and its related information in a table in our catalog for
+    /// further diagnosis of the issue.
+    /// How many candidates compacted concurrently are also decided using this estimation and
+    /// budget.
+    memory_budget_bytes: u64,
 }
 
 impl CompactorConfig {
@@ -157,14 +156,13 @@ impl CompactorConfig {
         max_desired_file_size_bytes: u64,
         percentage_max_file_size: u16,
         split_percentage: u16,
-        max_concurrent_size_bytes: u64,
         max_cold_concurrent_size_bytes: u64,
-        max_number_partitions_per_sequencer: usize,
+        max_number_partitions_per_shard: usize,
         min_number_recent_ingested_files_per_partition: usize,
-        input_size_threshold_bytes: u64,
         cold_input_size_threshold_bytes: u64,
-        input_file_count_threshold: usize,
+        cold_input_file_count_threshold: usize,
         hot_multiple: usize,
+        memory_budget_bytes: u64,
     ) -> Self {
         assert!(split_percentage > 0 && split_percentage <= 100);
 
@@ -172,13 +170,12 @@ impl CompactorConfig {
             max_desired_file_size_bytes,
             percentage_max_file_size,
             split_percentage,
-            max_concurrent_size_bytes,
             max_cold_concurrent_size_bytes,
-            max_number_partitions_per_sequencer,
+            max_number_partitions_per_shard,
             min_number_recent_ingested_files_per_partition,
-            input_size_threshold_bytes,
             cold_input_size_threshold_bytes,
-            input_file_count_threshold,
+            cold_input_file_count_threshold,
+            memory_budget_bytes,
             hot_multiple,
         }
     }
@@ -198,33 +195,14 @@ impl CompactorConfig {
         self.split_percentage
     }
 
-    /// The compactor will limit the number of simultaneous compaction jobs based on the
-    /// size of the input files to be compacted. Currently this only takes into account the
-    /// level 0 files, but should later also consider the level 1 files to be compacted. This
-    /// number should be less than 1/10th of the available memory to ensure compactions have
-    /// enough space to run.
-    pub fn max_concurrent_size_bytes(&self) -> u64 {
-        self.max_concurrent_size_bytes
-    }
-
-    /// Max number of partitions per sequencer we want to compact per cycle
-    pub fn max_number_partitions_per_sequencer(&self) -> usize {
-        self.max_number_partitions_per_sequencer
+    /// Max number of partitions per shard we want to compact per cycle
+    pub fn max_number_partitions_per_shard(&self) -> usize {
+        self.max_number_partitions_per_shard
     }
 
     /// Min number of recent ingested files a partition needs to be considered for compacting
     pub fn min_number_recent_ingested_files_per_partition(&self) -> usize {
         self.min_number_recent_ingested_files_per_partition
-    }
-
-    /// A compaction operation for hot partitions will gather as many L0 files with their
-    /// overlapping L1 files to compact together until the total size of input files crosses this
-    /// threshold. Later compactions will pick up the remaining L0 files.
-    ///
-    /// A compaction operation will be limited by this or by the file count threshold, whichever is
-    /// hit first.
-    pub fn input_size_threshold_bytes(&self) -> u64 {
-        self.input_size_threshold_bytes
     }
 
     /// A compaction operation for cold partitions will gather as many L0 files with their
@@ -234,14 +212,19 @@ impl CompactorConfig {
         self.cold_input_size_threshold_bytes
     }
 
-    /// A compaction operation will gather as many L0 files with their overlapping L1 files to
+    /// A compaction operation for cold partitions will gather as many L0 files with their overlapping L1 files to
     /// compact together until the total number of L0 + L1 files crosses this threshold. Later
     /// compactions will pick up the remaining L0 files.
     ///
     /// A compaction operation will be limited by this or by the input size threshold, whichever is
     /// hit first.
-    pub fn input_file_count_threshold(&self) -> usize {
-        self.input_file_count_threshold
+    pub fn cold_input_file_count_threshold(&self) -> usize {
+        self.cold_input_file_count_threshold
+    }
+
+    /// Memory budget this compactor should not exceed
+    pub fn memory_budget_bytes(&self) -> u64 {
+        self.memory_budget_bytes
     }
 }
 
@@ -265,7 +248,8 @@ async fn run_compactor(compactor: Arc<Compactor>, shutdown: CancellationToken) {
 pub async fn run_compactor_once(compactor: Arc<Compactor>) {
     let mut compacted_partitions = 0;
     for _ in 0..compactor.config.hot_multiple {
-        compacted_partitions += compact_hot_partitions(Arc::clone(&compactor)).await;
+        compacted_partitions +=
+            compact_hot_partitions::compact_hot_partitions(Arc::clone(&compactor)).await;
         if compacted_partitions == 0 {
             // Not found hot candidates, should move to compact cold partitions
             break;
@@ -279,121 +263,6 @@ pub async fn run_compactor_once(compactor: Arc<Compactor>) {
     }
 }
 
-/// Return number of compacted partitions
-async fn compact_hot_partitions(compactor: Arc<Compactor>) -> usize {
-    // Select hot partition candidates
-    let hot_attributes = Attributes::from(&[("partition_type", "hot")]);
-    let start_time = compactor.time_provider.now();
-    let candidates = Backoff::new(&compactor.backoff_config)
-        .retry_all_errors("hot_partitions_to_compact", || async {
-            compactor
-                .hot_partitions_to_compact(
-                    compactor.config.max_number_partitions_per_sequencer(),
-                    compactor
-                        .config
-                        .min_number_recent_ingested_files_per_partition(),
-                )
-                .await
-        })
-        .await
-        .expect("retry forever");
-    if let Some(delta) = compactor
-        .time_provider
-        .now()
-        .checked_duration_since(start_time)
-    {
-        let duration = compactor
-            .candidate_selection_duration
-            .recorder(hot_attributes.clone());
-        duration.record(delta);
-    }
-
-    // Add other compaction-needed info into selected partitions
-    let start_time = compactor.time_provider.now();
-    let candidates = Backoff::new(&compactor.backoff_config)
-        .retry_all_errors("add_info_to_partitions", || async {
-            compactor.add_info_to_partitions(&candidates).await
-        })
-        .await
-        .expect("retry forever");
-    if let Some(delta) = compactor
-        .time_provider
-        .now()
-        .checked_duration_since(start_time)
-    {
-        let duration = compactor
-            .partitions_extra_info_reading_duration
-            .recorder(hot_attributes.clone());
-        duration.record(delta);
-    }
-
-    let n_candidates = candidates.len();
-    if n_candidates == 0 {
-        debug!("no hot compaction candidates found");
-        return 0;
-    } else {
-        debug!(n_candidates, "found hot compaction candidates");
-    }
-
-    let start_time = compactor.time_provider.now();
-
-    // Repeat compacting n partitions in parallel until all candidates are compacted.
-    // Concurrency level calculation (this is estimated from previous experiments. The actual
-    // resource management will be more complicated and a future feature):
-    //   . Each `compact partititon` takes max of this much memory input_size_threshold_bytes
-    //   . We have this memory budget: max_concurrent_size_bytes
-    // --> num_parallel_partitions = max_concurrent_size_bytes/
-    //     input_size_threshold_bytes
-    let num_parallel_partitions = (compactor.config.max_concurrent_size_bytes
-        / compactor.config.input_size_threshold_bytes) as usize;
-
-    futures::stream::iter(candidates)
-        .map(|p| {
-            // run compaction in its own task
-            let comp = Arc::clone(&compactor);
-            tokio::task::spawn(async move {
-                let partition_id = p.candidate.partition_id;
-                let compaction_result = crate::compact_hot_partition(&comp, p).await;
-
-                match compaction_result {
-                    Err(e) => {
-                        warn!(?e, ?partition_id, "hot compaction failed");
-                    }
-                    Ok(_) => {
-                        debug!(?partition_id, "hot compaction complete");
-                    }
-                };
-            })
-        })
-        // Assume we have enough resources to run
-        // num_parallel_partitions compactions in parallel
-        .buffer_unordered(num_parallel_partitions)
-        // report any JoinErrors (aka task panics)
-        .map(|join_result| {
-            if let Err(e) = join_result {
-                warn!(?e, "hot compaction task failed");
-            }
-            Ok(())
-        })
-        // Errors are reported during execution, so ignore results here
-        // https://stackoverflow.com/questions/64443085/how-to-run-stream-to-completion-in-rust-using-combinators-other-than-for-each
-        .forward(futures::sink::drain())
-        .await
-        .ok();
-
-    // Done compacting all candidates in the cycle, record its time
-    if let Some(delta) = compactor
-        .time_provider
-        .now()
-        .checked_duration_since(start_time)
-    {
-        let duration = compactor.compaction_cycle_duration.recorder(hot_attributes);
-        duration.record(delta);
-    }
-
-    n_candidates
-}
-
 async fn compact_cold_partitions(compactor: Arc<Compactor>) -> usize {
     let cold_attributes = Attributes::from(&[("partition_type", "cold")]);
     // Select cold partition candidates
@@ -401,7 +270,7 @@ async fn compact_cold_partitions(compactor: Arc<Compactor>) -> usize {
     let candidates = Backoff::new(&compactor.backoff_config)
         .retry_all_errors("cold_partitions_to_compact", || async {
             compactor
-                .cold_partitions_to_compact(compactor.config.max_number_partitions_per_sequencer())
+                .cold_partitions_to_compact(compactor.config.max_number_partitions_per_shard())
                 .await
         })
         .await

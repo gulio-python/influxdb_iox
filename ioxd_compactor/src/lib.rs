@@ -4,7 +4,7 @@ use compactor::{
     handler::{CompactorHandler, CompactorHandlerImpl},
     server::CompactorServer,
 };
-use data_types::KafkaPartition;
+use data_types::ShardIndex;
 use hyper::{Body, Request, Response};
 use iox_catalog::interface::Catalog;
 use iox_query::exec::Executor;
@@ -32,11 +32,11 @@ pub enum Error {
     #[error("Catalog error: {0}")]
     Catalog(#[from] iox_catalog::interface::Error),
 
-    #[error("Kafka topic {0} not found in the catalog")]
-    KafkaTopicNotFound(String),
+    #[error("No topic named '{topic_name}' found in the catalog")]
+    TopicCatalogLookup { topic_name: String },
 
-    #[error("kafka_partition_range_start must be <= kafka_partition_range_end")]
-    KafkaRange,
+    #[error("shard_index_range_start must be <= shard_index_range_end")]
+    ShardIndexRange,
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -159,28 +159,28 @@ pub async fn build_compactor_from_config(
     time_provider: Arc<dyn TimeProvider>,
     metric_registry: Arc<Registry>,
 ) -> Result<compactor::compact::Compactor, Error> {
-    if compactor_config.write_buffer_partition_range_start
-        > compactor_config.write_buffer_partition_range_end
-    {
-        return Err(Error::KafkaRange);
+    if compactor_config.shard_index_range_start > compactor_config.shard_index_range_end {
+        return Err(Error::ShardIndexRange);
     }
 
     let mut txn = catalog.start_transaction().await?;
-    let kafka_topic = txn
-        .kafka_topics()
+    let topic = txn
+        .topics()
         .get_by_name(&compactor_config.topic)
         .await?
-        .ok_or(Error::KafkaTopicNotFound(compactor_config.topic))?;
+        .ok_or(Error::TopicCatalogLookup {
+            topic_name: compactor_config.topic,
+        })?;
 
-    let kafka_partitions: Vec<_> = (compactor_config.write_buffer_partition_range_start
-        ..=compactor_config.write_buffer_partition_range_end)
-        .map(KafkaPartition::new)
+    let shard_indexes: Vec<_> = (compactor_config.shard_index_range_start
+        ..=compactor_config.shard_index_range_end)
+        .map(ShardIndex::new)
         .collect();
 
-    let mut sequencers = Vec::with_capacity(kafka_partitions.len());
-    for k in kafka_partitions {
-        let s = txn.sequencers().create_or_get(&kafka_topic, k).await?;
-        sequencers.push(s.id);
+    let mut shards = Vec::with_capacity(shard_indexes.len());
+    for k in shard_indexes {
+        let s = txn.shards().create_or_get(&topic, k).await?;
+        shards.push(s.id);
     }
     txn.commit().await?;
 
@@ -190,18 +190,17 @@ pub async fn build_compactor_from_config(
         compactor_config.max_desired_file_size_bytes,
         compactor_config.percentage_max_file_size,
         compactor_config.split_percentage,
-        compactor_config.max_concurrent_size_bytes,
         compactor_config.max_cold_concurrent_size_bytes,
-        compactor_config.max_number_partitions_per_sequencer,
+        compactor_config.max_number_partitions_per_shard,
         compactor_config.min_number_recent_ingested_files_per_partition,
-        compactor_config.input_size_threshold_bytes,
         compactor_config.cold_input_size_threshold_bytes,
-        compactor_config.input_file_count_threshold,
+        compactor_config.cold_input_file_count_threshold,
         compactor_config.hot_multiple,
+        compactor_config.memory_budget_bytes,
     );
 
     Ok(compactor::compact::Compactor::new(
-        sequencers,
+        shards,
         catalog,
         parquet_store,
         exec,

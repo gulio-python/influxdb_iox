@@ -1,16 +1,16 @@
 //! Metric instrumentation for catalog implementations.
 
 use crate::interface::{
-    sealed::TransactionFinalize, ColumnRepo, ColumnUpsertRequest, KafkaTopicRepo, NamespaceRepo,
-    ParquetFileRepo, PartitionRepo, ProcessedTombstoneRepo, QueryPoolRepo, RepoCollection, Result,
-    SequencerRepo, TablePersistInfo, TableRepo, TombstoneRepo,
+    sealed::TransactionFinalize, ColumnRepo, ColumnUpsertRequest, NamespaceRepo, ParquetFileRepo,
+    PartitionRepo, ProcessedTombstoneRepo, QueryPoolRepo, RepoCollection, Result, ShardRepo,
+    TablePersistInfo, TableRepo, TombstoneRepo, TopicMetadataRepo,
 };
 use async_trait::async_trait;
 use data_types::{
-    Column, ColumnType, KafkaPartition, KafkaTopic, KafkaTopicId, Namespace, NamespaceId,
-    ParquetFile, ParquetFileId, ParquetFileParams, Partition, PartitionId, PartitionInfo,
-    PartitionKey, PartitionParam, ProcessedTombstone, QueryPool, QueryPoolId, SequenceNumber,
-    Sequencer, SequencerId, Table, TableId, TablePartition, Timestamp, Tombstone, TombstoneId,
+    Column, ColumnType, ColumnTypeCount, Namespace, NamespaceId, ParquetFile, ParquetFileId,
+    ParquetFileParams, Partition, PartitionId, PartitionInfo, PartitionKey, PartitionParam,
+    ProcessedTombstone, QueryPool, QueryPoolId, SequenceNumber, Shard, ShardId, ShardIndex, Table,
+    TableId, TablePartition, Timestamp, Tombstone, TombstoneId, TopicId, TopicMetadata,
 };
 use iox_time::{SystemProvider, TimeProvider};
 use metric::{DurationHistogram, Metric};
@@ -43,12 +43,12 @@ impl<T> MetricDecorator<T> {
 
 impl<T, P> RepoCollection for MetricDecorator<T, P>
 where
-    T: KafkaTopicRepo
+    T: TopicMetadataRepo
         + QueryPoolRepo
         + NamespaceRepo
         + TableRepo
         + ColumnRepo
-        + SequencerRepo
+        + ShardRepo
         + PartitionRepo
         + TombstoneRepo
         + ProcessedTombstoneRepo
@@ -56,7 +56,7 @@ where
         + Debug,
     P: TimeProvider,
 {
-    fn kafka_topics(&mut self) -> &mut dyn KafkaTopicRepo {
+    fn topics(&mut self) -> &mut dyn TopicMetadataRepo {
         self
     }
 
@@ -76,7 +76,7 @@ where
         self
     }
 
-    fn sequencers(&mut self) -> &mut dyn SequencerRepo {
+    fn shards(&mut self) -> &mut dyn ShardRepo {
         self
     }
 
@@ -175,10 +175,10 @@ macro_rules! decorate {
 }
 
 decorate!(
-    impl_trait = KafkaTopicRepo,
+    impl_trait = TopicMetadataRepo,
     methods = [
-        "kafka_create_or_get" = create_or_get(&mut self, name: &str) -> Result<KafkaTopic>;
-        "kafka_get_by_name" = get_by_name(&mut self, name: &str) -> Result<Option<KafkaTopic>>;
+        "topic_create_or_get" = create_or_get(&mut self, name: &str) -> Result<TopicMetadata>;
+        "topic_get_by_name" = get_by_name(&mut self, name: &str) -> Result<Option<TopicMetadata>>;
     ]
 );
 
@@ -192,7 +192,7 @@ decorate!(
 decorate!(
     impl_trait = NamespaceRepo,
     methods = [
-        "namespace_create" = create(&mut self, name: &str, retention_duration: &str, kafka_topic_id: KafkaTopicId, query_pool_id: QueryPoolId) -> Result<Namespace>;
+        "namespace_create" = create(&mut self, name: &str, retention_duration: &str, topic_id: TopicId, query_pool_id: QueryPoolId) -> Result<Namespace>;
         "namespace_list" = list(&mut self) -> Result<Vec<Namespace>>;
         "namespace_get_by_id" = get_by_id(&mut self, id: NamespaceId) -> Result<Option<Namespace>>;
         "namespace_get_by_name" = get_by_name(&mut self, name: &str) -> Result<Option<Namespace>>;
@@ -208,7 +208,7 @@ decorate!(
         "table_get_by_id" = get_by_id(&mut self, table_id: TableId) -> Result<Option<Table>>;
         "table_get_by_namespace_and_name" = get_by_namespace_and_name(&mut self, namespace_id: NamespaceId, name: &str) -> Result<Option<Table>>;
         "table_list_by_namespace_id" = list_by_namespace_id(&mut self, namespace_id: NamespaceId) -> Result<Vec<Table>>;
-        "get_table_persist_info" = get_table_persist_info(&mut self, sequencer_id: SequencerId, namespace_id: NamespaceId, table_name: &str) -> Result<Option<TablePersistInfo>>;
+        "get_table_persist_info" = get_table_persist_info(&mut self, shard_id: ShardId, namespace_id: NamespaceId, table_name: &str) -> Result<Option<TablePersistInfo>>;
         "table_list" = list(&mut self) -> Result<Vec<Table>>;
     ]
 );
@@ -221,26 +221,27 @@ decorate!(
         "column_list_by_table_id" = list_by_table_id(&mut self, table_id: TableId) -> Result<Vec<Column>>;
         "column_create_or_get_many" = create_or_get_many(&mut self, columns: &[ColumnUpsertRequest<'_>]) -> Result<Vec<Column>>;
         "column_list" = list(&mut self) -> Result<Vec<Column>>;
+        "column_list_type_count_by_table_id" = list_type_count_by_table_id(&mut self, table_id: TableId) -> Result<Vec<ColumnTypeCount>>;
     ]
 );
 
 decorate!(
-    impl_trait = SequencerRepo,
+    impl_trait = ShardRepo,
     methods = [
-        "sequencer_create_or_get" = create_or_get(&mut self, topic: &KafkaTopic, partition: KafkaPartition) -> Result<Sequencer>;
-        "sequencer_get_by_topic_id_and_partition" = get_by_topic_id_and_partition(&mut self, topic_id: KafkaTopicId, partition: KafkaPartition) -> Result<Option<Sequencer>>;
-        "sequencer_list" = list(&mut self) -> Result<Vec<Sequencer>>;
-        "sequencer_list_by_kafka_topic" = list_by_kafka_topic(&mut self, topic: &KafkaTopic) -> Result<Vec<Sequencer>>;
-        "sequencer_update_min_unpersisted_sequence_number" = update_min_unpersisted_sequence_number(&mut self, sequencer_id: SequencerId, sequence_number: SequenceNumber) -> Result<()>;
+        "shard_create_or_get" = create_or_get(&mut self, topic: &TopicMetadata, shard_index: ShardIndex) -> Result<Shard>;
+        "shard_get_by_topic_id_and_shard_index" = get_by_topic_id_and_shard_index(&mut self, topic_id: TopicId, shard_index: ShardIndex) -> Result<Option<Shard>>;
+        "shard_list" = list(&mut self) -> Result<Vec<Shard>>;
+        "shard_list_by_topic" = list_by_topic(&mut self, topic: &TopicMetadata) -> Result<Vec<Shard>>;
+        "shard_update_min_unpersisted_sequence_number" = update_min_unpersisted_sequence_number(&mut self, shard_id: ShardId, sequence_number: SequenceNumber) -> Result<()>;
     ]
 );
 
 decorate!(
     impl_trait = PartitionRepo,
     methods = [
-        "partition_create_or_get" = create_or_get(&mut self, key: PartitionKey, sequencer_id: SequencerId, table_id: TableId) -> Result<Partition>;
+        "partition_create_or_get" = create_or_get(&mut self, key: PartitionKey, shard_id: ShardId, table_id: TableId) -> Result<Partition>;
         "partition_get_by_id" = get_by_id(&mut self, partition_id: PartitionId) -> Result<Option<Partition>>;
-        "partition_list_by_sequencer" = list_by_sequencer(&mut self, sequencer_id: SequencerId) -> Result<Vec<Partition>>;
+        "partition_list_by_shard" = list_by_shard(&mut self, shard_id: ShardId) -> Result<Vec<Partition>>;
         "partition_list_by_namespace" = list_by_namespace(&mut self, namespace_id: NamespaceId) -> Result<Vec<Partition>>;
         "partition_list_by_table_id" = list_by_table_id(&mut self, table_id: TableId) -> Result<Vec<Partition>>;
         "partition_partition_info_by_id" = partition_info_by_id(&mut self, partition_id: PartitionId) -> Result<Option<PartitionInfo>>;
@@ -251,13 +252,13 @@ decorate!(
 decorate!(
     impl_trait = TombstoneRepo,
     methods = [
-        "tombstone_create_or_get" = create_or_get( &mut self, table_id: TableId, sequencer_id: SequencerId, sequence_number: SequenceNumber, min_time: Timestamp, max_time: Timestamp, predicate: &str) -> Result<Tombstone>;
+        "tombstone_create_or_get" = create_or_get( &mut self, table_id: TableId, shard_id: ShardId, sequence_number: SequenceNumber, min_time: Timestamp, max_time: Timestamp, predicate: &str) -> Result<Tombstone>;
         "tombstone_list_by_namespace" = list_by_namespace(&mut self, namespace_id: NamespaceId) -> Result<Vec<Tombstone>>;
         "tombstone_list_by_table" = list_by_table(&mut self, table_id: TableId) -> Result<Vec<Tombstone>>;
         "tombstone_get_by_id" = get_by_id(&mut self, id: TombstoneId) -> Result<Option<Tombstone>>;
-        "tombstone_list_tombstones_by_sequencer_greater_than" = list_tombstones_by_sequencer_greater_than(&mut self, sequencer_id: SequencerId, sequence_number: SequenceNumber) -> Result<Vec<Tombstone>>;
+        "tombstone_list_tombstones_by_shard_greater_than" = list_tombstones_by_shard_greater_than(&mut self, shard_id: ShardId, sequence_number: SequenceNumber) -> Result<Vec<Tombstone>>;
         "tombstone_remove" =  remove(&mut self, tombstone_ids: &[TombstoneId]) -> Result<()>;
-        "tombstone_list_tombstones_for_time_range" = list_tombstones_for_time_range(&mut self, sequencer_id: SequencerId, table_id: TableId, sequence_number: SequenceNumber, min_time: Timestamp, max_time: Timestamp) -> Result<Vec<Tombstone>>;
+        "tombstone_list_tombstones_for_time_range" = list_tombstones_for_time_range(&mut self, shard_id: ShardId, table_id: TableId, sequence_number: SequenceNumber, min_time: Timestamp, max_time: Timestamp) -> Result<Vec<Tombstone>>;
     ]
 );
 
@@ -266,21 +267,21 @@ decorate!(
     methods = [
         "parquet_create" = create( &mut self, parquet_file_params: ParquetFileParams) -> Result<ParquetFile>;
         "parquet_flag_for_delete" = flag_for_delete(&mut self, id: ParquetFileId) -> Result<()>;
-        "parquet_list_by_sequencer_greater_than" = list_by_sequencer_greater_than(&mut self, sequencer_id: SequencerId, sequence_number: SequenceNumber) -> Result<Vec<ParquetFile>>;
+        "parquet_list_by_shard_greater_than" = list_by_shard_greater_than(&mut self, shard_id: ShardId, sequence_number: SequenceNumber) -> Result<Vec<ParquetFile>>;
         "parquet_list_by_namespace_not_to_delete" = list_by_namespace_not_to_delete(&mut self, namespace_id: NamespaceId) -> Result<Vec<ParquetFile>>;
         "parquet_list_by_table_not_to_delete" = list_by_table_not_to_delete(&mut self, table_id: TableId) -> Result<Vec<ParquetFile>>;
         "parquet_delete_old" = delete_old(&mut self, older_than: Timestamp) -> Result<Vec<ParquetFile>>;
         "parquet_list_by_partition_not_to_delete" = list_by_partition_not_to_delete(&mut self, partition_id: PartitionId) -> Result<Vec<ParquetFile>>;
-        "parquet_level_0" = level_0(&mut self, sequencer_id: SequencerId) -> Result<Vec<ParquetFile>>;
+        "parquet_level_0" = level_0(&mut self, shard_id: ShardId) -> Result<Vec<ParquetFile>>;
         "parquet_level_1" = level_1(&mut self, table_partition: TablePartition, min_time: Timestamp, max_time: Timestamp) -> Result<Vec<ParquetFile>>;
         "parquet_update_to_level_1" = update_to_level_1(&mut self, parquet_file_ids: &[ParquetFileId]) -> Result<Vec<ParquetFileId>>;
         "parquet_exist" = exist(&mut self, id: ParquetFileId) -> Result<bool>;
         "parquet_count" = count(&mut self) -> Result<i64>;
-        "parquet_count_by_overlaps_with_level_0" = count_by_overlaps_with_level_0(&mut self, table_id: TableId, sequencer_id: SequencerId, min_time: Timestamp, max_time: Timestamp, sequence_number: SequenceNumber) -> Result<i64>;
-        "parquet_count_by_overlaps_with_level_1" = count_by_overlaps_with_level_1(&mut self, table_id: TableId, sequencer_id: SequencerId, min_time: Timestamp, max_time: Timestamp) -> Result<i64>;
+        "parquet_count_by_overlaps_with_level_0" = count_by_overlaps_with_level_0(&mut self, table_id: TableId, shard_id: ShardId, min_time: Timestamp, max_time: Timestamp, sequence_number: SequenceNumber) -> Result<i64>;
+        "parquet_count_by_overlaps_with_level_1" = count_by_overlaps_with_level_1(&mut self, table_id: TableId, shard_id: ShardId, min_time: Timestamp, max_time: Timestamp) -> Result<i64>;
         "parquet_get_by_object_store_id" = get_by_object_store_id(&mut self, object_store_id: Uuid) -> Result<Option<ParquetFile>>;
-        "recent_highest_throughput_partitions" = recent_highest_throughput_partitions(&mut self, sequencer_id: SequencerId, num_hours: u32, min_num_files: usize, num_partitions: usize) -> Result<Vec<PartitionParam>>;
-        "most_level_0_files_partitions" =  most_level_0_files_partitions(&mut self, sequencer_id: SequencerId, older_than_num_hours: u32, num_partitions: usize) -> Result<Vec<PartitionParam>>;
+        "recent_highest_throughput_partitions" = recent_highest_throughput_partitions(&mut self, shard_id: ShardId, num_hours: u32, min_num_files: usize, num_partitions: usize) -> Result<Vec<PartitionParam>>;
+        "most_level_0_files_partitions" =  most_level_0_files_partitions(&mut self, shard_id: ShardId, older_than_num_hours: u32, num_partitions: usize) -> Result<Vec<PartitionParam>>;
     ]
 );
 

@@ -130,13 +130,14 @@ impl Drop for QuerierHandlerImpl {
 mod tests {
     use super::*;
     use crate::{cache::CatalogCache, create_ingester_connection_for_testing};
-    use data_types::KafkaPartition;
+    use data_types::ShardIndex;
     use iox_catalog::mem::MemCatalog;
     use iox_query::exec::Executor;
     use iox_time::{MockProvider, Time};
     use object_store::memory::InMemory;
     use parquet_file::storage::ParquetStorage;
     use std::time::Duration;
+    use tokio::runtime::Handle;
 
     #[tokio::test]
     async fn test_shutdown() {
@@ -170,20 +171,17 @@ mod tests {
                 Arc::clone(&catalog),
                 time_provider,
                 Arc::clone(&metric_registry),
+                &Handle::current(),
             ));
-            // QuerierDatabase::new returns an error if there are no sequencers in the catalog
+            // QuerierDatabase::new returns an error if there are no shards in the catalog
             {
                 let mut repos = catalog.repositories().await;
 
-                let kafka_topic = repos
-                    .kafka_topics()
-                    .create_or_get("kafka_topic")
-                    .await
-                    .unwrap();
-                let kafka_partition = KafkaPartition::new(0);
+                let topic = repos.topics().create_or_get("topic").await.unwrap();
+                let shard_index = ShardIndex::new(0);
                 repos
-                    .sequencers()
-                    .create_or_get(&kafka_topic, kafka_partition)
+                    .shards()
+                    .create_or_get(&topic, shard_index)
                     .await
                     .unwrap();
             }

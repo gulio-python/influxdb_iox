@@ -147,7 +147,7 @@ impl ParquetFileCache {
             testing,
         ));
 
-        let mut backend = PolicyBackend::new(Box::new(HashMap::new()));
+        let mut backend = PolicyBackend::new(Box::new(HashMap::new()), Arc::clone(&time_provider));
         let (policy_constructor, remove_if_handle) =
             RemoveIfPolicy::create_constructor_and_handle(CACHE_ID, metric_registry);
         backend.add_policy(policy_constructor);
@@ -161,7 +161,7 @@ impl ParquetFileCache {
             )),
         ));
 
-        let cache = Box::new(CacheDriver::new(loader, Box::new(backend)));
+        let cache = CacheDriver::new(loader, backend);
         let cache = Box::new(CacheWithMetrics::new(
             cache,
             CACHE_ID,
@@ -473,12 +473,9 @@ mod tests {
         let table = ns.create_table(table_name).await;
         table.create_column("foo", ColumnType::F64).await;
         table.create_column("time", ColumnType::Time).await;
-        let sequencer1 = ns.create_sequencer(1).await;
+        let shard1 = ns.create_shard(1).await;
 
-        let partition = table
-            .with_sequencer(&sequencer1)
-            .create_partition("k")
-            .await;
+        let partition = table.with_shard(&shard1).create_partition("k").await;
 
         (table, partition)
     }

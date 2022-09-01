@@ -1,11 +1,14 @@
 use super::QuerierNamespace;
-use crate::{create_ingester_connection_for_testing, QuerierCatalogCache};
-use data_types::{KafkaPartition, TableId};
+use crate::{
+    cache::namespace::CachedNamespace, create_ingester_connection_for_testing, QuerierCatalogCache,
+};
+use data_types::{ShardIndex, TableId};
 use iox_catalog::interface::get_schema_by_name;
 use iox_tests::util::TestNamespace;
 use parquet_file::storage::ParquetStorage;
 use sharder::JumpHash;
 use std::sync::Arc;
+use tokio::runtime::Handle;
 
 /// Create [`QuerierNamespace`] for testing.
 pub async fn querier_namespace(ns: &Arc<TestNamespace>) -> QuerierNamespace {
@@ -18,26 +21,26 @@ pub async fn querier_namespace_with_limit(
     max_table_query_bytes: usize,
 ) -> QuerierNamespace {
     let mut repos = ns.catalog.catalog.repositories().await;
-    let schema = Arc::new(
-        get_schema_by_name(&ns.namespace.name, repos.as_mut())
-            .await
-            .unwrap(),
-    );
+    let schema = get_schema_by_name(&ns.namespace.name, repos.as_mut())
+        .await
+        .unwrap();
+    let cached_ns = Arc::new(CachedNamespace::from(&schema));
 
     let catalog_cache = Arc::new(QuerierCatalogCache::new_testing(
         ns.catalog.catalog(),
         ns.catalog.time_provider(),
         ns.catalog.metric_registry(),
+        &Handle::current(),
     ));
 
-    let sharder = Arc::new(JumpHash::new((0..1).map(KafkaPartition::new).map(Arc::new)).unwrap());
+    let sharder = Arc::new(JumpHash::new((0..1).map(ShardIndex::new).map(Arc::new)));
 
     QuerierNamespace::new_testing(
         catalog_cache,
         ParquetStorage::new(ns.catalog.object_store()),
         ns.catalog.metric_registry(),
         ns.namespace.name.clone().into(),
-        schema,
+        cached_ns,
         ns.catalog.exec(),
         Some(create_ingester_connection_for_testing()),
         sharder,

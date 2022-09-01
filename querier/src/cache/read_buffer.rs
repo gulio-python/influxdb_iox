@@ -94,7 +94,8 @@ impl ReadBufferCache {
         ));
 
         // add to memory pool
-        let mut backend = PolicyBackend::new(Box::new(HashMap::new()));
+        let mut backend =
+            PolicyBackend::new(Box::new(HashMap::new()), Arc::clone(&time_provider) as _);
         backend.add_policy(LruPolicy::new(
             Arc::clone(&ram_pool),
             CACHE_ID,
@@ -105,7 +106,7 @@ impl ReadBufferCache {
             )),
         ));
 
-        let cache = Box::new(CacheDriver::new(loader, Box::new(backend)));
+        let cache = CacheDriver::new(loader, backend);
         let cache = Box::new(CacheWithMetrics::new(
             cache,
             CACHE_ID,
@@ -248,12 +249,9 @@ mod tests {
         let table = ns.create_table("table1").await;
         table.create_column("foo", ColumnType::F64).await;
         table.create_column("time", ColumnType::Time).await;
-        let sequencer1 = ns.create_sequencer(1).await;
+        let shard1 = ns.create_shard(1).await;
 
-        let partition = table
-            .with_sequencer(&sequencer1)
-            .create_partition("k")
-            .await;
+        let partition = table.with_shard(&shard1).create_partition("k").await;
 
         (catalog, partition)
     }
@@ -326,12 +324,9 @@ mod tests {
             let table = ns.create_table(&table_name).await;
             table.create_column("foo", ColumnType::F64).await;
             table.create_column("time", ColumnType::Time).await;
-            let sequencer1 = ns.create_sequencer(1).await;
+            let shard1 = ns.create_shard(1).await;
 
-            let partition = table
-                .with_sequencer(&sequencer1)
-                .create_partition("k")
-                .await;
+            let partition = table.with_shard(&shard1).create_partition("k").await;
 
             let builder = TestParquetFileBuilder::default()
                 .with_line_protocol(&format!("{table_name} foo=1 11"));
@@ -348,7 +343,6 @@ mod tests {
         let ram_pool = Arc::new(ResourcePool::new(
             "pool",
             RamSize(3600),
-            catalog.time_provider(),
             Arc::clone(&catalog.metric_registry()),
         ));
         let cache = ReadBufferCache::new(

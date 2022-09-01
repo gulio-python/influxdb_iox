@@ -67,7 +67,6 @@
 //! let pool = Arc::new(ResourcePool::new(
 //!     "my_pool",
 //!     limit,
-//!     time_provider,
 //!     metric_registry,
 //! ));
 //!
@@ -85,7 +84,10 @@
 //!     }
 //! }
 //!
-//! let mut backend1 = PolicyBackend::new(Box::new(HashMap::new()));
+//! let mut backend1 = PolicyBackend::new(
+//!     Box::new(HashMap::new()),
+//!     Arc::clone(&time_provider) as _,
+//! );
 //! backend1.add_policy(
 //!     LruPolicy::new(
 //!         Arc::clone(&pool),
@@ -123,7 +125,10 @@
 //!     }
 //! }
 //!
-//! let mut backend2 = PolicyBackend::new(Box::new(HashMap::new()));
+//! let mut backend2 = PolicyBackend::new(
+//!     Box::new(HashMap::new()),
+//!     time_provider,
+//! );
 //! backend2.add_policy(
 //!     LruPolicy::new(
 //!         Arc::clone(&pool),
@@ -276,7 +281,7 @@ use std::{
     sync::Arc,
 };
 
-use iox_time::{Time, TimeProvider};
+use iox_time::Time;
 use metric::{U64Counter, U64Gauge};
 use parking_lot::{Mutex, MutexGuard};
 
@@ -471,7 +476,6 @@ where
 {
     inner: Mutex<ResourcePoolInner<S>>,
     name: &'static str,
-    time_provider: Arc<dyn TimeProvider>,
     metric_registry: Arc<metric::Registry>,
 }
 
@@ -480,18 +484,17 @@ where
     S: Resource,
 {
     /// Creates new empty resource pool with given limit.
-    pub fn new(
-        name: &'static str,
-        limit: S,
-        time_provider: Arc<dyn TimeProvider>,
-        metric_registry: Arc<metric::Registry>,
-    ) -> Self {
+    pub fn new(name: &'static str, limit: S, metric_registry: Arc<metric::Registry>) -> Self {
         Self {
             inner: Mutex::new(ResourcePoolInner::new(limit, name, &metric_registry)),
             name,
             metric_registry,
-            time_provider,
         }
+    }
+
+    /// Get pool limit.
+    pub fn limit(&self) -> S {
+        self.inner.lock().limit.v
     }
 
     /// Get current pool usage.
@@ -621,22 +624,25 @@ where
     type K = K;
     type V = V;
 
-    fn get(&mut self, k: &Self::K) -> Vec<ChangeRequest<'static, Self::K, Self::V>> {
+    fn get(&mut self, k: &Self::K, now: Time) -> Vec<ChangeRequest<'static, Self::K, Self::V>> {
         let mut inner = self.inner.lock();
 
         // update "last used"
         if let Some((consumption, _last_used)) = inner.last_used.remove(k) {
-            let now = self.pool.time_provider.now();
             inner.last_used.insert(k.clone(), consumption, now);
         }
 
         vec![]
     }
 
-    fn set(&mut self, k: Self::K, v: Self::V) -> Vec<ChangeRequest<'static, Self::K, Self::V>> {
+    fn set(
+        &mut self,
+        k: Self::K,
+        v: Self::V,
+        now: Time,
+    ) -> Vec<ChangeRequest<'static, Self::K, Self::V>> {
         // determine all attributes before getting any locks
         let consumption = self.resource_estimator.consumption(&k, &v);
-        let now = self.pool.time_provider.now();
 
         // get locks
         let mut pool = self.pool.inner.lock();
@@ -670,7 +676,7 @@ where
         downcast_change_requests(change_requests)
     }
 
-    fn remove(&mut self, k: &Self::K) -> Vec<ChangeRequest<'static, Self::K, Self::V>> {
+    fn remove(&mut self, k: &Self::K, _now: Time) -> Vec<ChangeRequest<'static, Self::K, Self::V>> {
         let mut inner = self.inner.lock();
 
         if let Some((consumption, _last_used)) = inner.last_used.remove(k) {
@@ -822,20 +828,59 @@ where
         .collect()
 }
 
+pub mod test_util {
+    //! Testing helpers for LRU policy.
+    use std::ops::{Add, Sub};
+
+    use super::*;
+
+    /// An abbstract test size.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+    pub struct TestSize(pub usize);
+
+    impl Resource for TestSize {
+        fn zero() -> Self {
+            Self(0)
+        }
+
+        fn unit() -> &'static str {
+            "bytes"
+        }
+    }
+
+    impl From<TestSize> for u64 {
+        fn from(s: TestSize) -> Self {
+            s.0 as Self
+        }
+    }
+
+    impl Add for TestSize {
+        type Output = Self;
+
+        fn add(self, rhs: Self) -> Self::Output {
+            Self(self.0.checked_add(rhs.0).expect("overflow"))
+        }
+    }
+
+    impl Sub for TestSize {
+        type Output = Self;
+
+        fn sub(self, rhs: Self) -> Self::Output {
+            Self(self.0.checked_sub(rhs.0).expect("underflow"))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::{
-        collections::HashMap,
-        ops::{Add, Sub},
-        time::Duration,
-    };
+    use std::{collections::HashMap, time::Duration};
 
     use iox_time::MockProvider;
     use metric::{Observation, RawReporter};
 
     use crate::backend::{policy::PolicyBackend, CacheBackend};
 
-    use super::*;
+    use super::{test_util::TestSize, *};
 
     #[test]
     #[should_panic(expected = "inner backend is not empty")]
@@ -844,12 +889,11 @@ mod tests {
         let pool = Arc::new(ResourcePool::new(
             "pool",
             TestSize(10),
-            Arc::clone(&time_provider) as _,
             Arc::new(metric::Registry::new()),
         ));
         let resource_estimator = Arc::new(TestResourceEstimator {});
 
-        let mut backend = PolicyBackend::new(Box::new(HashMap::new()));
+        let mut backend = PolicyBackend::new(Box::new(HashMap::new()), time_provider);
         let policy_constructor = LruPolicy::new(
             Arc::clone(&pool),
             "id",
@@ -868,19 +912,19 @@ mod tests {
         let pool = Arc::new(ResourcePool::new(
             "pool",
             TestSize(10),
-            Arc::clone(&time_provider) as _,
             Arc::new(metric::Registry::new()),
         ));
         let resource_estimator = Arc::new(TestResourceEstimator {});
 
-        let mut backend1 = PolicyBackend::new(Box::new(HashMap::new()));
+        let mut backend1 =
+            PolicyBackend::new(Box::new(HashMap::new()), Arc::clone(&time_provider) as _);
         backend1.add_policy(LruPolicy::new(
             Arc::clone(&pool),
             "id",
             Arc::clone(&resource_estimator) as _,
         ));
 
-        let mut backend2 = PolicyBackend::new(Box::new(HashMap::new()));
+        let mut backend2 = PolicyBackend::new(Box::new(HashMap::new()), time_provider);
         backend2.add_policy(LruPolicy::new(
             Arc::clone(&pool),
             "id",
@@ -894,12 +938,12 @@ mod tests {
         let pool = Arc::new(ResourcePool::new(
             "pool",
             TestSize(10),
-            Arc::clone(&time_provider) as _,
             Arc::new(metric::Registry::new()),
         ));
         let resource_estimator = Arc::new(TestResourceEstimator {});
 
-        let mut backend1 = PolicyBackend::new(Box::new(HashMap::new()));
+        let mut backend1 =
+            PolicyBackend::new(Box::new(HashMap::new()), Arc::clone(&time_provider) as _);
         backend1.add_policy(LruPolicy::new(
             Arc::clone(&pool),
             "id",
@@ -908,7 +952,7 @@ mod tests {
 
         // drop the backend so re-registering the same ID ("id") MUST NOT panic
         drop(backend1);
-        let mut backend2 = PolicyBackend::new(Box::new(HashMap::new()));
+        let mut backend2 = PolicyBackend::new(Box::new(HashMap::new()), time_provider);
         backend2.add_policy(LruPolicy::new(
             Arc::clone(&pool),
             "id",
@@ -922,14 +966,13 @@ mod tests {
         let pool = Arc::new(ResourcePool::new(
             "pool",
             TestSize(10),
-            Arc::clone(&time_provider) as _,
             Arc::new(metric::Registry::new()),
         ));
         let resource_estimator = Arc::new(TestResourceEstimator {});
 
         assert_eq!(pool.current().0, 0);
 
-        let mut backend = PolicyBackend::new(Box::new(HashMap::new()));
+        let mut backend = PolicyBackend::new(Box::new(HashMap::new()), time_provider);
         backend.add_policy(LruPolicy::new(
             Arc::clone(&pool),
             "id1",
@@ -945,12 +988,11 @@ mod tests {
         let pool = Arc::new(ResourcePool::new(
             "pool",
             TestSize(10),
-            Arc::clone(&time_provider) as _,
             Arc::new(metric::Registry::new()),
         ));
         let resource_estimator = Arc::new(TestResourceEstimator {});
 
-        let mut backend = PolicyBackend::new(Box::new(HashMap::new()));
+        let mut backend = PolicyBackend::new(Box::new(HashMap::new()), time_provider);
         backend.add_policy(LruPolicy::new(
             Arc::clone(&pool),
             "id1",
@@ -973,12 +1015,11 @@ mod tests {
         let pool = Arc::new(ResourcePool::new(
             "pool",
             TestSize(10),
-            Arc::clone(&time_provider) as _,
             Arc::new(metric::Registry::new()),
         ));
         let resource_estimator = Arc::new(TestResourceEstimator {});
 
-        let mut backend = PolicyBackend::new(Box::new(HashMap::new()));
+        let mut backend = PolicyBackend::new(Box::new(HashMap::new()), time_provider);
         backend.add_policy(LruPolicy::new(
             Arc::clone(&pool),
             "id1",
@@ -1008,19 +1049,20 @@ mod tests {
         let pool = Arc::new(ResourcePool::new(
             "pool",
             TestSize(21),
-            Arc::clone(&time_provider) as _,
             Arc::new(metric::Registry::new()),
         ));
         let resource_estimator = Arc::new(TestResourceEstimator {});
 
-        let mut backend1 = PolicyBackend::new(Box::new(HashMap::new()));
+        let mut backend1 =
+            PolicyBackend::new(Box::new(HashMap::new()), Arc::clone(&time_provider) as _);
         backend1.add_policy(LruPolicy::new(
             Arc::clone(&pool),
             "id1",
             Arc::clone(&resource_estimator) as _,
         ));
 
-        let mut backend2 = PolicyBackend::new(Box::new(HashMap::new()));
+        let mut backend2 =
+            PolicyBackend::new(Box::new(HashMap::new()), Arc::clone(&time_provider) as _);
         backend2.add_policy(LruPolicy::new(
             Arc::clone(&pool),
             "id2",
@@ -1148,12 +1190,12 @@ mod tests {
         let pool = Arc::new(ResourcePool::new(
             "pool",
             TestSize(6),
-            Arc::clone(&time_provider) as _,
             Arc::new(metric::Registry::new()),
         ));
         let resource_estimator = Arc::new(TestResourceEstimator {});
 
-        let mut backend = PolicyBackend::new(Box::new(HashMap::new()));
+        let mut backend =
+            PolicyBackend::new(Box::new(HashMap::new()), Arc::clone(&time_provider) as _);
         backend.add_policy(LruPolicy::new(
             Arc::clone(&pool),
             "id1",
@@ -1195,12 +1237,11 @@ mod tests {
         let pool = Arc::new(ResourcePool::new(
             "pool",
             TestSize(10),
-            Arc::clone(&time_provider) as _,
             Arc::new(metric::Registry::new()),
         ));
         let resource_estimator = Arc::new(TestResourceEstimator {});
 
-        let mut backend = PolicyBackend::new(Box::new(HashMap::new()));
+        let mut backend = PolicyBackend::new(Box::new(HashMap::new()), time_provider);
         backend.add_policy(LruPolicy::new(
             Arc::clone(&pool),
             "id1",
@@ -1221,7 +1262,6 @@ mod tests {
         let pool = Arc::new(ResourcePool::new(
             "pool",
             TestSize(3),
-            Arc::clone(&time_provider) as _,
             Arc::new(metric::Registry::new()),
         ));
 
@@ -1240,7 +1280,8 @@ mod tests {
 
         let resource_estimator = Arc::new(Provider {});
 
-        let mut backend = PolicyBackend::new(Box::new(HashMap::new()));
+        let mut backend =
+            PolicyBackend::new(Box::new(HashMap::new()), Arc::clone(&time_provider) as _);
         backend.add_policy(LruPolicy::new(
             Arc::clone(&pool),
             "id1",
@@ -1270,7 +1311,6 @@ mod tests {
         let pool = Arc::new(ResourcePool::new(
             "pool",
             TestSize(3),
-            Arc::clone(&time_provider) as _,
             Arc::new(metric::Registry::new()),
         ));
 
@@ -1311,10 +1351,13 @@ mod tests {
         let marker = Arc::new(());
         let marker_weak = Arc::downgrade(&marker);
 
-        let mut backend = PolicyBackend::new(Box::new(Backend {
-            marker,
-            inner: HashMap::new(),
-        }));
+        let mut backend = PolicyBackend::new(
+            Box::new(Backend {
+                marker,
+                inner: HashMap::new(),
+            }),
+            Arc::clone(&time_provider) as _,
+        );
         backend.add_policy(LruPolicy::new(
             Arc::clone(&pool),
             "id1",
@@ -1333,7 +1376,6 @@ mod tests {
         let pool = Arc::new(ResourcePool::new(
             "pool",
             TestSize(10),
-            Arc::clone(&time_provider) as _,
             Arc::clone(&metric_registry),
         ));
         let resource_estimator = Arc::new(TestResourceEstimator {});
@@ -1357,7 +1399,7 @@ mod tests {
             &Observation::U64Gauge(0)
         );
 
-        let mut backend = PolicyBackend::new(Box::new(HashMap::new()));
+        let mut backend = PolicyBackend::new(Box::new(HashMap::new()), time_provider);
         backend.add_policy(LruPolicy::new(
             Arc::clone(&pool),
             "id",
@@ -1480,12 +1522,11 @@ mod tests {
             let pool = Arc::new(ResourcePool::new(
                 "pool",
                 TestSize(10),
-                Arc::clone(&time_provider) as _,
                 Arc::new(metric::Registry::new()),
             ));
             let resource_estimator = Arc::new(ZeroSizeProvider {});
 
-            let mut backend = PolicyBackend::new(Box::new(HashMap::new()));
+            let mut backend = PolicyBackend::new(Box::new(HashMap::new()), time_provider);
             backend.add_policy(LruPolicy::new(
                 Arc::clone(&pool),
                 "id",
@@ -1493,41 +1534,6 @@ mod tests {
             ));
             backend
         });
-    }
-
-    #[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
-    struct TestSize(usize);
-
-    impl Resource for TestSize {
-        fn zero() -> Self {
-            Self(0)
-        }
-
-        fn unit() -> &'static str {
-            "bytes"
-        }
-    }
-
-    impl From<TestSize> for u64 {
-        fn from(s: TestSize) -> Self {
-            s.0 as Self
-        }
-    }
-
-    impl Add for TestSize {
-        type Output = Self;
-
-        fn add(self, rhs: Self) -> Self::Output {
-            Self(self.0.checked_add(rhs.0).expect("overflow"))
-        }
-    }
-
-    impl Sub for TestSize {
-        type Output = Self;
-
-        fn sub(self, rhs: Self) -> Self::Output {
-            Self(self.0.checked_sub(rhs.0).expect("underflow"))
-        }
     }
 
     #[derive(Debug)]

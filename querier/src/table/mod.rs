@@ -1,18 +1,22 @@
 use self::query_access::QuerierTableChunkPruner;
 use self::state_reconciler::Reconciler;
+use crate::chunk::util::create_basic_summary;
+use crate::table::query_access::MetricPruningObserver;
 use crate::{
     chunk::ChunkAdapter,
     ingester::{self, IngesterPartition},
     IngesterConnection,
 };
-use data_types::{KafkaPartition, PartitionId, TableId};
+use data_types::{ColumnId, PartitionId, ShardIndex, TableId, TimestampMinMax};
 use futures::{join, StreamExt};
-use iox_query::{exec::Executor, provider::ChunkPruner, QueryChunk};
-use observability_deps::tracing::debug;
+use iox_query::pruning::prune_summaries;
+use iox_query::{exec::Executor, provider, provider::ChunkPruner, QueryChunk};
+use observability_deps::tracing::{debug, trace};
 use predicate::Predicate;
 use schema::Schema;
 use sharder::JumpHash;
 use snafu::{ResultExt, Snafu};
+use std::collections::HashSet;
 use std::{
     collections::{hash_map::Entry, HashMap},
     sync::Arc,
@@ -49,13 +53,16 @@ pub enum Error {
     StateFusion {
         source: state_reconciler::ReconcileError,
     },
+
+    #[snafu(display("Chunk pruning failed: {}", source))]
+    ChunkPruning { source: provider::Error },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Args to create a [`QuerierTable`].
 pub struct QuerierTableArgs {
-    pub sharder: Arc<JumpHash<Arc<KafkaPartition>>>,
+    pub sharder: Arc<JumpHash<Arc<ShardIndex>>>,
     pub namespace_name: Arc<str>,
     pub id: TableId,
     pub table_name: Arc<str>,
@@ -70,8 +77,8 @@ pub struct QuerierTableArgs {
 /// Table representation for the querier.
 #[derive(Debug)]
 pub struct QuerierTable {
-    /// Sharder to query for which sequencers are responsible for the table's data
-    sharder: Arc<JumpHash<Arc<KafkaPartition>>>,
+    /// Sharder to query for which shards are responsible for the table's data
+    sharder: Arc<JumpHash<Arc<ShardIndex>>>,
 
     /// Namespace the table is in
     namespace_name: Arc<str>,
@@ -231,25 +238,90 @@ impl QuerierTable {
                 .get(self.id(), span_recorder.child_span("cache GET tombstone"))
         );
 
-        // create parquet files
-        let parquet_files: Vec<_> = futures::stream::iter(parquet_files.files.iter())
-            .filter_map(|cached_parquet_file| {
-                let chunk_adapter = Arc::clone(&self.chunk_adapter);
-                let span = span_recorder.child_span("new_chunk");
-                async move {
-                    chunk_adapter
-                        .new_chunk(
-                            Arc::clone(&self.namespace_name),
-                            Arc::clone(cached_parquet_file),
-                            span,
-                        )
-                        .await
-                }
-            })
-            .collect()
+        let columns: HashSet<ColumnId> = parquet_files
+            .files
+            .iter()
+            .flat_map(|cached_file| cached_file.column_set.iter().copied())
+            .collect();
+        let cached_namespace = self
+            .chunk_adapter
+            .catalog_cache()
+            .namespace()
+            .get(
+                Arc::clone(&self.namespace_name),
+                &[(&self.table_name, &columns)],
+                span_recorder.child_span("cache GET namespace schema"),
+            )
             .await;
+        let cached_table = cached_namespace
+            .as_ref()
+            .and_then(|ns| ns.tables.get(self.table_name.as_ref()));
 
-        self.reconciler
+        // create parquet files
+        let parquet_files: Vec<_> = match cached_table {
+            Some(cached_table) => {
+                let basic_summaries: Vec<_> = parquet_files
+                    .files
+                    .iter()
+                    .map(|p| {
+                        Arc::new(create_basic_summary(
+                            p.row_count as u64,
+                            &cached_table.schema,
+                            TimestampMinMax {
+                                min: p.min_time.get(),
+                                max: p.max_time.get(),
+                            },
+                        ))
+                    })
+                    .map(Some)
+                    .collect();
+
+                // Prune on the most basic summary data (timestamps and column names) before trying to fully load the chunks
+                let keeps = match prune_summaries(
+                    Arc::clone(&cached_table.schema),
+                    &basic_summaries,
+                    predicate,
+                ) {
+                    Ok(keeps) => keeps,
+                    Err(reason) => {
+                        // Ignore pruning failures here - the chunk pruner should have already logged them.
+                        // Just skip pruning and gather all the metadata. We have another chance to prune them
+                        // once all the metadata is available
+                        debug!(?reason, "Could not prune before metadata fetch");
+                        vec![true; basic_summaries.len()]
+                    }
+                };
+
+                let early_pruning_observer =
+                    &MetricPruningObserver::new(Arc::clone(&self.prune_metrics));
+                futures::stream::iter(parquet_files.files.iter().zip(keeps))
+                    .filter_map(|(cached_parquet_file, keep)| async move {
+                        if !keep {
+                            early_pruning_observer.was_pruned_early(
+                                cached_parquet_file.row_count as u64,
+                                cached_parquet_file.file_size_bytes as u64,
+                            );
+                            return None;
+                        }
+                        let chunk_adapter = Arc::clone(&self.chunk_adapter);
+                        let span = span_recorder.child_span("new_chunk");
+                        chunk_adapter
+                            .new_chunk(
+                                cached_table,
+                                Arc::clone(self.table_name()),
+                                Arc::clone(cached_parquet_file),
+                                span,
+                            )
+                            .await
+                    })
+                    .collect()
+                    .await
+            }
+            _ => Vec::new(),
+        };
+
+        let chunks = self
+            .reconciler
             .reconcile(
                 partitions,
                 tombstones.to_vec(),
@@ -257,7 +329,21 @@ impl QuerierTable {
                 span_recorder.child_span("reconcile"),
             )
             .await
-            .context(StateFusionSnafu)
+            .context(StateFusionSnafu)?;
+        trace!("Fetched chunks");
+
+        let num_initial_chunks = chunks.len();
+        let chunks = self
+            .chunk_pruner()
+            .prune_chunks(
+                self.table_name(),
+                Arc::clone(&self.schema),
+                chunks,
+                predicate,
+            )
+            .context(ChunkPruningSnafu)?;
+        debug!(%predicate, num_initial_chunks, num_final_chunks=chunks.len(), "pruned with pushed down predicates");
+        Ok(chunks)
     }
 
     /// Get a chunk pruner that can be used to prune chunks retrieved via [`chunks`](Self::chunks)
@@ -319,18 +405,18 @@ impl QuerierTable {
             .map(|(_, f)| f.name().to_string())
             .collect();
 
-        // Get the sequencer IDs responsible for this table's data from the sharder to
+        // Get the shard indexes responsible for this table's data from the sharder to
         // determine which ingester(s) to query.
-        // Currently, the sharder will only return one sequencer ID per table, but in the
-        // near future, the sharder might return more than one sequencer ID for one table.
-        let sequencer_ids = vec![**self
+        // Currently, the sharder will only return one shard index per table, but in the
+        // near future, the sharder might return more than one shard index for one table.
+        let shard_indexes = vec![**self
             .sharder
             .shard_for_query(&self.table_name, &self.namespace_name)];
 
         // get any chunks from the ingester(s)
         let partitions_result = ingester_connection
             .partitions(
-                &sequencer_ids,
+                &shard_indexes,
                 Arc::clone(&self.namespace_name),
                 Arc::clone(&self.table_name),
                 columns,
@@ -446,21 +532,12 @@ mod tests {
         let table1 = ns.create_table("table1").await;
         let table2 = ns.create_table("table2").await;
 
-        let sequencer1 = ns.create_sequencer(1).await;
-        let sequencer2 = ns.create_sequencer(2).await;
+        let shard1 = ns.create_shard(1).await;
+        let shard2 = ns.create_shard(2).await;
 
-        let partition11 = table1
-            .with_sequencer(&sequencer1)
-            .create_partition("k")
-            .await;
-        let partition12 = table1
-            .with_sequencer(&sequencer2)
-            .create_partition("k")
-            .await;
-        let partition21 = table2
-            .with_sequencer(&sequencer1)
-            .create_partition("k")
-            .await;
+        let partition11 = table1.with_shard(&shard1).create_partition("k").await;
+        let partition12 = table1.with_shard(&shard2).create_partition("k").await;
+        let partition21 = table2.with_shard(&shard1).create_partition("k").await;
 
         table1.create_column("time", ColumnType::Time).await;
         table1.create_column("foo", ColumnType::F64).await;
@@ -517,9 +594,16 @@ mod tests {
         let builder = TestParquetFileBuilder::default()
             .with_line_protocol("table1 foo=10 100")
             .with_max_seq(2)
+            .with_min_time(99)
+            .with_max_time(99);
+        let file122 = partition12.create_parquet_file(builder).await;
+
+        let builder = TestParquetFileBuilder::default()
+            .with_line_protocol("table1 foo=10 100")
+            .with_max_seq(2)
             .with_min_time(100)
             .with_max_time(100);
-        let file122 = partition12.create_parquet_file(builder).await;
+        let _file123 = partition12.create_parquet_file(builder).await;
 
         let builder = TestParquetFileBuilder::default()
             .with_line_protocol("table2 foo=6 66")
@@ -531,12 +615,12 @@ mod tests {
         file111.flag_for_delete().await;
 
         let tombstone1 = table1
-            .with_sequencer(&sequencer1)
+            .with_shard(&shard1)
             .create_tombstone(7, 1, 100, "foo=1")
             .await;
         tombstone1.mark_processed(&file112).await;
         let tombstone2 = table1
-            .with_sequencer(&sequencer1)
+            .with_shard(&shard1)
             .create_tombstone(8, 1, 100, "foo=1")
             .await;
         tombstone2.mark_processed(&file112).await;
@@ -549,6 +633,7 @@ mod tests {
         // this contains all files except for:
         // - file111: marked for delete
         // - file221: wrong table
+        // - file123: filtered by predicate
         let pred = Predicate::new().with_range(0, 100);
         let mut chunks = querier_table.chunks_with_predicate(&pred).await.unwrap();
         chunks.sort_by_key(|c| c.id());
@@ -587,11 +672,11 @@ mod tests {
         assert_eq!(chunks[1].delete_predicates().len(), 2);
         // file114: predicates are directly within the chunk range => assume they are materialized
         assert_eq!(chunks[2].delete_predicates().len(), 0);
-        // file115: came after in sequencer
+        // file115: came after in sequence
         assert_eq!(chunks[3].delete_predicates().len(), 0);
-        // file121: wrong sequencer
+        // file121: wrong shard
         assert_eq!(chunks[4].delete_predicates().len(), 0);
-        // file122: wrong sequencer
+        // file122: wrong shard
         assert_eq!(chunks[5].delete_predicates().len(), 0);
     }
 
@@ -602,8 +687,8 @@ mod tests {
 
         let ns = catalog.create_namespace("ns").await;
         let table = ns.create_table("table").await;
-        let sequencer = ns.create_sequencer(1).await;
-        let partition = table.with_sequencer(&sequencer).create_partition("k").await;
+        let shard = ns.create_shard(1).await;
+        let partition = table.with_shard(&shard).create_partition("k").await;
         let schema = make_schema(&table).await;
 
         // create a parquet file that cannot be processed by the querier:
@@ -634,7 +719,7 @@ mod tests {
             .with_compaction_level(CompactionLevel::FileNonOverlapped);
         partition.create_parquet_file(builder).await;
 
-        let builder = IngesterPartitionBuilder::new(&table, &schema, &sequencer, &partition);
+        let builder = IngesterPartitionBuilder::new(&table, &schema, &shard, &partition);
         let ingester_partition =
             builder.build_with_max_parquet_sequence_number(Some(SequenceNumber::new(1)));
 
@@ -652,15 +737,9 @@ mod tests {
         let catalog = TestCatalog::new();
         let ns = catalog.create_namespace("ns").await;
         let table = ns.create_table("table").await;
-        let sequencer = ns.create_sequencer(1).await;
-        let partition1 = table
-            .with_sequencer(&sequencer)
-            .create_partition("k1")
-            .await;
-        let partition2 = table
-            .with_sequencer(&sequencer)
-            .create_partition("k2")
-            .await;
+        let shard = ns.create_shard(1).await;
+        let partition1 = table.with_shard(&shard).create_partition("k1").await;
+        let partition2 = table.with_shard(&shard).create_partition("k2").await;
         table.create_column("time", ColumnType::Time).await;
         table.create_column("foo", ColumnType::F64).await;
 
@@ -691,21 +770,21 @@ mod tests {
         // partition1: kept because sequence number <= 10
         // partition2: kept because sequence number <= 11
         table
-            .with_sequencer(&sequencer)
+            .with_shard(&shard)
             .create_tombstone(10, 1, 100, "foo=1")
             .await;
 
         // partition1: pruned because sequence number > 10
         // partition2: kept because sequence number <= 11
         table
-            .with_sequencer(&sequencer)
+            .with_shard(&shard)
             .create_tombstone(11, 1, 100, "foo=2")
             .await;
 
         // partition1: pruned because sequence number > 10
         // partition2: pruned because sequence number > 11
         table
-            .with_sequencer(&sequencer)
+            .with_shard(&shard)
             .create_tombstone(12, 1, 100, "foo=3")
             .await;
 
@@ -719,8 +798,8 @@ mod tests {
 
         let ingester_chunk_id1 = u128::MAX - 1;
 
-        let builder1 = IngesterPartitionBuilder::new(&table, &schema, &sequencer, &partition1);
-        let builder2 = IngesterPartitionBuilder::new(&table, &schema, &sequencer, &partition2);
+        let builder1 = IngesterPartitionBuilder::new(&table, &schema, &shard, &partition1);
+        let builder2 = IngesterPartitionBuilder::new(&table, &schema, &shard, &partition2);
 
         let load_settings = HashMap::from([(
             file2.parquet_file.id,
@@ -805,15 +884,9 @@ mod tests {
 
         let ns = catalog.create_namespace("ns").await;
         let table = ns.create_table("table").await;
-        let sequencer = ns.create_sequencer(1).await;
-        let partition1 = table
-            .with_sequencer(&sequencer)
-            .create_partition("k1")
-            .await;
-        let partition2 = table
-            .with_sequencer(&sequencer)
-            .create_partition("k2")
-            .await;
+        let shard = ns.create_shard(1).await;
+        let partition1 = table.with_shard(&shard).create_partition("k1").await;
+        let partition2 = table.with_shard(&shard).create_partition("k2").await;
 
         let schema = Arc::new(
             SchemaBuilder::new()
@@ -823,8 +896,8 @@ mod tests {
                 .unwrap(),
         );
 
-        let builder1 = IngesterPartitionBuilder::new(&table, &schema, &sequencer, &partition1);
-        let builder2 = IngesterPartitionBuilder::new(&table, &schema, &sequencer, &partition2);
+        let builder1 = IngesterPartitionBuilder::new(&table, &schema, &shard, &partition1);
+        let builder2 = IngesterPartitionBuilder::new(&table, &schema, &shard, &partition2);
 
         let querier_table = TestQuerierTable::new(&catalog, &table)
             .await
@@ -871,11 +944,11 @@ mod tests {
         let catalog = TestCatalog::new();
         let ns = catalog.create_namespace("ns").await;
         let table = ns.create_table("table1").await;
-        let sequencer = ns.create_sequencer(1).await;
-        let partition = table.with_sequencer(&sequencer).create_partition("k").await;
+        let shard = ns.create_shard(1).await;
+        let partition = table.with_shard(&shard).create_partition("k").await;
         let schema = make_schema(&table).await;
 
-        let builder = IngesterPartitionBuilder::new(&table, &schema, &sequencer, &partition)
+        let builder = IngesterPartitionBuilder::new(&table, &schema, &shard, &partition)
             .with_lp(["table foo=1 1"]);
 
         // Parquet file between with max sequence number 2
@@ -926,13 +999,13 @@ mod tests {
         let catalog = TestCatalog::new();
         let ns = catalog.create_namespace("ns").await;
         let table = ns.create_table("table1").await;
-        let sequencer = ns.create_sequencer(1).await;
-        let partition = table.with_sequencer(&sequencer).create_partition("k").await;
+        let shard = ns.create_shard(1).await;
+        let partition = table.with_shard(&shard).create_partition("k").await;
         let schema = make_schema(&table).await;
         // Expect 1 chunk with with one delete predicate
         let querier_table = TestQuerierTable::new(&catalog, &table).await;
 
-        let builder = IngesterPartitionBuilder::new(&table, &schema, &sequencer, &partition)
+        let builder = IngesterPartitionBuilder::new(&table, &schema, &shard, &partition)
             .with_lp(["table foo=1 1"]);
 
         // parquet file with max sequence number 1
@@ -943,7 +1016,7 @@ mod tests {
 
         // tombstone with max sequence number 2
         table
-            .with_sequencer(&sequencer)
+            .with_shard(&shard)
             .create_tombstone(2, 1, 100, "foo=1")
             .await;
 
@@ -959,7 +1032,7 @@ mod tests {
 
         // Now, make a second tombstone with max sequence number 3
         table
-            .with_sequencer(&sequencer)
+            .with_shard(&shard)
             .create_tombstone(3, 1, 100, "foo=1")
             .await;
 

@@ -1,10 +1,17 @@
 //! gRPC service implementations for `router`.
 
-use crate::dml_handlers::{DmlError, DmlHandler, PartitionError};
+pub mod sharder;
+
+use self::sharder::ShardService;
+use crate::{
+    dml_handlers::{DmlError, DmlHandler, PartitionError},
+    shard::Shard,
+};
+use ::sharder::Sharder;
 use generated_types::{
     google::FieldViolation,
     influxdata::{
-        iox::{catalog::v1::*, object_store::v1::*, schema::v1::*},
+        iox::{catalog::v1::*, object_store::v1::*, schema::v1::*, sharder::v1::*},
         pbdata::v1::*,
     },
 };
@@ -29,33 +36,37 @@ const WRITE_TOKEN_GRPC_HEADER: &str = "x-iox-write-token";
 
 /// This type is responsible for managing all gRPC services exposed by `router`.
 #[derive(Debug)]
-pub struct GrpcDelegate<D> {
+pub struct GrpcDelegate<D, S> {
     dml_handler: Arc<D>,
     catalog: Arc<dyn Catalog>,
     object_store: Arc<DynObjectStore>,
     metrics: Arc<metric::Registry>,
+    shard_service: ShardService<S>,
 }
 
-impl<D> GrpcDelegate<D> {
+impl<D, S> GrpcDelegate<D, S> {
     /// Initialise a new gRPC handler, dispatching DML operations to `dml_handler`.
     pub fn new(
         dml_handler: Arc<D>,
         catalog: Arc<dyn Catalog>,
         object_store: Arc<DynObjectStore>,
         metrics: Arc<metric::Registry>,
+        shard_service: ShardService<S>,
     ) -> Self {
         Self {
             dml_handler,
             catalog,
             object_store,
             metrics,
+            shard_service,
         }
     }
 }
 
-impl<D> GrpcDelegate<D>
+impl<D, S> GrpcDelegate<D, S>
 where
     D: DmlHandler<WriteInput = HashMap<String, MutableBatch>, WriteOutput = WriteSummary> + 'static,
+    S: Sharder<(), Item = Arc<Shard>> + Clone + 'static,
 {
     /// Acquire a [`WriteService`] gRPC service implementation.
     ///
@@ -102,6 +113,15 @@ where
             Arc::clone(&self.catalog),
             Arc::clone(&self.object_store),
         ))
+    }
+
+    /// Return a gRPC [`ShardService`] handler.
+    ///
+    /// [`ShardService`]: generated_types::influxdata::iox::sharder::v1::shard_service_server::ShardService
+    pub fn shard_service(
+        &self,
+    ) -> shard_service_server::ShardServiceServer<impl shard_service_server::ShardService> {
+        shard_service_server::ShardServiceServer::new(self.shard_service.clone())
     }
 }
 

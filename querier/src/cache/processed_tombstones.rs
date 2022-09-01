@@ -80,10 +80,9 @@ impl ProcessedTombstonesCache {
             testing,
         ));
 
-        let mut backend = PolicyBackend::new(Box::new(HashMap::new()));
+        let mut backend = PolicyBackend::new(Box::new(HashMap::new()), Arc::clone(&time_provider));
         backend.add_policy(TtlPolicy::new(
             Arc::new(KeepExistsForever {}),
-            Arc::clone(&time_provider),
             CACHE_ID,
             metric_registry,
         ));
@@ -95,7 +94,7 @@ impl ProcessedTombstonesCache {
             })),
         ));
 
-        let cache = Box::new(CacheDriver::new(loader, Box::new(backend)));
+        let cache = CacheDriver::new(loader, backend);
         let cache = Box::new(CacheWithMetrics::new(
             cache,
             CACHE_ID,
@@ -154,18 +153,18 @@ mod tests {
         let table = ns.create_table("table").await;
         table.create_column("foo", ColumnType::F64).await;
         table.create_column("time", ColumnType::Time).await;
-        let sequencer = ns.create_sequencer(1).await;
-        let partition = table.with_sequencer(&sequencer).create_partition("k").await;
+        let shard = ns.create_shard(1).await;
+        let partition = table.with_shard(&shard).create_partition("k").await;
 
         let builder = TestParquetFileBuilder::default().with_line_protocol(TABLE_LINE_PROTOCOL);
         let file1 = partition.create_parquet_file(builder.clone()).await;
         let file2 = partition.create_parquet_file(builder).await;
         let ts1 = table
-            .with_sequencer(&sequencer)
+            .with_shard(&shard)
             .create_tombstone(1, 1, 10, "foo=1")
             .await;
         let ts2 = table
-            .with_sequencer(&sequencer)
+            .with_shard(&shard)
             .create_tombstone(2, 1, 10, "foo=1")
             .await;
 

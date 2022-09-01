@@ -8,8 +8,8 @@ use router::{
         WriteSummaryAdapter,
     },
     namespace_cache::{MemoryNamespaceCache, ShardedCache},
-    sequencer::Sequencer,
     server::http::HttpDelegate,
+    shard::Shard,
 };
 use sharder::JumpHash;
 use std::{collections::BTreeSet, iter, sync::Arc};
@@ -19,13 +19,13 @@ use write_buffer::{
     mock::{MockBufferForWriting, MockBufferSharedState},
 };
 
-// Init a mock write buffer with the given number of sequencers.
-fn init_write_buffer(n_sequencers: u32) -> ShardedWriteBuffer<JumpHash<Arc<Sequencer>>> {
+// Init a mock write buffer with the given number of shards.
+fn init_write_buffer(n_shards: u32) -> ShardedWriteBuffer<JumpHash<Arc<Shard>>> {
     let time = iox_time::MockProvider::new(iox_time::Time::from_timestamp_millis(668563200000));
     let write_buffer: Arc<dyn WriteBufferWriting> = Arc::new(
         MockBufferForWriting::new(
-            MockBufferSharedState::empty_with_n_sequencers(
-                n_sequencers.try_into().expect("cannot have 0 sequencers"),
+            MockBufferSharedState::empty_with_n_shards(
+                n_shards.try_into().expect("cannot have 0 shards"),
             ),
             None,
             Arc::new(time),
@@ -33,16 +33,15 @@ fn init_write_buffer(n_sequencers: u32) -> ShardedWriteBuffer<JumpHash<Arc<Seque
         .expect("failed to init mock write buffer"),
     );
 
-    let shards: BTreeSet<_> = write_buffer.sequencer_ids();
-    ShardedWriteBuffer::new(
-        JumpHash::new(
-            shards
-                .into_iter()
-                .map(|id| Sequencer::new(id as _, Arc::clone(&write_buffer), &Default::default()))
-                .map(Arc::new),
-        )
-        .expect("failed to init sharder"),
-    )
+    let shards: BTreeSet<_> = write_buffer.shard_indexes();
+    ShardedWriteBuffer::new(JumpHash::new(
+        shards
+            .into_iter()
+            .map(|shard_index| {
+                Shard::new(shard_index, Arc::clone(&write_buffer), &Default::default())
+            })
+            .map(Arc::new),
+    ))
 }
 
 fn runtime() -> Runtime {
@@ -59,12 +58,9 @@ fn e2e_benchmarks(c: &mut Criterion) {
     let delegate = {
         let metrics = Arc::new(metric::Registry::new());
         let catalog: Arc<dyn Catalog> = Arc::new(MemCatalog::new(Arc::clone(&metrics)));
-        let ns_cache = Arc::new(
-            ShardedCache::new(
-                iter::repeat_with(|| Arc::new(MemoryNamespaceCache::default())).take(10),
-            )
-            .unwrap(),
-        );
+        let ns_cache = Arc::new(ShardedCache::new(
+            iter::repeat_with(|| Arc::new(MemoryNamespaceCache::default())).take(10),
+        ));
 
         let write_buffer = init_write_buffer(1);
         let schema_validator =

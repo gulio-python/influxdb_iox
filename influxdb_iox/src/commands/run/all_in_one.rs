@@ -11,7 +11,7 @@ use clap_blocks::{
     socket_addr::SocketAddr,
     write_buffer::WriteBufferConfig,
 };
-use data_types::IngesterMapping;
+use data_types::{IngesterMapping, ShardIndex};
 use iox_query::exec::Executor;
 use iox_time::{SystemProvider, TimeProvider};
 use ioxd_common::{
@@ -197,7 +197,7 @@ pub struct Config {
     pub pause_ingest_size_bytes: usize,
 
     /// Once the ingester crosses this threshold of data buffered across
-    /// all sequencers, it will pick the largest partitions and persist
+    /// all shards, it will pick the largest partitions and persist
     /// them until it falls below this threshold. An ingester running in
     /// a steady state is expected to take up this much memory.
     /// The default value is 1 GB (in bytes).
@@ -225,7 +225,7 @@ pub struct Config {
 
     /// If a partition has had data buffered for longer than this period of time
     /// it will be persisted. This puts an upper bound on how far back the
-    /// ingester may need to read in Kafka on restart or recovery. The default value
+    /// ingester may need to read in the write buffer on restart or recovery. The default value
     /// is 30 minutes (in seconds).
     #[clap(
         long = "--persist-partition-age-threshold-seconds",
@@ -389,16 +389,16 @@ impl Config {
             .with_grpc_bind_address(compactor_grpc_bind_address);
 
         // All-in-one mode only supports one write buffer partition.
-        let write_buffer_partition_range_start = 0;
-        let write_buffer_partition_range_end = 0;
+        let shard_index_range_start = 0;
+        let shard_index_range_end = 0;
 
         // Use whatever data is available in the write buffer rather than erroring if the sequence
         // number has not been retained in the write buffer.
         let skip_to_oldest_available = true;
 
         let ingester_config = IngesterConfig {
-            write_buffer_partition_range_start,
-            write_buffer_partition_range_end,
+            shard_index_range_start,
+            shard_index_range_end,
             pause_ingest_size_bytes,
             persist_memory_threshold_bytes,
             persist_partition_size_threshold_bytes,
@@ -407,6 +407,7 @@ impl Config {
             skip_to_oldest_available,
             test_flight_do_get_panic: 0,
             concurrent_request_limit: 10,
+            persist_partition_rows_max: 500_000,
         };
 
         // create a CompactorConfig for the all in one server based on
@@ -414,25 +415,24 @@ impl Config {
         // parameters are redundant with ingester's
         let compactor_config = CompactorConfig {
             topic: QUERY_POOL_NAME.to_string(),
-            write_buffer_partition_range_start,
-            write_buffer_partition_range_end,
+            shard_index_range_start,
+            shard_index_range_end,
             max_desired_file_size_bytes: 30_000,
             percentage_max_file_size: 30,
             split_percentage: 80,
-            max_concurrent_size_bytes: 100_000,
             max_cold_concurrent_size_bytes: 90_000,
-            max_number_partitions_per_sequencer: 1,
+            max_number_partitions_per_shard: 1,
             min_number_recent_ingested_files_per_partition: 1,
-            input_size_threshold_bytes: 314_572_800,
             cold_input_size_threshold_bytes: 629_145_600,
-            input_file_count_threshold: 100,
+            cold_input_file_count_threshold: 100,
             hot_multiple: 4,
+            memory_budget_bytes: 300_000,
         };
 
         let querier_config = QuerierConfig {
-            num_query_threads: None,           // will be ignored
-            sequencer_to_ingesters_file: None, // will be ignored
-            sequencer_to_ingesters: None,      // will be ignored
+            num_query_threads: None,       // will be ignored
+            shard_to_ingesters_file: None, // will be ignored
+            shard_to_ingesters: None,      // will be ignored
             ram_pool_metadata_bytes: querier_ram_pool_metadata_bytes,
             ram_pool_data_bytes: querier_ram_pool_data_bytes,
             max_concurrent_queries: querier_max_concurrent_queries,
@@ -498,7 +498,7 @@ pub async fn command(config: Config) -> Result<()> {
     catalog
         .repositories()
         .await
-        .kafka_topics()
+        .topics()
         .create_or_get(QUERY_POOL_NAME)
         .await?;
 
@@ -553,9 +553,9 @@ pub async fn command(config: Config) -> Result<()> {
     )
     .await?;
 
-    let ingester_addresses = IngesterAddresses::BySequencer(
+    let ingester_addresses = IngesterAddresses::ByShardIndex(
         [(
-            0,
+            ShardIndex::new(0),
             IngesterMapping::Addr(Arc::from(
                 format!("http://{}", ingester_run_config.grpc_bind_address).as_str(),
             )),

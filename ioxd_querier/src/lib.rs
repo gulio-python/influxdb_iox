@@ -16,7 +16,7 @@ use metric::Registry;
 use object_store::DynObjectStore;
 use parquet_file::storage::ParquetStorage;
 use querier::{
-    create_ingester_connections_by_sequencer, QuerierCatalogCache, QuerierDatabase, QuerierHandler,
+    create_ingester_connections_by_shard, QuerierCatalogCache, QuerierDatabase, QuerierHandler,
     QuerierHandlerImpl, QuerierServer,
 };
 use std::{
@@ -24,6 +24,7 @@ use std::{
     sync::Arc,
 };
 use thiserror::Error;
+use tokio::runtime::Handle;
 use trace::TraceCollector;
 
 mod rpc;
@@ -154,7 +155,7 @@ pub enum Error {
     #[error("failed to initialise write buffer connection: {0}")]
     WriteBuffer(#[from] write_buffer::core::WriteBufferError),
 
-    #[error("failed to create KafkaPartition from id: {0}")]
+    #[error("failed to create ShardIndex from id: {0}")]
     InvalidData(#[from] std::num::TryFromIntError),
 
     #[error("querier error: {0}")]
@@ -171,11 +172,12 @@ pub async fn create_querier_server_type(
         Arc::clone(&args.metric_registry),
         args.querier_config.ram_pool_metadata_bytes(),
         args.querier_config.ram_pool_data_bytes(),
+        &Handle::current(),
     ));
 
     let ingester_connection = match args.ingester_addresses {
         IngesterAddresses::None => None,
-        IngesterAddresses::BySequencer(map) => Some(create_ingester_connections_by_sequencer(
+        IngesterAddresses::ByShardIndex(map) => Some(create_ingester_connections_by_shard(
             map,
             Arc::clone(&catalog_cache),
         )),

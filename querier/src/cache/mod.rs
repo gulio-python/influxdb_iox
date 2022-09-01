@@ -4,11 +4,12 @@ use cache_system::backend::policy::lru::ResourcePool;
 use iox_catalog::interface::Catalog;
 use iox_time::TimeProvider;
 use std::sync::Arc;
+use tokio::runtime::Handle;
 
 use self::{
     namespace::NamespaceCache, parquet_file::ParquetFileCache, partition::PartitionCache,
     processed_tombstones::ProcessedTombstonesCache, projected_schema::ProjectedSchemaCache,
-    ram::RamSize, read_buffer::ReadBufferCache, table::TableCache, tombstones::TombstoneCache,
+    ram::RamSize, read_buffer::ReadBufferCache, tombstones::TombstoneCache,
 };
 
 pub mod namespace;
@@ -18,7 +19,6 @@ pub mod processed_tombstones;
 pub mod projected_schema;
 mod ram;
 pub mod read_buffer;
-pub mod table;
 pub mod tombstones;
 
 #[cfg(test)]
@@ -32,9 +32,6 @@ pub struct CatalogCache {
 
     /// Partition cache.
     partition_cache: PartitionCache,
-
-    /// Table cache.
-    table_cache: TableCache,
 
     /// Namespace cache.
     namespace_cache: NamespaceCache,
@@ -69,6 +66,7 @@ impl CatalogCache {
         metric_registry: Arc<metric::Registry>,
         ram_pool_metadata_bytes: usize,
         ram_pool_data_bytes: usize,
+        handle: &Handle,
     ) -> Self {
         Self::new_internal(
             catalog,
@@ -76,6 +74,7 @@ impl CatalogCache {
             metric_registry,
             ram_pool_metadata_bytes,
             ram_pool_data_bytes,
+            handle,
             false,
         )
     }
@@ -87,6 +86,7 @@ impl CatalogCache {
         catalog: Arc<dyn Catalog>,
         time_provider: Arc<dyn TimeProvider>,
         metric_registry: Arc<metric::Registry>,
+        handle: &Handle,
     ) -> Self {
         Self::new_internal(
             catalog,
@@ -94,6 +94,7 @@ impl CatalogCache {
             metric_registry,
             usize::MAX,
             usize::MAX,
+            handle,
             true,
         )
     }
@@ -104,6 +105,7 @@ impl CatalogCache {
         metric_registry: Arc<metric::Registry>,
         ram_pool_metadata_bytes: usize,
         ram_pool_data_bytes: usize,
+        handle: &Handle,
         testing: bool,
     ) -> Self {
         let backoff_config = BackoffConfig::default();
@@ -111,25 +113,15 @@ impl CatalogCache {
         let ram_pool_metadata = Arc::new(ResourcePool::new(
             "ram_metadata",
             RamSize(ram_pool_metadata_bytes),
-            Arc::clone(&time_provider),
             Arc::clone(&metric_registry),
         ));
         let ram_pool_data = Arc::new(ResourcePool::new(
             "ram_data",
             RamSize(ram_pool_data_bytes),
-            Arc::clone(&time_provider),
             Arc::clone(&metric_registry),
         ));
 
         let partition_cache = PartitionCache::new(
-            Arc::clone(&catalog),
-            backoff_config.clone(),
-            Arc::clone(&time_provider),
-            &metric_registry,
-            Arc::clone(&ram_pool_metadata),
-            testing,
-        );
-        let table_cache = TableCache::new(
             Arc::clone(&catalog),
             backoff_config.clone(),
             Arc::clone(&time_provider),
@@ -143,6 +135,7 @@ impl CatalogCache {
             Arc::clone(&time_provider),
             &metric_registry,
             Arc::clone(&ram_pool_metadata),
+            handle,
             testing,
         );
         let processed_tombstones_cache = ProcessedTombstonesCache::new(
@@ -186,7 +179,6 @@ impl CatalogCache {
         Self {
             catalog,
             partition_cache,
-            table_cache,
             namespace_cache,
             processed_tombstones_cache,
             parquet_file_cache,
@@ -216,11 +208,6 @@ impl CatalogCache {
     /// Namespace cache
     pub(crate) fn namespace(&self) -> &NamespaceCache {
         &self.namespace_cache
-    }
-
-    /// Table cache
-    pub(crate) fn table(&self) -> &TableCache {
-        &self.table_cache
     }
 
     /// Partition cache

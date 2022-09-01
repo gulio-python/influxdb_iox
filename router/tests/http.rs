@@ -1,5 +1,5 @@
 use assert_matches::assert_matches;
-use data_types::{KafkaTopicId, PartitionTemplate, QueryPoolId, TemplatePart};
+use data_types::{PartitionTemplate, QueryPoolId, ShardIndex, TemplatePart, TopicId};
 use dml::DmlOperation;
 use hashbrown::HashMap;
 use hyper::{Body, Request, StatusCode};
@@ -13,8 +13,8 @@ use router::{
         ShardedWriteBuffer, WriteSummaryAdapter,
     },
     namespace_cache::{MemoryNamespaceCache, ShardedCache},
-    sequencer::Sequencer,
     server::http::HttpDelegate,
+    shard::Shard,
 };
 use sharder::JumpHash;
 use std::{collections::BTreeSet, iter, string::String, sync::Arc};
@@ -23,9 +23,9 @@ use write_buffer::{
     mock::{MockBufferForWriting, MockBufferSharedState},
 };
 
-/// The kafka topic catalog ID assigned by the namespace auto-creator in the
+/// The topic catalog ID assigned by the namespace auto-creator in the
 /// handler stack for namespaces it has not yet observed.
-const TEST_KAFKA_TOPIC_ID: i64 = 1;
+const TEST_TOPIC_ID: i64 = 1;
 
 /// The query pool catalog ID assigned by the namespace auto-creator in the
 /// handler stack for namespaces it has not yet observed.
@@ -57,7 +57,7 @@ type HttpDelegateStack = HttpDelegate<
             >,
             WriteSummaryAdapter<
                 FanOutAdaptor<
-                    ShardedWriteBuffer<JumpHash<Arc<Sequencer>>>,
+                    ShardedWriteBuffer<JumpHash<Arc<Shard>>>,
                     Vec<Partitioned<HashMap<String, MutableBatch>>>,
                 >,
             >,
@@ -73,7 +73,7 @@ impl TestContext {
         let time = iox_time::MockProvider::new(iox_time::Time::from_timestamp_millis(668563200000));
 
         let write_buffer = MockBufferForWriting::new(
-            MockBufferSharedState::empty_with_n_sequencers(1.try_into().unwrap()),
+            MockBufferSharedState::empty_with_n_shards(1.try_into().unwrap()),
             None,
             Arc::new(time),
         )
@@ -81,29 +81,23 @@ impl TestContext {
         let write_buffer_state = write_buffer.state();
         let write_buffer: Arc<dyn WriteBufferWriting> = Arc::new(write_buffer);
 
-        let shards: BTreeSet<_> = write_buffer.sequencer_ids();
-        let sharded_write_buffer = ShardedWriteBuffer::new(
-            JumpHash::new(
-                shards
-                    .into_iter()
-                    .map(|id| Sequencer::new(id as _, Arc::clone(&write_buffer), &metrics))
-                    .map(Arc::new),
-            )
-            .unwrap(),
-        );
+        let shards: BTreeSet<_> = write_buffer.shard_indexes();
+        let sharded_write_buffer = ShardedWriteBuffer::new(JumpHash::new(
+            shards
+                .into_iter()
+                .map(|shard_index| Shard::new(shard_index, Arc::clone(&write_buffer), &metrics))
+                .map(Arc::new),
+        ));
 
         let catalog: Arc<dyn Catalog> = Arc::new(MemCatalog::new(Arc::clone(&metrics)));
-        let ns_cache = Arc::new(
-            ShardedCache::new(
-                iter::repeat_with(|| Arc::new(MemoryNamespaceCache::default())).take(10),
-            )
-            .unwrap(),
-        );
+        let ns_cache = Arc::new(ShardedCache::new(
+            iter::repeat_with(|| Arc::new(MemoryNamespaceCache::default())).take(10),
+        ));
 
         let ns_creator = NamespaceAutocreation::new(
             Arc::clone(&catalog),
             Arc::clone(&ns_cache),
-            KafkaTopicId::new(TEST_KAFKA_TOPIC_ID),
+            TopicId::new(TEST_TOPIC_ID),
             QueryPoolId::new(TEST_QUERY_POOL_ID),
             iox_catalog::INFINITE_RETENTION_POLICY.to_owned(),
         );
@@ -178,7 +172,7 @@ async fn test_write_ok() {
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
     // Check the write buffer observed the correct write.
-    let writes = ctx.write_buffer_state().get_messages(0);
+    let writes = ctx.write_buffer_state().get_messages(ShardIndex::new(0));
     assert_eq!(writes.len(), 1);
     assert_matches!(writes.as_slice(), [Ok(DmlOperation::Write(w))] => {
         assert_eq!(w.namespace(), "bananas_test");
@@ -200,7 +194,7 @@ async fn test_write_ok() {
         ns.retention_duration.as_deref(),
         Some(iox_catalog::INFINITE_RETENTION_POLICY)
     );
-    assert_eq!(ns.kafka_topic_id, KafkaTopicId::new(TEST_KAFKA_TOPIC_ID));
+    assert_eq!(ns.topic_id, TopicId::new(TEST_TOPIC_ID));
     assert_eq!(ns.query_pool_id, QueryPoolId::new(TEST_QUERY_POOL_ID));
 
     // Ensure the metric instrumentation was hit
@@ -229,7 +223,7 @@ async fn test_write_ok() {
 
     let histogram = ctx
         .metrics()
-        .get_instrument::<Metric<DurationHistogram>>("sequencer_enqueue_duration")
+        .get_instrument::<Metric<DurationHistogram>>("shard_enqueue_duration")
         .expect("failed to read metric")
         .get_observer(&Attributes::from(&[
             ("kafka_partition", "0"),

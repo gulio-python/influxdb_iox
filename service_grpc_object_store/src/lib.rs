@@ -68,7 +68,7 @@ impl object_store_service_server::ObjectStoreService for ObjectStoreService {
         let path = ParquetFilePath::new(
             parquet_file.namespace_id,
             parquet_file.table_id,
-            parquet_file.sequencer_id,
+            parquet_file.shard_id,
             parquet_file.partition_id,
             parquet_file.object_store_id,
         );
@@ -96,7 +96,7 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use data_types::{
-        ColumnId, ColumnSet, CompactionLevel, KafkaPartition, ParquetFileParams, SequenceNumber,
+        ColumnId, ColumnSet, CompactionLevel, ParquetFileParams, SequenceNumber, ShardIndex,
         Timestamp,
     };
     use generated_types::influxdata::iox::object_store::v1::object_store_service_server::ObjectStoreService;
@@ -112,24 +112,20 @@ mod tests {
             let metrics = Arc::new(metric::Registry::default());
             let catalog = Arc::new(MemCatalog::new(metrics));
             let mut repos = catalog.repositories().await;
-            let kafka = repos
-                .kafka_topics()
-                .create_or_get("iox-shared")
-                .await
-                .unwrap();
+            let topic = repos.topics().create_or_get("iox-shared").await.unwrap();
             let pool = repos
                 .query_pools()
                 .create_or_get("iox-shared")
                 .await
                 .unwrap();
-            let sequencer = repos
-                .sequencers()
-                .create_or_get(&kafka, KafkaPartition::new(1))
+            let shard = repos
+                .shards()
+                .create_or_get(&topic, ShardIndex::new(1))
                 .await
                 .unwrap();
             let namespace = repos
                 .namespaces()
-                .create("catalog_partition_test", "inf", kafka.id, pool.id)
+                .create("catalog_partition_test", "inf", topic.id, pool.id)
                 .await
                 .unwrap();
             let table = repos
@@ -139,11 +135,11 @@ mod tests {
                 .unwrap();
             let partition = repos
                 .partitions()
-                .create_or_get("foo".into(), sequencer.id, table.id)
+                .create_or_get("foo".into(), shard.id, table.id)
                 .await
                 .unwrap();
             let p1params = ParquetFileParams {
-                sequencer_id: sequencer.id,
+                shard_id: shard.id,
                 namespace_id: namespace.id,
                 table_id: table.id,
                 partition_id: partition.id,
@@ -167,7 +163,7 @@ mod tests {
         let path = ParquetFilePath::new(
             p1.namespace_id,
             p1.table_id,
-            p1.sequencer_id,
+            p1.shard_id,
             p1.partition_id,
             p1.object_store_id,
         );

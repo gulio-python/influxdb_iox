@@ -11,6 +11,7 @@
 )]
 
 pub mod compact;
+pub(crate) mod compact_hot_partitions;
 pub mod garbage_collector;
 pub mod handler;
 pub(crate) mod parquet_file_combining;
@@ -23,6 +24,7 @@ pub mod utils;
 use crate::compact::{Compactor, PartitionCompactionCandidateWithInfo};
 use data_types::CompactionLevel;
 use metric::Attributes;
+use parquet_file_filtering::FilteredFiles;
 use snafu::{ResultExt, Snafu};
 use std::sync::Arc;
 
@@ -48,35 +50,21 @@ pub(crate) enum Error {
 /// One compaction operation of one hot partition
 pub(crate) async fn compact_hot_partition(
     compactor: &Compactor,
-    partition: PartitionCompactionCandidateWithInfo,
+    to_compact: FilteredFiles,
 ) -> Result<(), Error> {
     let start_time = compactor.time_provider.now();
-    let sequencer_id = partition.sequencer_id();
 
-    let parquet_files_for_compaction =
-        parquet_file_lookup::ParquetFilesForCompaction::for_partition(
-            Arc::clone(&compactor.catalog),
-            partition.id(),
-        )
-        .await
-        .context(LookupSnafu)?;
-
-    let to_compact = parquet_file_filtering::filter_hot_parquet_files(
-        parquet_files_for_compaction,
-        compactor.config.input_size_threshold_bytes(),
-        compactor.config.input_file_count_threshold(),
-        &compactor.parquet_file_candidate_gauge,
-        &compactor.parquet_file_candidate_bytes_gauge,
-    );
+    let partition = to_compact.partition;
+    let shard_id = partition.shard_id();
 
     let compact_result = parquet_file_combining::compact_parquet_files(
-        to_compact,
+        to_compact.files,
         partition,
         Arc::clone(&compactor.catalog),
         compactor.store.clone(),
         Arc::clone(&compactor.exec),
         Arc::clone(&compactor.time_provider),
-        &compactor.compaction_counter,
+        &compactor.compaction_input_file_bytes,
         compactor.config.max_desired_file_size_bytes(),
         compactor.config.percentage_max_file_size(),
         compactor.config.split_percentage(),
@@ -85,7 +73,7 @@ pub(crate) async fn compact_hot_partition(
     .context(CombiningSnafu);
 
     let attributes = Attributes::from([
-        ("sequencer_id", format!("{}", sequencer_id).into()),
+        ("shard_id", format!("{}", shard_id).into()),
         ("partition_type", "hot".into()),
     ]);
     if let Some(delta) = compactor
@@ -106,7 +94,7 @@ pub(crate) async fn compact_cold_partition(
     partition: PartitionCompactionCandidateWithInfo,
 ) -> Result<(), Error> {
     let start_time = compactor.time_provider.now();
-    let sequencer_id = partition.sequencer_id();
+    let shard_id = partition.shard_id();
 
     let parquet_files_for_compaction =
         parquet_file_lookup::ParquetFilesForCompaction::for_partition(
@@ -119,8 +107,9 @@ pub(crate) async fn compact_cold_partition(
     let to_compact = parquet_file_filtering::filter_cold_parquet_files(
         parquet_files_for_compaction,
         compactor.config.cold_input_size_threshold_bytes(),
+        compactor.config.cold_input_file_count_threshold(),
         &compactor.parquet_file_candidate_gauge,
-        &compactor.parquet_file_candidate_bytes_gauge,
+        &compactor.parquet_file_candidate_bytes,
     );
 
     let compact_result =
@@ -142,7 +131,7 @@ pub(crate) async fn compact_cold_partition(
                 compactor.store.clone(),
                 Arc::clone(&compactor.exec),
                 Arc::clone(&compactor.time_provider),
-                &compactor.compaction_counter,
+                &compactor.compaction_input_file_bytes,
                 compactor.config.max_desired_file_size_bytes(),
                 compactor.config.percentage_max_file_size(),
                 compactor.config.split_percentage(),
@@ -152,7 +141,7 @@ pub(crate) async fn compact_cold_partition(
         };
 
     let attributes = Attributes::from([
-        ("sequencer_id", format!("{}", sequencer_id).into()),
+        ("shard_id", format!("{}", shard_id).into()),
         ("partition_type", "cold".into()),
     ]);
     if let Some(delta) = compactor
@@ -174,7 +163,7 @@ mod tests {
     use arrow::record_batch::RecordBatch;
     use arrow_util::assert_batches_sorted_eq;
     use backoff::BackoffConfig;
-    use data_types::{ColumnType, CompactionLevel, ParquetFile};
+    use data_types::{ColumnType, ColumnTypeCount, CompactionLevel, ParquetFile};
     use iox_query::exec::Executor;
     use iox_tests::util::{TestCatalog, TestParquetFileBuilder, TestTable};
     use iox_time::{SystemProvider, TimeProvider};
@@ -234,22 +223,33 @@ mod tests {
         .join("\n");
 
         let ns = catalog.create_namespace("ns").await;
-        let sequencer = ns.create_sequencer(1).await;
+        let shard = ns.create_shard(1).await;
         let table = ns.create_table("table").await;
         table.create_column("field_int", ColumnType::I64).await;
         table.create_column("tag1", ColumnType::Tag).await;
         table.create_column("tag2", ColumnType::Tag).await;
         table.create_column("tag3", ColumnType::Tag).await;
         table.create_column("time", ColumnType::Time).await;
-        let partition = table
-            .with_sequencer(&sequencer)
-            .create_partition("part")
-            .await;
+        let table_column_types = vec![
+            ColumnTypeCount {
+                col_type: ColumnType::Tag as i16,
+                count: 3,
+            },
+            ColumnTypeCount {
+                col_type: ColumnType::I64 as i16,
+                count: 1,
+            },
+            ColumnTypeCount {
+                col_type: ColumnType::Time as i16,
+                count: 1,
+            },
+        ];
+        let partition = table.with_shard(&shard).create_partition("part").await;
         let time = Arc::new(SystemProvider::new());
         let config = make_compactor_config();
         let metrics = Arc::new(metric::Registry::new());
         let compactor = Compactor::new(
-            vec![sequencer.sequencer.id],
+            vec![shard.shard.id],
             Arc::clone(&catalog.catalog),
             ParquetStorage::new(Arc::clone(&catalog.object_store)),
             Arc::new(Executor::new(1)),
@@ -324,14 +324,14 @@ mod tests {
         partition.create_parquet_file(builder).await;
 
         // should have 4 level-0 files before compacting
-        let count = catalog.count_level_0_files(sequencer.sequencer.id).await;
+        let count = catalog.count_level_0_files(shard.shard.id).await;
         assert_eq!(count, 4);
 
         // ------------------------------------------------
         // Compact
         let candidates = compactor
             .hot_partitions_to_compact(
-                compactor.config.max_number_partitions_per_sequencer(),
+                compactor.config.max_number_partitions_per_shard(),
                 compactor
                     .config
                     .min_number_recent_ingested_files_per_partition(),
@@ -341,9 +341,26 @@ mod tests {
         let mut candidates = compactor.add_info_to_partitions(&candidates).await.unwrap();
 
         assert_eq!(candidates.len(), 1);
-        let c = candidates.pop().unwrap();
+        let c = candidates.pop_front().unwrap();
 
-        compact_hot_partition(&compactor, c).await.unwrap();
+        let parquet_files_for_compaction =
+            parquet_file_lookup::ParquetFilesForCompaction::for_partition(
+                Arc::clone(&compactor.catalog),
+                c.id(),
+            )
+            .await
+            .unwrap();
+
+        let to_compact = parquet_file_filtering::filter_hot_parquet_files(
+            c,
+            parquet_files_for_compaction,
+            compactor.config.memory_budget_bytes(),
+            &table_column_types,
+            &compactor.parquet_file_candidate_gauge,
+            &compactor.parquet_file_candidate_bytes,
+        );
+
+        compact_hot_partition(&compactor, to_compact).await.unwrap();
 
         // Should have 3 non-soft-deleted files:
         //
@@ -455,23 +472,20 @@ mod tests {
         .join("\n");
 
         let ns = catalog.create_namespace("ns").await;
-        let sequencer = ns.create_sequencer(1).await;
+        let shard = ns.create_shard(1).await;
         let table = ns.create_table("table").await;
         table.create_column("field_int", ColumnType::I64).await;
         table.create_column("tag1", ColumnType::Tag).await;
         table.create_column("tag2", ColumnType::Tag).await;
         table.create_column("tag3", ColumnType::Tag).await;
         table.create_column("time", ColumnType::Time).await;
-        let partition = table
-            .with_sequencer(&sequencer)
-            .create_partition("part")
-            .await;
+        let partition = table.with_shard(&shard).create_partition("part").await;
         let time = Arc::new(SystemProvider::new());
         let time_38_hour_ago = (time.now() - Duration::from_secs(60 * 60 * 38)).timestamp_nanos();
         let config = make_compactor_config();
         let metrics = Arc::new(metric::Registry::new());
         let compactor = Compactor::new(
-            vec![sequencer.sequencer.id],
+            vec![shard.shard.id],
             Arc::clone(&catalog.catalog),
             ParquetStorage::new(Arc::clone(&catalog.object_store)),
             Arc::new(Executor::new(1)),
@@ -546,19 +560,19 @@ mod tests {
         partition.create_parquet_file(builder).await;
 
         // should have 4 level-0 files before compacting
-        let count = catalog.count_level_0_files(sequencer.sequencer.id).await;
+        let count = catalog.count_level_0_files(shard.shard.id).await;
         assert_eq!(count, 4);
 
         // ------------------------------------------------
         // Compact
         let candidates = compactor
-            .cold_partitions_to_compact(compactor.config.max_number_partitions_per_sequencer())
+            .cold_partitions_to_compact(compactor.config.max_number_partitions_per_shard())
             .await
             .unwrap();
         let mut candidates = compactor.add_info_to_partitions(&candidates).await.unwrap();
 
         assert_eq!(candidates.len(), 1);
-        let c = candidates.pop().unwrap();
+        let c = candidates.pop_front().unwrap();
 
         compact_cold_partition(&compactor, c).await.unwrap();
 
@@ -642,23 +656,20 @@ mod tests {
         .join("\n");
 
         let ns = catalog.create_namespace("ns").await;
-        let sequencer = ns.create_sequencer(1).await;
+        let shard = ns.create_shard(1).await;
         let table = ns.create_table("table").await;
         table.create_column("field_int", ColumnType::I64).await;
         table.create_column("tag1", ColumnType::Tag).await;
         table.create_column("tag2", ColumnType::Tag).await;
         table.create_column("tag3", ColumnType::Tag).await;
         table.create_column("time", ColumnType::Time).await;
-        let partition = table
-            .with_sequencer(&sequencer)
-            .create_partition("part")
-            .await;
+        let partition = table.with_shard(&shard).create_partition("part").await;
         let time = Arc::new(SystemProvider::new());
         let time_38_hour_ago = (time.now() - Duration::from_secs(60 * 60 * 38)).timestamp_nanos();
         let config = make_compactor_config();
         let metrics = Arc::new(metric::Registry::new());
         let compactor = Compactor::new(
-            vec![sequencer.sequencer.id],
+            vec![shard.shard.id],
             Arc::clone(&catalog.catalog),
             ParquetStorage::new(Arc::clone(&catalog.object_store)),
             Arc::new(Executor::new(1)),
@@ -692,19 +703,19 @@ mod tests {
         partition.create_parquet_file(builder).await;
 
         // should have 1 level-0 file before compacting
-        let count = catalog.count_level_0_files(sequencer.sequencer.id).await;
+        let count = catalog.count_level_0_files(shard.shard.id).await;
         assert_eq!(count, 1);
 
         // ------------------------------------------------
         // Compact
         let candidates = compactor
-            .cold_partitions_to_compact(compactor.config.max_number_partitions_per_sequencer())
+            .cold_partitions_to_compact(compactor.config.max_number_partitions_per_shard())
             .await
             .unwrap();
         let mut candidates = compactor.add_info_to_partitions(&candidates).await.unwrap();
 
         assert_eq!(candidates.len(), 1);
-        let c = candidates.pop().unwrap();
+        let c = candidates.pop_front().unwrap();
 
         compact_cold_partition(&compactor, c).await.unwrap();
 
@@ -712,7 +723,6 @@ mod tests {
         //
         // - the level 1 file that didn't overlap with anything
         // - the newly created level 1 file that was only upgraded from level 0
-        // - the two newly created after compacting and splitting pf1, pf2, pf3, pf4, pf5
         let mut files = catalog.list_by_table_not_to_delete(table.table.id).await;
         assert_eq!(files.len(), 2);
         let files_and_levels: Vec<_> = files
@@ -786,27 +796,25 @@ mod tests {
         let max_desired_file_size_bytes = 10_000;
         let percentage_max_file_size = 30;
         let split_percentage = 80;
-        let max_concurrent_size_bytes = 100_000;
         let max_cold_concurrent_size_bytes = 90_000;
-        let max_number_partitions_per_sequencer = 1;
+        let max_number_partitions_per_shard = 1;
         let min_number_recent_ingested_per_partition = 1;
-        let input_size_threshold_bytes = 300 * 1024 * 1024;
         let cold_input_size_threshold_bytes = 600 * 1024 * 1024;
-        let input_file_count_threshold = 100;
+        let cold_input_file_count_threshold = 100;
         let hot_multiple = 4;
+        let memory_budget_bytes = 100_000_000;
 
         CompactorConfig::new(
             max_desired_file_size_bytes,
             percentage_max_file_size,
             split_percentage,
-            max_concurrent_size_bytes,
             max_cold_concurrent_size_bytes,
-            max_number_partitions_per_sequencer,
+            max_number_partitions_per_shard,
             min_number_recent_ingested_per_partition,
-            input_size_threshold_bytes,
             cold_input_size_threshold_bytes,
-            input_file_count_threshold,
+            cold_input_file_count_threshold,
             hot_multiple,
+            memory_budget_bytes,
         )
     }
 }

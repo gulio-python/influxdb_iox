@@ -68,7 +68,7 @@ impl GarbageCollector {
             let path = ParquetFilePath::new(
                 catalog_record.namespace_id,
                 catalog_record.table_id,
-                catalog_record.sequencer_id,
+                catalog_record.shard_id,
                 catalog_record.partition_id,
                 catalog_record.object_store_id,
             );
@@ -94,8 +94,8 @@ impl GarbageCollector {
 mod tests {
     use super::*;
     use data_types::{
-        ColumnId, ColumnSet, CompactionLevel, KafkaPartition, ParquetFile, ParquetFileParams,
-        SequenceNumber,
+        ColumnId, ColumnSet, CompactionLevel, ParquetFile, ParquetFileParams, SequenceNumber,
+        ShardIndex,
     };
     use futures::{StreamExt, TryStreamExt};
     use iox_tests::util::TestCatalog;
@@ -114,7 +114,7 @@ mod tests {
         let path = ParquetFilePath::new(
             catalog_record.namespace_id,
             catalog_record.table_id,
-            catalog_record.sequencer_id,
+            catalog_record.shard_id,
             catalog_record.partition_id,
             catalog_record.object_store_id,
         );
@@ -147,11 +147,11 @@ mod tests {
             Timestamp::new((gc.time_provider.now() + Duration::from_secs(100)).timestamp_nanos());
 
         let mut txn = catalog.catalog.start_transaction().await.unwrap();
-        let kafka = txn.kafka_topics().create_or_get("foo").await.unwrap();
+        let topic = txn.topics().create_or_get("foo").await.unwrap();
         let pool = txn.query_pools().create_or_get("foo").await.unwrap();
         let namespace = txn
             .namespaces()
-            .create("gc_leave_undeleted_files_alone", "inf", kafka.id, pool.id)
+            .create("gc_leave_undeleted_files_alone", "inf", topic.id, pool.id)
             .await
             .unwrap();
         let table = txn
@@ -159,14 +159,14 @@ mod tests {
             .create_or_get("test_table", namespace.id)
             .await
             .unwrap();
-        let sequencer = txn
-            .sequencers()
-            .create_or_get(&kafka, KafkaPartition::new(1))
+        let shard = txn
+            .shards()
+            .create_or_get(&topic, ShardIndex::new(1))
             .await
             .unwrap();
         let partition = txn
             .partitions()
-            .create_or_get("one".into(), sequencer.id, table.id)
+            .create_or_get("one".into(), shard.id, table.id)
             .await
             .unwrap();
 
@@ -174,7 +174,7 @@ mod tests {
         let max_time = Timestamp::new(10);
 
         let parquet_file_params = ParquetFileParams {
-            sequencer_id: sequencer.id,
+            shard_id: shard.id,
             namespace_id: namespace.id,
             table_id: partition.table_id,
             partition_id: partition.id,
@@ -228,11 +228,11 @@ mod tests {
             Timestamp::new((gc.time_provider.now() - Duration::from_secs(100)).timestamp_nanos());
 
         let mut txn = catalog.catalog.start_transaction().await.unwrap();
-        let kafka = txn.kafka_topics().create_or_get("foo").await.unwrap();
+        let topic = txn.topics().create_or_get("foo").await.unwrap();
         let pool = txn.query_pools().create_or_get("foo").await.unwrap();
         let namespace = txn
             .namespaces()
-            .create("gc_leave_too_new_files_alone", "inf", kafka.id, pool.id)
+            .create("gc_leave_too_new_files_alone", "inf", topic.id, pool.id)
             .await
             .unwrap();
         let table = txn
@@ -240,14 +240,14 @@ mod tests {
             .create_or_get("test_table", namespace.id)
             .await
             .unwrap();
-        let sequencer = txn
-            .sequencers()
-            .create_or_get(&kafka, KafkaPartition::new(1))
+        let shard = txn
+            .shards()
+            .create_or_get(&topic, ShardIndex::new(1))
             .await
             .unwrap();
         let partition = txn
             .partitions()
-            .create_or_get("one".into(), sequencer.id, table.id)
+            .create_or_get("one".into(), shard.id, table.id)
             .await
             .unwrap();
 
@@ -255,7 +255,7 @@ mod tests {
         let max_time = Timestamp::new(10);
 
         let parquet_file_params = ParquetFileParams {
-            sequencer_id: sequencer.id,
+            shard_id: shard.id,
             namespace_id: namespace.id,
             table_id: partition.table_id,
             partition_id: partition.id,
@@ -313,11 +313,11 @@ mod tests {
             Timestamp::new((gc.time_provider.now() + Duration::from_secs(100)).timestamp_nanos());
 
         let mut txn = catalog.catalog.start_transaction().await.unwrap();
-        let kafka = txn.kafka_topics().create_or_get("foo").await.unwrap();
+        let topic = txn.topics().create_or_get("foo").await.unwrap();
         let pool = txn.query_pools().create_or_get("foo").await.unwrap();
         let namespace = txn
             .namespaces()
-            .create("gc_remove_old_enough_files", "inf", kafka.id, pool.id)
+            .create("gc_remove_old_enough_files", "inf", topic.id, pool.id)
             .await
             .unwrap();
         let table = txn
@@ -325,14 +325,14 @@ mod tests {
             .create_or_get("test_table", namespace.id)
             .await
             .unwrap();
-        let sequencer = txn
-            .sequencers()
-            .create_or_get(&kafka, KafkaPartition::new(1))
+        let shard = txn
+            .shards()
+            .create_or_get(&topic, ShardIndex::new(1))
             .await
             .unwrap();
         let partition = txn
             .partitions()
-            .create_or_get("one".into(), sequencer.id, table.id)
+            .create_or_get("one".into(), shard.id, table.id)
             .await
             .unwrap();
 
@@ -340,7 +340,7 @@ mod tests {
         let max_time = Timestamp::new(10);
 
         let parquet_file_params = ParquetFileParams {
-            sequencer_id: sequencer.id,
+            shard_id: shard.id,
             namespace_id: namespace.id,
             table_id: partition.table_id,
             partition_id: partition.id,
