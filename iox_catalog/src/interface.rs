@@ -329,7 +329,6 @@ pub trait TableRepo: Send + Sync {
 #[derive(Debug, Copy, Clone, Eq, PartialEq, sqlx::FromRow)]
 pub struct TablePersistInfo {
     /// shard the sequence numbers are associated with
-    #[sqlx(rename = "sequencer_id")]
     pub shard_id: ShardId,
     /// the global identifier for the table
     pub table_id: TableId,
@@ -562,7 +561,7 @@ pub trait ParquetFileRepo: Send + Sync {
     async fn recent_highest_throughput_partitions(
         &mut self,
         shard_id: ShardId,
-        num_hours: u32,
+        time_at_num_minutes_ago: Timestamp,
         min_num_files: usize,
         num_partitions: usize,
     ) -> Result<Vec<PartitionParam>>;
@@ -572,7 +571,7 @@ pub trait ParquetFileRepo: Send + Sync {
     async fn most_level_0_files_partitions(
         &mut self,
         shard_id: ShardId,
-        older_than_num_hours: u32,
+        time_in_the_past: Timestamp,
         num_partitions: usize,
     ) -> Result<Vec<PartitionParam>>;
 
@@ -2726,13 +2725,16 @@ pub(crate) mod test_helpers {
             (catalog.time_provider().now() - Duration::from_secs(60 * 60 * 38)).timestamp_nanos(),
         );
 
-        let older_than = 24;
         let num_partitions = 2;
+
+        let time_24_hours_ago = Timestamp::new(
+            (catalog.time_provider().now() - Duration::from_secs(60 * 60 * 24)).timestamp_nanos(),
+        );
 
         // Db has no partition
         let partitions = repos
             .parquet_files()
-            .most_level_0_files_partitions(shard.id, older_than, num_partitions)
+            .most_level_0_files_partitions(shard.id, time_24_hours_ago, num_partitions)
             .await
             .unwrap();
         assert!(partitions.is_empty());
@@ -2745,7 +2747,7 @@ pub(crate) mod test_helpers {
             .unwrap();
         let partitions = repos
             .parquet_files()
-            .most_level_0_files_partitions(shard.id, older_than, num_partitions)
+            .most_level_0_files_partitions(shard.id, time_24_hours_ago, num_partitions)
             .await
             .unwrap();
         assert!(partitions.is_empty());
@@ -2778,7 +2780,7 @@ pub(crate) mod test_helpers {
             .unwrap();
         let partitions = repos
             .parquet_files()
-            .most_level_0_files_partitions(shard.id, older_than, num_partitions)
+            .most_level_0_files_partitions(shard.id, time_24_hours_ago, num_partitions)
             .await
             .unwrap();
         assert!(partitions.is_empty());
@@ -2808,7 +2810,7 @@ pub(crate) mod test_helpers {
         repos.parquet_files().create(hot_file_params).await.unwrap();
         let partitions = repos
             .parquet_files()
-            .most_level_0_files_partitions(shard.id, older_than, num_partitions)
+            .most_level_0_files_partitions(shard.id, time_24_hours_ago, num_partitions)
             .await
             .unwrap();
         assert!(partitions.is_empty());
@@ -2825,7 +2827,7 @@ pub(crate) mod test_helpers {
             .unwrap();
         let partitions = repos
             .parquet_files()
-            .most_level_0_files_partitions(shard.id, older_than, num_partitions)
+            .most_level_0_files_partitions(shard.id, time_24_hours_ago, num_partitions)
             .await
             .unwrap();
         assert_eq!(partitions.len(), 1);
@@ -2859,7 +2861,7 @@ pub(crate) mod test_helpers {
         // Must return 2 partitions
         let partitions = repos
             .parquet_files()
-            .most_level_0_files_partitions(shard.id, older_than, num_partitions)
+            .most_level_0_files_partitions(shard.id, time_24_hours_ago, num_partitions)
             .await
             .unwrap();
         assert_eq!(partitions.len(), 2);
@@ -2886,7 +2888,7 @@ pub(crate) mod test_helpers {
         // Still return 2 partitions the limit num_partitions=2
         let partitions = repos
             .parquet_files()
-            .most_level_0_files_partitions(shard.id, older_than, num_partitions)
+            .most_level_0_files_partitions(shard.id, time_24_hours_ago, num_partitions)
             .await
             .unwrap();
         assert_eq!(partitions.len(), 2);
@@ -2928,9 +2930,14 @@ pub(crate) mod test_helpers {
             .unwrap();
 
         // params for the tests
-        let num_hours = 4;
+        let num_minutes = 4 * 60;
         let min_num_files = 2;
         let num_partitions = 2;
+
+        let time_at_num_minutes_ago = Timestamp::new(
+            (catalog.time_provider().now() - Duration::from_secs(60 * num_minutes))
+                .timestamp_nanos(),
+        );
 
         // Case 1
         // Db has no partition
@@ -2938,7 +2945,7 @@ pub(crate) mod test_helpers {
             .parquet_files()
             .recent_highest_throughput_partitions(
                 shard.id,
-                num_hours,
+                time_at_num_minutes_ago,
                 min_num_files,
                 num_partitions,
             )
@@ -2957,7 +2964,7 @@ pub(crate) mod test_helpers {
             .parquet_files()
             .recent_highest_throughput_partitions(
                 shard.id,
-                num_hours,
+                time_at_num_minutes_ago,
                 min_num_files,
                 num_partitions,
             )
@@ -3014,7 +3021,7 @@ pub(crate) mod test_helpers {
             .parquet_files()
             .recent_highest_throughput_partitions(
                 shard.id,
-                num_hours,
+                time_at_num_minutes_ago,
                 min_num_files,
                 num_partitions,
             )
@@ -3039,7 +3046,7 @@ pub(crate) mod test_helpers {
             .parquet_files()
             .recent_highest_throughput_partitions(
                 shard.id,
-                num_hours,
+                time_at_num_minutes_ago,
                 min_num_files,
                 num_partitions,
             )
@@ -3050,7 +3057,12 @@ pub(crate) mod test_helpers {
         // Case 4.2: min_num_files = 1
         let partitions = repos
             .parquet_files()
-            .recent_highest_throughput_partitions(shard.id, num_hours, 1, num_partitions)
+            .recent_highest_throughput_partitions(
+                shard.id,
+                time_at_num_minutes_ago,
+                1,
+                num_partitions,
+            )
             .await
             .unwrap();
         // and have one partition
@@ -3090,7 +3102,7 @@ pub(crate) mod test_helpers {
             .parquet_files()
             .recent_highest_throughput_partitions(
                 shard.id,
-                num_hours,
+                time_at_num_minutes_ago,
                 min_num_files,
                 num_partitions,
             )
@@ -3102,7 +3114,12 @@ pub(crate) mod test_helpers {
                                                                       // Case 5.2: min_num_files = 1
         let partitions = repos
             .parquet_files()
-            .recent_highest_throughput_partitions(shard.id, num_hours, 1, num_partitions)
+            .recent_highest_throughput_partitions(
+                shard.id,
+                time_at_num_minutes_ago,
+                1,
+                num_partitions,
+            )
             .await
             .unwrap();
         assert_eq!(partitions.len(), 2);
@@ -3138,7 +3155,7 @@ pub(crate) mod test_helpers {
             .parquet_files()
             .recent_highest_throughput_partitions(
                 shard.id,
-                num_hours,
+                time_at_num_minutes_ago,
                 min_num_files,
                 num_partitions,
             )
@@ -3151,7 +3168,12 @@ pub(crate) mod test_helpers {
                                                                       // Case 6.2: min_num_files = 1
         let partitions = repos
             .parquet_files()
-            .recent_highest_throughput_partitions(shard.id, num_hours, 1, num_partitions)
+            .recent_highest_throughput_partitions(
+                shard.id,
+                time_at_num_minutes_ago,
+                1,
+                num_partitions,
+            )
             .await
             .unwrap();
         assert_eq!(partitions.len(), 2);

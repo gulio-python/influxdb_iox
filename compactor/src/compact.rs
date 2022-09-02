@@ -4,7 +4,7 @@ use crate::handler::CompactorConfig;
 use backoff::BackoffConfig;
 use data_types::{
     ColumnTypeCount, Namespace, NamespaceId, PartitionId, PartitionKey, PartitionParam, ShardId,
-    Table, TableId, TableSchema,
+    Table, TableId, TableSchema, Timestamp,
 };
 use iox_catalog::interface::{get_schema_by_id, Catalog};
 use iox_query::exec::Executor;
@@ -274,14 +274,20 @@ impl Compactor {
             ]);
 
             // Get the most recent highest ingested throughput partitions within
-            // the last 4 hours. If nothing, increase to 24 hours
+            // the last 4 hours. If not, increase to 24 hours
             let mut num_partitions = 0;
             for num_hours in [4, 24] {
+                // convert "now() - num_hours" to timenanosecond
+                let time_at_num_hours_ago = Timestamp::new(
+                    (self.time_provider.now() - Duration::from_secs(60 * 60 * num_hours))
+                        .timestamp_nanos(),
+                );
+
                 let mut partitions = repos
                     .parquet_files()
                     .recent_highest_throughput_partitions(
                         *shard_id,
-                        num_hours,
+                        time_at_num_hours_ago,
                         min_recent_ingested_files,
                         max_num_partitions_per_shard,
                     )
@@ -335,9 +341,17 @@ impl Compactor {
                 ("partition_type", "cold".into()),
             ]);
 
+            let time_24_hours_ago = Timestamp::new(
+                (self.time_provider.now() - Duration::from_secs(60 * 60 * 24)).timestamp_nanos(),
+            );
+
             let mut partitions = repos
                 .parquet_files()
-                .most_level_0_files_partitions(*shard_id, 24, max_num_partitions_per_shard)
+                .most_level_0_files_partitions(
+                    *shard_id,
+                    time_24_hours_ago,
+                    max_num_partitions_per_shard,
+                )
                 .await
                 .context(MostL0PartitionsSnafu {
                     shard_id: *shard_id,
@@ -611,8 +625,8 @@ mod tests {
 
         // Some times in the past to set to created_at of the files
         let time_now = Timestamp::new(compactor.time_provider.now().timestamp_nanos());
-        let time_three_hour_ago = Timestamp::new(
-            (compactor.time_provider.now() - Duration::from_secs(60 * 60 * 3)).timestamp_nanos(),
+        let time_three_minutes_ago = Timestamp::new(
+            (compactor.time_provider.now() - Duration::from_secs(60 * 3)).timestamp_nanos(),
         );
         let time_five_hour_ago = Timestamp::new(
             (compactor.time_provider.now() - Duration::from_secs(60 * 60 * 5)).timestamp_nanos(),
@@ -724,7 +738,7 @@ mod tests {
         let p5 = ParquetFileParams {
             object_store_id: Uuid::new_v4(),
             partition_id: partition3.id,
-            created_at: time_three_hour_ago,
+            created_at: time_three_minutes_ago,
             ..p1.clone()
         };
         let _pf5 = txn.parquet_files().create(p5).await.unwrap();
