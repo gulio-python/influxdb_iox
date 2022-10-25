@@ -9,7 +9,6 @@ use backoff::{Backoff, BackoffConfig};
 use data_types::{Namespace, ShardIndex};
 use iox_catalog::interface::Catalog;
 use iox_query::exec::Executor;
-use parquet_file::storage::ParquetStorage;
 use service_common::QueryDatabaseProvider;
 use sharder::JumpHash;
 use snafu::Snafu;
@@ -107,7 +106,6 @@ impl QuerierDatabase {
     pub async fn new(
         catalog_cache: Arc<CatalogCache>,
         metric_registry: Arc<metric::Registry>,
-        store: ParquetStorage,
         exec: Arc<Executor>,
         ingester_connection: Option<Arc<dyn IngesterConnection>>,
         max_concurrent_queries: usize,
@@ -124,9 +122,7 @@ impl QuerierDatabase {
 
         let chunk_adapter = Arc::new(ChunkAdapter::new(
             Arc::clone(&catalog_cache),
-            store,
             Arc::clone(&metric_registry),
-            Default::default(),
         ));
         let query_log = Arc::new(QueryLog::new(QUERY_LOG_SIZE, catalog_cache.time_provider()));
         let semaphore_metrics = Arc::new(AsyncSemaphoreMetrics::new(
@@ -263,7 +259,6 @@ mod tests {
         QuerierDatabase::new(
             catalog_cache,
             catalog.metric_registry(),
-            ParquetStorage::new(catalog.object_store()),
             catalog.exec(),
             Some(create_ingester_connection_for_testing()),
             QuerierDatabase::MAX_CONCURRENT_QUERIES_MAX.saturating_add(1),
@@ -289,7 +284,6 @@ mod tests {
             QuerierDatabase::new(
                 catalog_cache,
                 catalog.metric_registry(),
-                ParquetStorage::new(catalog.object_store()),
                 catalog.exec(),
                 Some(create_ingester_connection_for_testing()),
                 QuerierDatabase::MAX_CONCURRENT_QUERIES_MAX,
@@ -316,7 +310,6 @@ mod tests {
         let db = QuerierDatabase::new(
             catalog_cache,
             catalog.metric_registry(),
-            ParquetStorage::new(catalog.object_store()),
             catalog.exec(),
             Some(create_ingester_connection_for_testing()),
             QuerierDatabase::MAX_CONCURRENT_QUERIES_MAX,
@@ -347,7 +340,6 @@ mod tests {
         let db = QuerierDatabase::new(
             catalog_cache,
             catalog.metric_registry(),
-            ParquetStorage::new(catalog.object_store()),
             catalog.exec(),
             Some(create_ingester_connection_for_testing()),
             QuerierDatabase::MAX_CONCURRENT_QUERIES_MAX,

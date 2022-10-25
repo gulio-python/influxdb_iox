@@ -10,27 +10,38 @@ use data_types::{
     ShardIndex, Table, TableId, TableSchema, Timestamp, Tombstone, TombstoneId, TopicMetadata,
 };
 use datafusion::physical_plan::metrics::Count;
+use datafusion_util::MemoryStream;
 use iox_catalog::{
     interface::{get_schema_by_id, get_table_schema_by_id, Catalog, PartitionRepo},
     mem::MemCatalog,
 };
-use iox_query::{exec::Executor, provider::RecordBatchDeduplicator, util::arrow_sort_key_exprs};
+use iox_query::{
+    exec::{DedicatedExecutors, Executor, ExecutorConfig},
+    provider::RecordBatchDeduplicator,
+    util::arrow_sort_key_exprs,
+};
 use iox_time::{MockProvider, Time, TimeProvider};
 use mutable_batch_lp::test_helpers::lp_to_mutable_batch;
 use object_store::{memory::InMemory, DynObjectStore};
 use observability_deps::tracing::debug;
 use once_cell::sync::Lazy;
-use parquet_file::{metadata::IoxMetadata, storage::ParquetStorage};
+use parquet_file::{
+    chunk::ParquetChunk,
+    metadata::IoxMetadata,
+    storage::{ParquetStorage, StorageId},
+};
+use predicate::Predicate;
 use schema::{
     selection::Selection,
     sort::{adjust_sort_key_columns, compute_sort_key, SortKey},
     Schema,
 };
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 use uuid::Uuid;
 
 /// Global executor used by all test catalogs.
-static GLOBAL_EXEC: Lazy<Arc<Executor>> = Lazy::new(|| Arc::new(Executor::new(1)));
+static GLOBAL_EXEC: Lazy<Arc<DedicatedExecutors>> =
+    Lazy::new(|| Arc::new(DedicatedExecutors::new(1)));
 
 /// Catalog for tests
 #[derive(Debug)]
@@ -39,6 +50,7 @@ pub struct TestCatalog {
     pub catalog: Arc<dyn Catalog>,
     pub metric_registry: Arc<metric::Registry>,
     pub object_store: Arc<DynObjectStore>,
+    pub parquet_store: ParquetStorage,
     pub time_provider: Arc<MockProvider>,
     pub exec: Arc<Executor>,
 }
@@ -46,25 +58,39 @@ pub struct TestCatalog {
 impl TestCatalog {
     /// Initialize the catalog
     ///
-    /// All test catalogs use the same [`Executor`]. Use [`with_exec`](Self::with_exec) if you need a special or
+    /// All test catalogs use the same [`Executor`]. Use [`with_execs`](Self::with_execs) if you need a special or
     /// dedicated executor.
     pub fn new() -> Arc<Self> {
         let exec = Arc::clone(&GLOBAL_EXEC);
 
-        Self::with_exec(exec)
+        Self::with_execs(exec, 1)
     }
 
-    /// Initialize with given executor.
-    pub fn with_exec(exec: Arc<Executor>) -> Arc<Self> {
+    /// Initialize with given executors.
+    pub fn with_execs(exec: Arc<DedicatedExecutors>, target_query_partitions: usize) -> Arc<Self> {
         let metric_registry = Arc::new(metric::Registry::new());
         let catalog: Arc<dyn Catalog> = Arc::new(MemCatalog::new(Arc::clone(&metric_registry)));
         let object_store = Arc::new(InMemory::new());
+        let parquet_store =
+            ParquetStorage::new(Arc::clone(&object_store) as _, StorageId::from("iox"));
         let time_provider = Arc::new(MockProvider::new(Time::from_timestamp(0, 0)));
+        let exec = Arc::new(Executor::new_with_config_and_executors(
+            ExecutorConfig {
+                num_threads: exec.num_threads(),
+                target_query_partitions,
+                object_stores: HashMap::from([(
+                    parquet_store.id(),
+                    Arc::clone(parquet_store.object_store()),
+                )]),
+            },
+            exec,
+        ));
 
         Arc::new(Self {
             metric_registry,
             catalog,
             object_store,
+            parquet_store,
             time_provider,
             exec,
         })
@@ -119,7 +145,7 @@ impl TestCatalog {
         )
     }
 
-    /// Create a namesapce in the catalog
+    /// Create a namespace in the catalog
     pub async fn create_namespace(self: &Arc<Self>, name: &str) -> Arc<TestNamespace> {
         let mut repos = self.catalog.repositories().await;
 
@@ -265,6 +291,16 @@ impl TestNamespace {
             .await
             .unwrap()
     }
+
+    /// Set the number of columns per table allowed in this namespace.
+    pub async fn update_column_limit(&self, new_max: i32) {
+        let mut repos = self.catalog.catalog.repositories().await;
+        repos
+            .namespaces()
+            .update_column_limit(&self.namespace.name, new_max)
+            .await
+            .unwrap();
+    }
 }
 
 /// A test shard with its namespace in the catalog
@@ -333,6 +369,36 @@ impl TestTable {
     /// Get schema for this table.
     pub async fn schema(&self) -> Schema {
         self.catalog_schema().await.try_into().unwrap()
+    }
+
+    /// Read the record batches from the specified Parquet File associated with this table.
+    pub async fn read_parquet_file(&self, file: ParquetFile) -> Vec<RecordBatch> {
+        // get schema
+        let table_catalog_schema = self.catalog_schema().await;
+        let column_id_lookup = table_catalog_schema.column_id_map();
+        let table_schema = self.schema().await;
+        let selection: Vec<_> = file
+            .column_set
+            .iter()
+            .map(|id| *column_id_lookup.get(id).unwrap())
+            .collect();
+        let schema = table_schema.select_by_names(&selection).unwrap();
+
+        let chunk = ParquetChunk::new(
+            Arc::new(file),
+            Arc::new(schema),
+            self.catalog.parquet_store.clone(),
+        );
+        let rx = chunk
+            .read_filter(
+                &Predicate::default(),
+                Selection::All,
+                &chunk.store().test_df_context(),
+            )
+            .unwrap();
+        datafusion::physical_plan::common::collect(rx)
+            .await
+            .unwrap()
     }
 }
 
@@ -484,6 +550,7 @@ impl TestPartition {
             min_time,
             max_time,
             file_size_bytes,
+            size_override,
             creation_time,
             compaction_level,
             to_delete,
@@ -525,7 +592,10 @@ impl TestPartition {
             sort_key: Some(sort_key.clone()),
         };
         let real_file_size_bytes = create_parquet_file(
-            ParquetStorage::new(Arc::clone(&self.catalog.object_store)),
+            ParquetStorage::new(
+                Arc::clone(&self.catalog.object_store),
+                StorageId::from("iox"),
+            ),
             &metadata,
             record_batch.clone(),
         )
@@ -539,6 +609,7 @@ impl TestPartition {
             min_time,
             max_time,
             file_size_bytes: Some(file_size_bytes.unwrap_or(real_file_size_bytes as u64)),
+            size_override,
             creation_time,
             compaction_level,
             to_delete,
@@ -564,6 +635,7 @@ impl TestPartition {
             min_time,
             max_time,
             file_size_bytes,
+            size_override,
             creation_time,
             compaction_level,
             to_delete,
@@ -579,7 +651,7 @@ impl TestPartition {
                 table_catalog_schema
                     .columns
                     .get(f.name())
-                    .expect("Column registered")
+                    .unwrap_or_else(|| panic!("Column {} is not registered", f.name()))
                     .id
             }));
 
@@ -633,6 +705,7 @@ impl TestPartition {
             shard: Arc::clone(&self.shard),
             partition: Arc::clone(self),
             parquet_file,
+            size_override,
         }
     }
 }
@@ -647,6 +720,7 @@ pub struct TestParquetFileBuilder {
     min_time: i64,
     max_time: i64,
     file_size_bytes: Option<u64>,
+    size_override: Option<i64>,
     creation_time: i64,
     compaction_level: CompactionLevel,
     to_delete: bool,
@@ -664,6 +738,7 @@ impl Default for TestParquetFileBuilder {
             min_time: now().timestamp_nanos(),
             max_time: now().timestamp_nanos(),
             file_size_bytes: None,
+            size_override: None,
             creation_time: 1,
             compaction_level: CompactionLevel::Initial,
             to_delete: false,
@@ -719,15 +794,9 @@ impl TestParquetFileBuilder {
         self
     }
 
-    /// Specify the file size, in bytes, for the parquet file metadata.
-    pub fn with_file_size_bytes(mut self, file_size_bytes: u64) -> Self {
-        self.file_size_bytes = Some(file_size_bytes);
-        self
-    }
-
     /// Specify the creation time for the parquet file metadata.
-    pub fn with_creation_time(mut self, creation_time: i64) -> Self {
-        self.creation_time = creation_time;
+    pub fn with_creation_time(mut self, creation_time: iox_time::Time) -> Self {
+        self.creation_time = creation_time.timestamp_nanos();
         self
     }
 
@@ -747,6 +816,12 @@ impl TestParquetFileBuilder {
     /// set, this will panic! Only use this when you're not specifying any rows!
     pub fn with_row_count(mut self, row_count: usize) -> Self {
         self.row_count = Some(row_count);
+        self
+    }
+
+    /// Specify the size override to use for a CompactorParquetFile
+    pub fn with_size_override(mut self, size_override: i64) -> Self {
+        self.size_override = Some(size_override);
         self
     }
 }
@@ -799,7 +874,7 @@ async fn create_parquet_file(
     metadata: &IoxMetadata,
     record_batch: RecordBatch,
 ) -> usize {
-    let stream = futures::stream::once(async { Ok(record_batch) });
+    let stream = Box::pin(MemoryStream::new(vec![record_batch]));
     let (_meta, file_size) = store
         .upload(stream, metadata)
         .await
@@ -816,6 +891,7 @@ pub struct TestParquetFile {
     pub shard: Arc<TestShard>,
     pub partition: Arc<TestPartition>,
     pub parquet_file: ParquetFile,
+    pub size_override: Option<i64>,
 }
 
 impl TestParquetFile {
@@ -930,5 +1006,5 @@ fn dedup_batch(record_batch: RecordBatch, sort_key: &SortKey) -> RecordBatch {
         batches.push(batch);
     }
 
-    RecordBatch::concat(&schema, &batches).unwrap()
+    arrow::compute::concat_batches(&schema, &batches).unwrap()
 }

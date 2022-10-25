@@ -4,8 +4,7 @@ use crate::{
     scenarios::{
         AnotherMeasurementForAggs, DbScenario, DbSetup, MeasurementForDefect2691,
         MeasurementForGroupByField, MeasurementForGroupKeys, MeasurementForMax, MeasurementForMin,
-        MeasurementForSelectors, OneMeasurementForAggs, OneMeasurementNoTags2,
-        OneMeasurementNoTagsWithDelete, OneMeasurementNoTagsWithDeleteAllWithAndWithoutChunk,
+        MeasurementForSelectors, OneMeasurementForAggs, OneMeasurementNoTags2, PeriodsInNames,
         TwoMeasurementForAggs, TwoMeasurementsManyFields, TwoMeasurementsManyFieldsOneChunk,
     },
 };
@@ -39,7 +38,7 @@ async fn run_read_group_test_case<D>(
 
         let plans = planner
             .read_group(
-                db.as_query_database(),
+                db.as_query_database_arc(),
                 predicate.clone(),
                 agg,
                 &group_columns,
@@ -85,75 +84,6 @@ async fn test_read_group_data_no_tag_columns() {
 
     run_read_group_test_case(
         OneMeasurementNoTags2 {},
-        InfluxRpcPredicate::default(),
-        agg,
-        group_columns,
-        expected_results,
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn test_read_group_data_no_tag_columns_count_with_delete() {
-    let agg = Aggregate::Count;
-    let group_columns = vec![];
-    let expected_results = vec![
-        "Group tag_keys: _field, _measurement partition_key_vals: ",
-        "Series tags={_field=foo, _measurement=m0}\n  IntegerPoints timestamps: [2], values: [1]",
-    ];
-    run_read_group_test_case(
-        OneMeasurementNoTagsWithDelete {},
-        InfluxRpcPredicate::default(),
-        agg,
-        group_columns.clone(),
-        expected_results,
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn test_read_group_data_no_tag_columns_min_with_delete() {
-    let agg = Aggregate::Min;
-    let group_columns = vec![];
-    let expected_results = vec![
-        "Group tag_keys: _field, _measurement partition_key_vals: ",
-        "Series tags={_field=foo, _measurement=m0}\n  FloatPoints timestamps: [2], values: [2.0]",
-    ];
-
-    run_read_group_test_case(
-        OneMeasurementNoTagsWithDelete {},
-        InfluxRpcPredicate::default(),
-        agg,
-        group_columns.clone(),
-        expected_results,
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn test_read_group_data_no_tag_columns_count_with_delete_all() {
-    let agg = Aggregate::Count;
-    let group_columns = vec![];
-    let expected_results = vec![];
-
-    run_read_group_test_case(
-        OneMeasurementNoTagsWithDeleteAllWithAndWithoutChunk {},
-        InfluxRpcPredicate::default(),
-        agg,
-        group_columns.clone(),
-        expected_results,
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn test_read_group_data_no_tag_columns_min_with_delete_all() {
-    let agg = Aggregate::Min;
-    let group_columns = vec![];
-    let expected_results = vec![];
-
-    run_read_group_test_case(
-        OneMeasurementNoTagsWithDeleteAllWithAndWithoutChunk {},
         InfluxRpcPredicate::default(),
         agg,
         group_columns,
@@ -211,6 +141,8 @@ async fn test_read_group_data_field_restriction() {
 
 #[tokio::test]
 async fn test_grouped_series_set_plan_sum() {
+    test_helpers::maybe_start_logging();
+
     let predicate = Predicate::default()
         // city=Boston OR city=Cambridge (filters out LA rows)
         .with_expr(
@@ -245,6 +177,8 @@ async fn test_grouped_series_set_plan_sum() {
 
 #[tokio::test]
 async fn test_grouped_series_set_plan_count() {
+    test_helpers::maybe_start_logging();
+
     let predicate = Predicate::default()
         // city=Boston OR city=Cambridge (filters out LA rows)
         .with_expr(
@@ -279,6 +213,8 @@ async fn test_grouped_series_set_plan_count() {
 
 #[tokio::test]
 async fn test_grouped_series_set_plan_mean() {
+    test_helpers::maybe_start_logging();
+
     let predicate = Predicate::default()
         // city=Boston OR city=Cambridge (filters out LA rows)
         .with_expr(
@@ -342,6 +278,8 @@ async fn test_grouped_series_set_plan_count_measurement_pred() {
 
 #[tokio::test]
 async fn test_grouped_series_set_plan_first() {
+    test_helpers::maybe_start_logging();
+
     let predicate = Predicate::default()
         // fiter out first row (ts 1000)
         .with_range(1001, 4001);
@@ -370,6 +308,8 @@ async fn test_grouped_series_set_plan_first() {
 
 #[tokio::test]
 async fn test_grouped_series_set_plan_first_with_nulls() {
+    test_helpers::maybe_start_logging();
+
     let predicate = Predicate::default()
         // return three rows, but one series
         // "h2o,state=MA,city=Boston temp=70.4 50",
@@ -907,6 +847,32 @@ async fn test_grouped_series_set_plan_group_field_pred_filter_on_value_sum() {
 
     run_read_group_test_case(
         MeasurementForDefect2691 {},
+        predicate,
+        agg,
+        group_columns,
+        expected_results,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_read_group_with_periods() {
+    let predicate = Predicate::default()
+        .with_range(0, 1700000001000000000)
+        .with_expr(col("_field").eq(lit("field.one")));
+    let predicate = InfluxRpcPredicate::new(None, predicate);
+
+    let agg = Aggregate::Sum;
+    let group_columns = vec!["_field"];
+
+    let expected_results = vec![
+        "Group tag_keys: _field, _measurement, tag.one, tag.two partition_key_vals: field.one",
+        "Series tags={_field=field.one, _measurement=measurement.one, tag.one=value, tag.two=other}\n  FloatPoints timestamps: [1609459201000000001], values: [1.0]",
+        "Series tags={_field=field.one, _measurement=measurement.one, tag.one=value2, tag.two=other2}\n  FloatPoints timestamps: [1609459201000000002], values: [1.0]",
+    ];
+
+    run_read_group_test_case(
+        PeriodsInNames {},
         predicate,
         agg,
         group_columns,

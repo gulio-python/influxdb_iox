@@ -48,14 +48,13 @@ members = [
     "mutable_batch_tests",
     "object_store_metrics",
     "observability_deps",
-    "packers",
     "panic_logging",
     "parquet_file",
+    "parquet_to_line_protocol",
     "predicate",
     "querier",
     "query_functions",
     "query_tests",
-    "read_buffer",
     "router",
     "schema",
     "service_common",
@@ -103,6 +102,12 @@ exclude = [
     "tools/",
 ]
 
+[workspace.package]
+version = "0.1.0"
+authors = ["IOx Project Developers"]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
 # This profile optimizes for runtime performance and small binary size at the expense of longer
 # build times. It's most suitable for final release builds.
 [profile.release]
@@ -121,6 +126,9 @@ codegen-units = 16
 lto = false
 incremental = true
 
-[patch.crates-io]
-# remove and bump object_store dep version once this revision is released.
-object_store = { git = 'https://github.com/tustvold/arrow-rs.git', rev = "b167e3318cea81946a3c35e8d2e2baea69252303", package = "object_store" }
+# Per insta docs: https://insta.rs/docs/quickstart/#optional-faster-runs
+[profile.dev.package.insta]
+opt-level = 3
+
+[profile.dev.package.similar]
+opt-level = 3

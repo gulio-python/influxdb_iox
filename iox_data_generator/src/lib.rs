@@ -24,14 +24,16 @@
     clippy::explicit_iter_loop,
     clippy::future_not_send,
     clippy::use_self,
-    clippy::clone_on_ref_ptr
+    clippy::clone_on_ref_ptr,
+    clippy::todo,
+    clippy::dbg_macro
 )]
 
 use crate::{agent::Agent, tag_set::GeneratedTagSets};
 use snafu::{ResultExt, Snafu};
-use std::sync::{atomic::AtomicU64, Arc};
 use std::{
     convert::TryFrom,
+    sync::{atomic::AtomicU64, Arc},
     time::{SystemTime, UNIX_EPOCH},
 };
 use tracing::info;
@@ -152,7 +154,8 @@ pub async fn generate(
             .context(CouldNotCreateAgentSnafu)?;
 
             info!(
-                "Configuring {} agents of \"{}\" to write data to org {} and bucket {} (database {})",
+                "Configuring {} agents of \"{}\" to write data \
+                to org {} and bucket {} (database {})",
                 agent_assignment.count,
                 agent_assignment.spec.name,
                 org,
@@ -169,7 +172,8 @@ pub async fn generate(
 
                 let total_rows = Arc::clone(&total_rows);
                 handles.push(tokio::task::spawn(async move {
-                    // did this weird hack because otherwise the stdout outputs would be jumbled together garbage
+                    // did this weird hack because otherwise the stdout outputs would be jumbled
+                    // together garbage
                     if one_agent_at_a_time {
                         let _l = lock_ref.lock().await;
                         agent

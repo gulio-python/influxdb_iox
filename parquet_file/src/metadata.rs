@@ -297,6 +297,20 @@ pub struct IoxMetadata {
 }
 
 impl IoxMetadata {
+    /// Convert to base64 encoded protobuf format
+    pub fn to_base64(&self) -> std::result::Result<String, prost::EncodeError> {
+        Ok(base64::encode(&self.to_protobuf()?))
+    }
+
+    /// Read from base64 encoded protobuf format
+    pub fn from_base64(proto_base64: &[u8]) -> Result<Self> {
+        let proto_bytes = base64::decode(proto_base64)
+            .map_err(|err| Box::new(err) as _)
+            .context(IoxMetadataBrokenSnafu)?;
+
+        Self::from_protobuf(&proto_bytes)
+    }
+
     /// Convert to protobuf v3 message.
     pub(crate) fn to_protobuf(&self) -> std::result::Result<Vec<u8>, prost::EncodeError> {
         let sort_key = self.sort_key.as_ref().map(|key| proto::SortKey {
@@ -378,6 +392,27 @@ impl IoxMetadata {
                 },
             )?,
         })
+    }
+
+    /// Generate metadata for a file generated from some process other than IOx ingesting.
+    ///
+    /// This metadata will not have valid catalog values; inserting files with this metadata into
+    /// the catalog should get valid values out-of-band.
+    pub fn external(creation_timestamp_ns: i64, table_name: impl Into<Arc<str>>) -> Self {
+        Self {
+            object_store_id: Default::default(),
+            creation_timestamp: Time::from_timestamp_nanos(creation_timestamp_ns),
+            namespace_id: NamespaceId::new(1),
+            namespace_name: "external".into(),
+            shard_id: ShardId::new(1),
+            table_id: TableId::new(1),
+            table_name: table_name.into(),
+            partition_id: PartitionId::new(1),
+            partition_key: "unknown".into(),
+            max_sequence_number: SequenceNumber::new(1),
+            compaction_level: CompactionLevel::Initial,
+            sort_key: None,
+        }
     }
 
     /// verify uuid
@@ -462,7 +497,7 @@ impl IoxMetadata {
             file_size_bytes: file_size_bytes as i64,
             compaction_level: self.compaction_level,
             row_count: row_count.try_into().expect("row count overflows i64"),
-            created_at: Timestamp::new(self.creation_timestamp.timestamp_nanos()),
+            created_at: Timestamp::from(self.creation_timestamp),
             column_set: ColumnSet::new(columns),
         }
     }
@@ -590,7 +625,7 @@ impl IoxParquetMetaData {
             .map(|rg| rg.to_thrift())
             .collect();
 
-        let thrift_file_metadata = parquet_format::FileMetaData {
+        let thrift_file_metadata = parquet::format::FileMetaData {
             version: file_metadata.version(),
             schema: thrift_schema,
 
@@ -621,7 +656,7 @@ impl IoxParquetMetaData {
         // step 2: load thrift data from byte stream
         let thrift_file_metadata = {
             let mut protocol = TCompactInputProtocol::new(&data[..]);
-            parquet_format::FileMetaData::read_from_in_protocol(&mut protocol)
+            parquet::format::FileMetaData::read_from_in_protocol(&mut protocol)
                 .context(ThriftReadFailureSnafu {})?
         };
 
@@ -660,10 +695,10 @@ impl IoxParquetMetaData {
     }
 }
 
-impl TryFrom<parquet_format::FileMetaData> for IoxParquetMetaData {
+impl TryFrom<parquet::format::FileMetaData> for IoxParquetMetaData {
     type Error = Error;
 
-    fn try_from(v: parquet_format::FileMetaData) -> Result<Self, Self::Error> {
+    fn try_from(v: parquet::format::FileMetaData) -> Result<Self, Self::Error> {
         let mut buffer = Vec::new();
         {
             let mut protocol = TCompactOutputProtocol::new(&mut buffer);
@@ -718,12 +753,8 @@ impl DecodedIoxParquetMetaData {
 
         // extract protobuf message from key-value entry
         let proto_base64 = kv.value.as_ref().context(IoxMetadataMissingSnafu)?;
-        let proto_bytes = base64::decode(proto_base64)
-            .map_err(|err| Box::new(err) as _)
-            .context(IoxMetadataBrokenSnafu)?;
-
-        // convert to Rust object
-        IoxMetadata::from_protobuf(proto_bytes.as_slice())
+        // read to rust object
+        IoxMetadata::from_base64(proto_base64.as_bytes())
     }
 
     /// Read IOx schema from parquet metadata.
@@ -963,6 +994,7 @@ mod tests {
         record_batch::RecordBatch,
     };
     use data_types::CompactionLevel;
+    use datafusion_util::MemoryStream;
     use schema::builder::SchemaBuilder;
 
     #[test]
@@ -1026,7 +1058,7 @@ mod tests {
             .as_arrow();
 
         let batch = RecordBatch::try_new(schema, vec![data, timestamps]).unwrap();
-        let stream = futures::stream::iter([Ok(batch.clone())]);
+        let stream = Box::pin(MemoryStream::new(vec![batch.clone()]));
 
         let (bytes, file_meta) = crate::serialize::to_parquet_bytes(stream, &meta)
             .await

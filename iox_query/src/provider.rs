@@ -10,7 +10,6 @@ use datafusion::{
     error::{DataFusionError, Result as DataFusionResult},
     execution::context::SessionState,
     logical_expr::{TableProviderFilterPushDown, TableType},
-    logical_plan::Expr,
     physical_plan::{
         expressions::{col as physical_col, PhysicalSortExpr},
         filter::FilterExec,
@@ -19,6 +18,7 @@ use datafusion::{
         union::UnionExec,
         ExecutionPlan,
     },
+    prelude::Expr,
 };
 use observability_deps::tracing::{debug, trace, warn};
 use predicate::Predicate;
@@ -239,7 +239,7 @@ impl TableProvider for ChunkTableProvider {
         // the scan for the plans to be correct, they are an extra
         // optimization for providers which can offer them
         let predicate = Predicate::default().with_pushdown_exprs(filters);
-        let mut deduplicate = Deduplicater::new(self.ctx.child_ctx("deduplicator"));
+        let deduplicate = Deduplicater::new(self.ctx.child_ctx("deduplicator"));
         let plan = deduplicate.build_scan_plan(
             Arc::clone(&self.table_name),
             scan_schema,
@@ -264,18 +264,109 @@ impl TableProvider for ChunkTableProvider {
     }
 }
 
+/// Chunks split into disjoint categories.
 #[derive(Debug)]
-/// A deduplicater that deduplicate the duplicated data during scan execution
-pub(crate) struct Deduplicater {
+struct Chunks {
     /// a vector of a vector of overlapped chunks
-    pub overlapped_chunks_set: Vec<Vec<Arc<dyn QueryChunk>>>,
+    overlapped_chunks_set: Vec<Vec<Arc<dyn QueryChunk>>>,
 
     /// a vector of non-overlapped chunks each have duplicates in itself
-    pub in_chunk_duplicates_chunks: Vec<Arc<dyn QueryChunk>>,
+    in_chunk_duplicates_chunks: Vec<Arc<dyn QueryChunk>>,
 
     /// a vector of non-overlapped and non-duplicates chunks
-    pub no_duplicates_chunks: Vec<Arc<dyn QueryChunk>>,
+    no_duplicates_chunks: Vec<Arc<dyn QueryChunk>>,
+}
 
+impl Chunks {
+    /// discover overlaps and split them into three groups:
+    ///  1. vector of vector of overlapped chunks
+    ///  2. vector of non-overlapped chunks, each have duplicates in itself
+    ///  3. vectors of non-overlapped chunks without duplicates
+    fn split_overlapped_chunks(chunks: Vec<Arc<dyn QueryChunk>>) -> Result<Self> {
+        trace!("split_overlapped_chunks");
+
+        // -------------------------------
+        // Group chunks by partition first
+        // Chunks in different partition are guarantee not to overlap
+
+        // Group chunks by partition
+        let mut partition_groups = HashMap::with_capacity(chunks.len());
+        for chunk in chunks {
+            let chunks = partition_groups
+                .entry(chunk.partition_id())
+                .or_insert_with(Vec::new);
+            chunks.push(chunk);
+        }
+
+        // -------------------------------
+        // Find all overlapped groups for each partition-group based on their time range
+        let mut this = Self {
+            in_chunk_duplicates_chunks: vec![],
+            no_duplicates_chunks: vec![],
+            overlapped_chunks_set: vec![],
+        };
+        for (_, chunks) in partition_groups {
+            let groups = group_potential_duplicates(chunks).context(InternalChunkGroupingSnafu)?;
+            for mut group in groups {
+                if group.len() == 1 {
+                    if group[0].may_contain_pk_duplicates() {
+                        this.in_chunk_duplicates_chunks.append(&mut group);
+                    } else {
+                        this.no_duplicates_chunks.append(&mut group);
+                    }
+                } else {
+                    this.overlapped_chunks_set.push(group)
+                }
+            }
+        }
+
+        Ok(this)
+    }
+
+    /// Return true if all chunks neither overlap nor have duplicates in itself
+    fn no_duplicates(&self) -> bool {
+        self.overlapped_chunks_set.is_empty() && self.in_chunk_duplicates_chunks.is_empty()
+    }
+
+    fn into_no_duplicates(self) -> Vec<Arc<dyn QueryChunk>> {
+        assert!(self.no_duplicates());
+        self.no_duplicates_chunks
+    }
+
+    fn no_delete_predicates(&self) -> bool {
+        self.iter()
+            .all(|chunk| chunk.delete_predicates().is_empty())
+    }
+
+    /// Iterate over all chunks
+    fn iter(&self) -> impl Iterator<Item = &'_ Arc<dyn QueryChunk>> + '_ {
+        self.overlapped_chunks_set
+            .iter()
+            .flat_map(|c| c.iter())
+            .chain(self.in_chunk_duplicates_chunks.iter())
+            .chain(self.no_duplicates_chunks.iter())
+    }
+
+    fn is_empty(&self) -> bool {
+        self.overlapped_chunks_set.is_empty()
+            && self.in_chunk_duplicates_chunks.is_empty()
+            && self.no_duplicates_chunks.is_empty()
+    }
+}
+
+impl<'a> IntoIterator for &'a Chunks {
+    type Item = &'a Arc<dyn QueryChunk>;
+
+    type IntoIter = Box<dyn Iterator<Item = &'a Arc<dyn QueryChunk>> + 'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        Box::new(self.iter())
+    }
+}
+
+/// A deduplicater that deduplicate the duplicated data during scan execution
+#[derive(Debug)]
+pub(crate) struct Deduplicater {
     /// schema interner
     schema_interner: SchemaInterner,
 
@@ -286,9 +377,6 @@ pub(crate) struct Deduplicater {
 impl Deduplicater {
     pub(crate) fn new(ctx: IOxSessionContext) -> Self {
         Self {
-            overlapped_chunks_set: vec![],
-            in_chunk_duplicates_chunks: vec![],
-            no_duplicates_chunks: vec![],
             schema_interner: Default::default(),
             ctx,
         }
@@ -370,7 +458,7 @@ impl Deduplicater {
     ///
     ///```
     pub(crate) fn build_scan_plan(
-        &mut self,
+        mut self,
         table_name: Arc<str>,
         output_schema: Arc<Schema>,
         chunks: Vec<Arc<dyn QueryChunk>>,
@@ -378,11 +466,11 @@ impl Deduplicater {
         output_sort_key: Option<SortKey>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         // find overlapped chunks and put them into the right group
-        self.split_overlapped_chunks(chunks.to_vec())?;
+        let mut chunks = Chunks::split_overlapped_chunks(chunks)?;
 
         // Building plans
         let mut plans: Vec<Arc<dyn ExecutionPlan>> = vec![];
-        if self.no_duplicates() {
+        if chunks.no_duplicates() {
             // Neither overlaps nor duplicates, no deduplicating needed
             debug!("All chunks neither overlap nor duplicate. Build only one scan node for all of them.");
             let mut non_duplicate_plans = Self::build_plans_for_non_duplicates_chunks(
@@ -396,10 +484,10 @@ impl Deduplicater {
             )?;
             plans.append(&mut non_duplicate_plans);
         } else {
-            let pk_schema = Self::compute_pk_schema(&chunks, &mut self.schema_interner);
-            debug!(overlapped_chunks=?self.overlapped_chunks_set.len(),
-                   in_chunk_duplicates=?self.in_chunk_duplicates_chunks.len(),
-                   no_duplicates_chunks=?self.no_duplicates_chunks.len(),
+            let pk_schema = Self::compute_pk_schema(chunks.iter(), &mut self.schema_interner);
+            debug!(overlapped_chunks=?chunks.overlapped_chunks_set.len(),
+                   in_chunk_duplicates=?chunks.in_chunk_duplicates_chunks.len(),
+                   no_duplicates_chunks=?chunks.no_duplicates_chunks.len(),
                    "Chunks after classifying");
 
             // Verify that output_sort_key must cover PK
@@ -424,11 +512,11 @@ impl Deduplicater {
             // This sort key is only used when the chunks are not
             // sorted and output_sort_key is not provided
             let dedup_sort_key_for_unsorted_chunks =
-                compute_sort_key_for_chunks(&pk_schema, chunks.as_ref());
+                compute_sort_key_for_chunks(&pk_schema, &chunks);
 
             // Build a plan for each overlapped set of chunks which may have
             // duplicated keys in any of the chunks of the set
-            for overlapped_chunks in self.overlapped_chunks_set.iter().cloned() {
+            for overlapped_chunks in chunks.overlapped_chunks_set.drain(..) {
                 // Find a common sort key to use to deduplicate this overlapped set
                 let chunks_dedup_sort_key =
                     output_sort_key.as_ref().cloned().unwrap_or_else(|| {
@@ -459,7 +547,7 @@ impl Deduplicater {
 
             // Build a plan for each chunk which may have duplicates,
             // but only within itself (not with any other chunk)
-            for chunk_with_duplicates in self.in_chunk_duplicates_chunks.iter().cloned() {
+            for chunk_with_duplicates in chunks.in_chunk_duplicates_chunks.drain(..) {
                 // Find the sort key to use to deduplicate this chunk
                 let chunk_dedup_sort_key = output_sort_key.as_ref().cloned().unwrap_or_else(|| {
                     Self::chunks_dedup_sort_key(
@@ -489,7 +577,7 @@ impl Deduplicater {
 
             // Build a plan for each chunk that has no duplicates:
             // neither with any other chunk or within itself
-            if !self.no_duplicates_chunks.is_empty() {
+            if !chunks.no_duplicates_chunks.is_empty() {
                 debug!(
                     ?output_sort_key,
                     ?pk_schema,
@@ -499,7 +587,7 @@ impl Deduplicater {
                     self.ctx.child_ctx("build_plans_for_non_duplicates_chunks"),
                     Arc::clone(&table_name),
                     Arc::clone(&output_schema),
-                    self.no_duplicates_chunks.to_vec(),
+                    chunks,
                     predicate,
                     output_sort_key.as_ref(),
                     &mut self.schema_interner,
@@ -621,58 +709,6 @@ impl Deduplicater {
             }
         }
         false
-    }
-
-    /// discover overlaps and split them into three groups:
-    ///  1. vector of vector of overlapped chunks
-    ///  2. vector of non-overlapped chunks, each have duplicates in itself
-    ///  3. vectors of non-overlapped chunks without duplicates
-    fn split_overlapped_chunks(&mut self, chunks: Vec<Arc<dyn QueryChunk>>) -> Result<()> {
-        trace!("split_overlapped_chunks");
-
-        // -------------------------------
-        // Group chunks by partition first
-        // Chunks in different partition are guarantee not to ovelap
-
-        // Chunks without assigned partition id should be treated overlapped
-        // This is the case of ingester data
-        if chunks.iter().any(|c| c.partition_id().is_none()) {
-            self.overlapped_chunks_set.push(chunks);
-            return Ok(());
-        }
-
-        // Group chunks by partition
-        let mut partition_groups = HashMap::with_capacity(chunks.len());
-        for chunk in chunks {
-            let chunks = partition_groups
-                .entry(chunk.partition_id().expect("Chunk must have partition id"))
-                .or_insert_with(Vec::new);
-            chunks.push(chunk);
-        }
-
-        // -------------------------------
-        // Find all overlapped groups for each partition-group based on their time range
-        for (_, chunks) in partition_groups {
-            let groups = group_potential_duplicates(chunks).context(InternalChunkGroupingSnafu)?;
-            for mut group in groups {
-                if group.len() == 1 {
-                    if group[0].may_contain_pk_duplicates() {
-                        self.in_chunk_duplicates_chunks.append(&mut group);
-                    } else {
-                        self.no_duplicates_chunks.append(&mut group);
-                    }
-                } else {
-                    self.overlapped_chunks_set.push(group)
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Return true if all chunks neither overlap nor have duplicates in itself
-    fn no_duplicates(&self) -> bool {
-        self.overlapped_chunks_set.is_empty() && self.in_chunk_duplicates_chunks.is_empty()
     }
 
     /// Return deduplicate plan for the given overlapped chunks
@@ -1020,7 +1056,7 @@ impl Deduplicater {
         trace!(?del_preds, "Chunk delete predicates");
         let negated_del_expr_val = Predicate::negated_expr(&del_preds[..]);
         if let Some(negated_del_expr) = negated_del_expr_val {
-            debug!(?negated_del_expr, "Logical negated expressions");
+            debug!(?negated_del_expr, "Logical negated delete predicates");
 
             let negated_physical_del_expr =
                 df_physical_expr(&*input, negated_del_expr).context(InternalFilterSnafu)?;
@@ -1102,8 +1138,9 @@ impl Deduplicater {
         debug!(?sort_exprs, chunk_id=?chunk.id(), "Sort Expression for the sort operator of chunk");
 
         // Create SortExec operator
+        let fetch = None;
         Ok(Arc::new(
-            SortExec::try_new(sort_exprs, input).context(InternalSortSnafu)?,
+            SortExec::try_new(sort_exprs, input, fetch).context(InternalSortSnafu)?,
         ))
     }
 
@@ -1164,22 +1201,24 @@ impl Deduplicater {
         ctx: IOxSessionContext,
         table_name: Arc<str>,
         output_schema: Arc<Schema>,
-        chunks: Vec<Arc<dyn QueryChunk>>, // These chunks is identified having no duplicates
+        chunks: Chunks, // These chunks is identified having no duplicates
         predicate: Predicate,
         output_sort_key: Option<&SortKey>,
         schema_interner: &mut SchemaInterner,
     ) -> Result<Vec<Arc<dyn ExecutionPlan>>> {
+        assert!(chunks.no_duplicates());
+
         let mut plans: Vec<Arc<dyn ExecutionPlan>> = vec![];
 
         // Only chunks without delete predicates should be in this one IOxReadFilterNode
         // if there is no chunk, we still need to return a plan
-        if (output_sort_key.is_none() && Self::no_delete_predicates(&chunks)) || chunks.is_empty() {
+        if (output_sort_key.is_none() && chunks.no_delete_predicates()) || chunks.is_empty() {
             debug!("Build one scan IOxReadFilterNode for all non duplicated chunks even if empty");
             plans.push(Arc::new(IOxReadFilterNode::new(
                 ctx,
                 Arc::clone(&table_name),
                 output_schema,
-                chunks,
+                chunks.into_no_duplicates(),
                 predicate,
             )));
 
@@ -1206,15 +1245,9 @@ impl Deduplicater {
         sorted_chunk_plans
     }
 
-    fn no_delete_predicates(chunks: &[Arc<dyn QueryChunk>]) -> bool {
-        chunks
-            .iter()
-            .all(|chunk| chunk.delete_predicates().is_empty())
-    }
-
     /// Find the columns needed in chunks' primary keys across schemas
-    fn compute_pk_schema(
-        chunks: &[Arc<dyn QueryChunk>],
+    fn compute_pk_schema<'a>(
+        chunks: impl IntoIterator<Item = &'a Arc<dyn QueryChunk>>,
         schema_interner: &mut SchemaInterner,
     ) -> Arc<Schema> {
         let mut schema_merger = SchemaMerger::new().with_interner(schema_interner);
@@ -1302,70 +1335,19 @@ mod test {
                 .with_may_contain_pk_duplicates(true),
         );
 
-        let mut deduplicator = Deduplicater::new(IOxSessionContext::with_testing());
-        deduplicator
-            .split_overlapped_chunks(vec![c1, c2, c3, c4])
-            .expect("split chunks");
+        let chunks = Chunks::split_overlapped_chunks(vec![c1, c2, c3, c4]).expect("split chunks");
 
         assert_eq!(
-            chunk_group_ids(&deduplicator.overlapped_chunks_set),
+            chunk_group_ids(&chunks.overlapped_chunks_set),
             vec!["Group 0: 00000000-0000-0000-0000-000000000002, 00000000-0000-0000-0000-000000000003"]
         );
         assert_eq!(
-            chunk_ids(&deduplicator.in_chunk_duplicates_chunks),
+            chunk_ids(&chunks.in_chunk_duplicates_chunks),
             "00000000-0000-0000-0000-000000000004"
         );
         assert_eq!(
-            chunk_ids(&deduplicator.no_duplicates_chunks),
+            chunk_ids(&chunks.no_duplicates_chunks),
             "00000000-0000-0000-0000-000000000001"
-        );
-    }
-
-    #[test]
-    fn chunk_grouping_no_partition() {
-        // At least one chunk without assigned partition, all chunks are considered overlapped even if their time ranges do not
-
-        // c1: no time-range overlaps
-        let c1 = Arc::new(
-            TestChunk::new("t")
-                .with_id(1)
-                .with_partition_id(10)
-                .with_time_column_with_stats(Some(1), Some(10)),
-        );
-
-        // c2: time-range overlap with c3
-        let c2 = Arc::new(
-            TestChunk::new("t")
-                .with_id(2)
-                .with_partition_id(10)
-                .with_time_column_with_stats(Some(15), Some(20)),
-        );
-
-        // c3: time-range overlap with c2
-        // no partition provided
-        let c3 = Arc::new(
-            TestChunk::new("t")
-                .with_id(3)
-                .with_time_column_with_stats(Some(17), Some(23)),
-        );
-
-        // c4: time-range self overlap
-        let c4 = Arc::new(
-            TestChunk::new("t")
-                .with_id(4)
-                .with_partition_id(10)
-                .with_time_column_with_stats(Some(30), Some(40))
-                .with_may_contain_pk_duplicates(true),
-        );
-
-        let mut deduplicator = Deduplicater::new(IOxSessionContext::with_testing());
-        deduplicator
-            .split_overlapped_chunks(vec![c1, c2, c3, c4])
-            .expect("split chunks");
-
-        assert_eq!(
-            chunk_group_ids(&deduplicator.overlapped_chunks_set),
-            vec!["Group 0: 00000000-0000-0000-0000-000000000001, 00000000-0000-0000-0000-000000000002, 00000000-0000-0000-0000-000000000003, 00000000-0000-0000-0000-000000000004"]
         );
     }
 
@@ -1684,7 +1666,8 @@ mod test {
                 .with_tag_column("tag1")
                 .with_tag_column("tag2")
                 .with_i64_field_column("field_int")
-                .with_sort_key(sort_key.clone()),
+                .with_sort_key(sort_key.clone())
+                .with_timestamp_min_max(10, 20),
         ) as Arc<dyn QueryChunk>;
 
         // Non-sorted Chunk 2
@@ -1694,7 +1677,8 @@ mod test {
                 .with_time_column()
                 .with_tag_column("tag1")
                 .with_tag_column("tag2")
-                .with_i64_field_column("field_int"),
+                .with_i64_field_column("field_int")
+                .with_timestamp_min_max(21, 30),
         ) as Arc<dyn QueryChunk>;
 
         // Datafusion schema of the chunk
@@ -1705,7 +1689,8 @@ mod test {
             IOxSessionContext::with_testing(),
             Arc::from("t"),
             Arc::clone(&schema),
-            vec![Arc::clone(&chunk1), Arc::clone(&chunk2)],
+            Chunks::split_overlapped_chunks(vec![Arc::clone(&chunk1), Arc::clone(&chunk2)])
+                .unwrap(),
             Predicate::default(),
             None, // not ask to sort the output of the plan
             &mut SchemaInterner::default(),
@@ -1726,7 +1711,8 @@ mod test {
             IOxSessionContext::with_testing(),
             Arc::from("t"),
             schema,
-            vec![Arc::clone(&chunk1), Arc::clone(&chunk2)],
+            Chunks::split_overlapped_chunks(vec![Arc::clone(&chunk1), Arc::clone(&chunk2)])
+                .unwrap(),
             Predicate::default(),
             Some(&sort_key), // sort output on this sort_key
             &mut SchemaInterner::default(),
@@ -2020,6 +2006,7 @@ mod test {
         // request just the field and timestamp
         let schema = SchemaBuilder::new()
             .field("field_int", DataType::Int64)
+            .unwrap()
             .timestamp()
             .build()
             .unwrap();
@@ -2115,7 +2102,9 @@ mod test {
         // request just the fields
         let schema = SchemaBuilder::new()
             .field("field_int", DataType::Int64)
+            .unwrap()
             .field("other_field_int", DataType::Int64)
+            .unwrap()
             .build()
             .unwrap();
 
@@ -2303,7 +2292,7 @@ mod test {
         ];
         assert_batches_sorted_eq!(&expected, &raw_data(&chunks).await);
 
-        let mut deduplicator = Deduplicater::new(IOxSessionContext::with_testing());
+        let deduplicator = Deduplicater::new(IOxSessionContext::with_testing());
         let plan = deduplicator
             .build_scan_plan(Arc::from("t"), schema, chunks, Predicate::default(), None)
             .unwrap();
@@ -2360,7 +2349,7 @@ mod test {
         ];
         assert_batches_eq!(&expected, &raw_data(&chunks).await);
 
-        let mut deduplicator = Deduplicater::new(IOxSessionContext::with_testing());
+        let deduplicator = Deduplicater::new(IOxSessionContext::with_testing());
         let plan = deduplicator
             .build_scan_plan(Arc::from("t"), schema, chunks, Predicate::default(), None)
             .unwrap();
@@ -2430,11 +2419,12 @@ mod test {
         // request just the field and timestamp
         let schema = SchemaBuilder::new()
             .field("field_int", DataType::Int64)
+            .unwrap()
             .timestamp()
             .build()
             .unwrap();
 
-        let mut deduplicator = Deduplicater::new(IOxSessionContext::with_testing());
+        let deduplicator = Deduplicater::new(IOxSessionContext::with_testing());
         let plan = deduplicator
             .build_scan_plan(
                 Arc::from("t"),
@@ -2534,7 +2524,7 @@ mod test {
         ];
         assert_batches_eq!(&expected, &raw_data(&chunks).await);
 
-        let mut deduplicator = Deduplicater::new(IOxSessionContext::with_testing());
+        let deduplicator = Deduplicater::new(IOxSessionContext::with_testing());
         let plan = deduplicator
             .build_scan_plan(Arc::from("t"), schema, chunks, Predicate::default(), None)
             .unwrap();
@@ -2686,7 +2676,7 @@ mod test {
         assert_batches_eq!(&expected, &raw_data(&chunks).await);
 
         // Create scan plan whose output data is only partially sorted
-        let mut deduplicator = Deduplicater::new(IOxSessionContext::with_testing());
+        let deduplicator = Deduplicater::new(IOxSessionContext::with_testing());
         let plan = deduplicator
             .build_scan_plan(Arc::from("t"), schema, chunks, Predicate::default(), None)
             .unwrap();
@@ -2889,7 +2879,7 @@ mod test {
         assert_batches_eq!(&expected, &raw_data(&chunks).await);
 
         let sort_key = compute_sort_key_for_chunks(&schema, &chunks);
-        let mut deduplicator = Deduplicater::new(IOxSessionContext::with_testing());
+        let deduplicator = Deduplicater::new(IOxSessionContext::with_testing());
         let plan = deduplicator
             .build_scan_plan(
                 Arc::from("t"),
@@ -3022,7 +3012,7 @@ mod test {
 
         let schema = chunk1.schema();
         let chunks = vec![chunk1, chunk2, chunk3, chunk4];
-        let mut deduplicator = Deduplicater::new(IOxSessionContext::with_testing());
+        let deduplicator = Deduplicater::new(IOxSessionContext::with_testing());
         let plan = deduplicator
             .build_scan_plan(
                 Arc::from("t"),
@@ -3209,7 +3199,7 @@ mod test {
             chunk1_1, chunk1_2, chunk1_3, chunk1_4, chunk2_1, chunk2_2, chunk2_3, chunk2_4,
             chunk2_5, chunk2_6,
         ];
-        let mut deduplicator = Deduplicater::new(IOxSessionContext::with_testing());
+        let deduplicator = Deduplicater::new(IOxSessionContext::with_testing());
         let plan = deduplicator
             .build_scan_plan(
                 Arc::from("t"),

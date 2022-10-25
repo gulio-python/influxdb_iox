@@ -1,15 +1,7 @@
 //! Ingest handler
 
-use crate::{
-    data::{IngesterData, IngesterQueryResponse, ShardData},
-    lifecycle::{run_lifecycle_manager, LifecycleConfig, LifecycleManager},
-    poison::PoisonCabinet,
-    querier_handler::prepare_data_to_querier,
-    stream_handler::{
-        sink_adaptor::IngestSinkAdaptor, sink_instrumentation::SinkInstrumentation,
-        PeriodicWatermarkFetcher, SequencedStreamHandler,
-    },
-};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
+
 use async_trait::async_trait;
 use backoff::BackoffConfig;
 use data_types::{Shard, ShardIndex, TopicMetadata};
@@ -26,14 +18,36 @@ use metric::{DurationHistogram, Metric, U64Counter};
 use object_store::DynObjectStore;
 use observability_deps::tracing::*;
 use snafu::{ResultExt, Snafu};
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use tokio::{
     sync::{Semaphore, TryAcquireError},
     task::{JoinError, JoinHandle},
 };
 use tokio_util::sync::CancellationToken;
+use trace::span::{Span, SpanRecorder};
 use write_buffer::core::WriteBufferReading;
 use write_summary::ShardProgress;
+
+use crate::{
+    data::{
+        partition::resolver::{CatalogPartitionResolver, PartitionCache, PartitionProvider},
+        shard::ShardData,
+        IngesterData,
+    },
+    lifecycle::{run_lifecycle_manager, LifecycleConfig, LifecycleManager},
+    poison::PoisonCabinet,
+    querier_handler::{prepare_data_to_querier, IngesterQueryResponse},
+    stream_handler::{
+        handler::SequencedStreamHandler, sink_adaptor::IngestSinkAdaptor,
+        sink_instrumentation::SinkInstrumentation, PeriodicWatermarkFetcher,
+    },
+};
+
+/// The maximum duration of time between creating a [`PartitionData`] and its
+/// [`SortKey`] being fetched from the catalog.
+///
+/// [`PartitionData`]: crate::data::partition::PartitionData
+/// [`SortKey`]: schema::sort::SortKey
+const SORT_KEY_PRE_FETCH: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Snafu)]
 #[allow(missing_copy_implementations, missing_docs)]
@@ -41,6 +55,10 @@ pub enum Error {
     #[snafu(display("Write buffer error: {}", source))]
     WriteBuffer {
         source: write_buffer::core::WriteBufferError,
+    },
+    #[snafu(display("error populating partition cache from catalog: {}", source))]
+    PartitionCache {
+        source: iox_catalog::interface::Error,
     },
 }
 
@@ -54,6 +72,7 @@ pub trait IngestHandler: Send + Sync {
     async fn query(
         &self,
         request: IngesterQueryRequest,
+        span: Option<Span>,
     ) -> Result<IngesterQueryResponse, crate::querier_handler::Error>;
 
     /// Return shard progress for the requested shard indexes
@@ -133,19 +152,52 @@ impl IngestHandlerImpl {
         skip_to_oldest_available: bool,
         max_requests: usize,
     ) -> Result<Self> {
+        // Read the most recently created partitions for the shards this
+        // ingester instance will be consuming from.
+        //
+        // By caching these hot partitions overall catalog load after an
+        // ingester starts up is reduced, and the associated query latency is
+        // removed from the (blocking) ingest hot path.
+        let shard_ids = shard_states.iter().map(|(_, s)| s.id).collect::<Vec<_>>();
+        let recent_partitions = catalog
+            .repositories()
+            .await
+            .partitions()
+            .most_recent_n(10_000, &shard_ids)
+            .await
+            .context(PartitionCacheSnafu)?;
+
+        // Build the partition provider.
+        let partition_provider = CatalogPartitionResolver::new(Arc::clone(&catalog));
+        let partition_provider = PartitionCache::new(
+            partition_provider,
+            recent_partitions,
+            SORT_KEY_PRE_FETCH,
+            Arc::clone(&catalog),
+            BackoffConfig::default(),
+        );
+        let partition_provider: Arc<dyn PartitionProvider> = Arc::new(partition_provider);
+
         // build the initial ingester data state
         let mut shards = BTreeMap::new();
         for s in shard_states.values() {
             shards.insert(
                 s.id,
-                ShardData::new(s.shard_index, Arc::clone(&metric_registry)),
+                ShardData::new(
+                    s.shard_index,
+                    s.id,
+                    Arc::clone(&partition_provider),
+                    Arc::clone(&metric_registry),
+                ),
             );
         }
+
         let data = Arc::new(IngesterData::new(
             object_store,
             catalog,
-            shards,
+            shard_states.clone().into_iter().map(|(idx, s)| (s.id, idx)),
             exec,
+            partition_provider,
             BackoffConfig::default(),
             Arc::clone(&metric_registry),
         ));
@@ -231,6 +283,7 @@ impl IngestHandlerImpl {
                         lifecycle_handle,
                         topic_name,
                         shard.shard_index,
+                        shard.id,
                         &*metric_registry,
                         skip_to_oldest_available,
                     );
@@ -280,7 +333,10 @@ impl IngestHandler for IngestHandlerImpl {
     async fn query(
         &self,
         request: IngesterQueryRequest,
+        span: Option<Span>,
     ) -> Result<IngesterQueryResponse, crate::querier_handler::Error> {
+        let span_recorder = SpanRecorder::new(span);
+
         // TODO(4567): move this into a instrumented query delegate
 
         // Acquire and hold a permit for the duration of this request, or return
@@ -310,7 +366,12 @@ impl IngestHandler for IngestHandlerImpl {
 
         let t = self.time_provider.now();
         let request = Arc::new(request);
-        let res = prepare_data_to_querier(&self.data, &request).await;
+        let res = prepare_data_to_querier(
+            &self.data,
+            &request,
+            span_recorder.child_span("ingester prepare data to querier"),
+        )
+        .await;
 
         if let Some(delta) = self.time_provider.now().checked_duration_since(t) {
             match &res {
@@ -382,188 +443,22 @@ impl<T> Drop for IngestHandlerImpl<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::data::SnapshotBatch;
-    use data_types::{Namespace, NamespaceSchema, QueryPool, Sequence, SequenceNumber};
+    use std::{num::NonZeroU32, ops::DerefMut};
+
+    use data_types::{Namespace, NamespaceSchema, Sequence, SequenceNumber};
     use dml::{DmlMeta, DmlWrite};
     use iox_catalog::{mem::MemCatalog, validate_or_insert_schema};
     use iox_time::Time;
-    use metric::{Attributes, Metric, U64Counter, U64Gauge};
     use mutable_batch_lp::lines_to_batches;
     use object_store::memory::InMemory;
-    use std::{num::NonZeroU32, ops::DerefMut};
     use test_helpers::maybe_start_logging;
     use write_buffer::mock::{MockBufferForReading, MockBufferSharedState};
 
-    #[tokio::test]
-    async fn read_from_write_buffer_write_to_mutable_buffer() {
-        let ingester = TestIngester::new().await;
-
-        let schema = NamespaceSchema::new(
-            ingester.namespace.id,
-            ingester.topic.id,
-            ingester.query_pool.id,
-        );
-        let mut txn = ingester.catalog.start_transaction().await.unwrap();
-        let ingest_ts1 = Time::from_timestamp_millis(42);
-        let ingest_ts2 = Time::from_timestamp_millis(1337);
-        let w1 = DmlWrite::new(
-            "foo",
-            lines_to_batches("mem foo=1 10", 0).unwrap(),
-            Some("1970-01-01".into()),
-            DmlMeta::sequenced(
-                Sequence::new(ShardIndex::new(0), SequenceNumber::new(0)),
-                ingest_ts1,
-                None,
-                50,
-            ),
-        );
-        let schema = validate_or_insert_schema(w1.tables(), &schema, txn.deref_mut())
-            .await
-            .unwrap()
-            .unwrap();
-        ingester.write_buffer_state.push_write(w1);
-        let w2 = DmlWrite::new(
-            "foo",
-            lines_to_batches("cpu bar=2 20\ncpu bar=3 30", 0).unwrap(),
-            Some("1970-01-01".into()),
-            DmlMeta::sequenced(
-                Sequence::new(ShardIndex::new(0), SequenceNumber::new(7)),
-                ingest_ts2,
-                None,
-                150,
-            ),
-        );
-        let _schema = validate_or_insert_schema(w2.tables(), &schema, txn.deref_mut())
-            .await
-            .unwrap()
-            .unwrap();
-        ingester.write_buffer_state.push_write(w2);
-        let w3 = DmlWrite::new(
-            "foo",
-            lines_to_batches("a b=2 200", 0).unwrap(),
-            Some("1970-01-01".into()),
-            DmlMeta::sequenced(
-                Sequence::new(ShardIndex::new(0), SequenceNumber::new(9)),
-                ingest_ts2,
-                None,
-                150,
-            ),
-        );
-        let _schema = validate_or_insert_schema(w3.tables(), &schema, txn.deref_mut())
-            .await
-            .unwrap()
-            .unwrap();
-        ingester.write_buffer_state.push_write(w3);
-        txn.commit().await.unwrap();
-
-        // give the writes some time to go through the buffer. Exit once we've verified there's
-        // data in there from both writes.
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                let mut has_measurement = false;
-
-                if let Some(data) = ingester.ingester.data.shard(ingester.shard.id) {
-                    if let Some(data) = data.namespace(&ingester.namespace.name) {
-                        // verify there's data in the buffer
-                        if let Some((b, _)) = data.snapshot("a", &"1970-01-01".into()).await {
-                            if let Some(b) = b.first() {
-                                if b.data.num_rows() > 0 {
-                                    has_measurement = true;
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // and ensure that the shard state was actually updated
-                let shard = ingester
-                    .catalog
-                    .repositories()
-                    .await
-                    .shards()
-                    .create_or_get(&ingester.topic, ingester.shard_index)
-                    .await
-                    .unwrap();
-
-                if has_measurement
-                    && shard.min_unpersisted_sequence_number == SequenceNumber::new(9)
-                {
-                    break;
-                }
-
-                tokio::time::sleep(Duration::from_millis(200)).await;
-            }
-        })
-        .await
-        .expect("timeout");
-
-        let observation = ingester
-            .metrics
-            .get_instrument::<Metric<DurationHistogram>>("ingester_op_apply_duration")
-            .unwrap()
-            .get_observer(&Attributes::from(&[
-                ("kafka_topic", "whatevs"),
-                ("kafka_partition", "0"),
-                ("result", "success"),
-            ]))
-            .unwrap()
-            .fetch();
-        let hits = observation.buckets.iter().map(|b| b.count).sum::<u64>();
-        assert_eq!(hits, 3);
-
-        let observation = ingester
-            .metrics
-            .get_instrument::<Metric<U64Counter>>("ingester_write_buffer_read_bytes")
-            .unwrap()
-            .get_observer(&Attributes::from(&[
-                ("kafka_topic", "whatevs"),
-                ("kafka_partition", "0"),
-            ]))
-            .unwrap()
-            .fetch();
-        assert_eq!(observation, 350);
-
-        let observation = ingester
-            .metrics
-            .get_instrument::<Metric<U64Gauge>>("ingester_write_buffer_last_sequence_number")
-            .unwrap()
-            .get_observer(&Attributes::from(&[
-                ("kafka_topic", "whatevs"),
-                ("kafka_partition", "0"),
-            ]))
-            .unwrap()
-            .fetch();
-        assert_eq!(observation, 9);
-
-        let observation = ingester
-            .metrics
-            .get_instrument::<Metric<U64Gauge>>("ingester_write_buffer_sequence_number_lag")
-            .unwrap()
-            .get_observer(&Attributes::from(&[
-                ("kafka_topic", "whatevs"),
-                ("kafka_partition", "0"),
-            ]))
-            .unwrap()
-            .fetch();
-        assert_eq!(observation, 0);
-
-        let observation = ingester
-            .metrics
-            .get_instrument::<Metric<U64Gauge>>("ingester_write_buffer_last_ingest_ts")
-            .unwrap()
-            .get_observer(&Attributes::from(&[
-                ("kafka_topic", "whatevs"),
-                ("kafka_partition", "0"),
-            ]))
-            .unwrap()
-            .fetch();
-        assert_eq!(observation, ingest_ts2.timestamp_nanos() as u64);
-    }
+    use super::*;
 
     #[tokio::test]
     async fn test_shutdown() {
-        let ingester = TestIngester::new().await.ingester;
+        let (ingester, _, _) = ingester_test_setup(vec![], 0, true).await;
 
         // does not exit w/o shutdown
         tokio::select! {
@@ -581,7 +476,7 @@ mod tests {
     #[tokio::test]
     #[should_panic(expected = "Background worker 'bad_task' exited early!")]
     async fn test_join_task_early_shutdown() {
-        let mut ingester = TestIngester::new().await.ingester;
+        let (mut ingester, _, _) = ingester_test_setup(vec![], 0, true).await;
 
         let shutdown_task = tokio::spawn(async {
             // It does nothing! and stops.
@@ -598,7 +493,7 @@ mod tests {
     #[tokio::test]
     #[should_panic(expected = "JoinError::Panic")]
     async fn test_join_task_panic() {
-        let mut ingester = TestIngester::new().await.ingester;
+        let (mut ingester, _, _) = ingester_test_setup(vec![], 0, true).await;
 
         let shutdown_task = tokio::spawn(async {
             panic!("bananas");
@@ -652,7 +547,12 @@ mod tests {
         let write_buffer_state =
             MockBufferSharedState::empty_with_n_shards(NonZeroU32::try_from(1).unwrap());
 
-        let schema = NamespaceSchema::new(namespace.id, topic.id, query_pool.id);
+        let schema = NamespaceSchema::new(
+            namespace.id,
+            topic.id,
+            query_pool.id,
+            namespace.max_columns_per_table,
+        );
         for write_operation in write_operations {
             validate_or_insert_schema(write_operation.tables(), &schema, txn.deref_mut())
                 .await
@@ -692,86 +592,6 @@ mod tests {
         (ingester, shard, namespace)
     }
 
-    async fn verify_ingester_buffer_has_data(
-        ingester: IngestHandlerImpl,
-        shard: Shard,
-        namespace: Namespace,
-        custom_batch_verification: impl Fn(&SnapshotBatch) + Send,
-    ) {
-        // give the writes some time to go through the buffer. Exit once we've verified there's
-        // data in there
-        tokio::time::timeout(Duration::from_secs(1), async move {
-            loop {
-                let mut has_measurement = false;
-
-                if let Some(data) = ingester.data.shard(shard.id) {
-                    if let Some(data) = data.namespace(&namespace.name) {
-                        // verify there's data in the buffer
-                        if let Some((b, _)) = data.snapshot("cpu", &"1970-01-01".into()).await {
-                            if let Some(b) = b.first() {
-                                custom_batch_verification(b);
-
-                                if b.data.num_rows() == 1 {
-                                    has_measurement = true;
-                                }
-                            }
-                        }
-                    }
-                }
-
-                if has_measurement {
-                    break;
-                }
-
-                tokio::time::sleep(Duration::from_millis(200)).await;
-            }
-        })
-        .await
-        .expect("timeout");
-    }
-
-    #[tokio::test]
-    async fn seeks_on_initialization() {
-        let ingest_ts1 = Time::from_timestamp_millis(42);
-        let ingest_ts2 = Time::from_timestamp_millis(1337);
-        let write_operations = vec![
-            DmlWrite::new(
-                "foo",
-                lines_to_batches("cpu bar=2 20", 0).unwrap(),
-                Some("1970-01-01".into()),
-                DmlMeta::sequenced(
-                    Sequence::new(ShardIndex::new(0), SequenceNumber::new(1)),
-                    ingest_ts1,
-                    None,
-                    150,
-                ),
-            ),
-            DmlWrite::new(
-                "foo",
-                lines_to_batches("cpu bar=2 30", 0).unwrap(),
-                Some("1970-01-01".into()),
-                DmlMeta::sequenced(
-                    Sequence::new(ShardIndex::new(0), SequenceNumber::new(2)),
-                    ingest_ts2,
-                    None,
-                    150,
-                ),
-            ),
-        ];
-
-        let (ingester, shard, namespace) = ingester_test_setup(write_operations, 2, false).await;
-
-        verify_ingester_buffer_has_data(ingester, shard, namespace, |first_batch| {
-            if first_batch.min_sequence_number == SequenceNumber::new(1) {
-                panic!(
-                    "initialization did a seek to the beginning rather than \
-                    the min_unpersisted"
-                );
-            }
-        })
-        .await;
-    }
-
     #[tokio::test]
     #[should_panic(expected = "JoinError::Panic")]
     async fn sequence_number_no_longer_exists() {
@@ -797,7 +617,9 @@ mod tests {
     }
 
     #[tokio::test]
-    #[should_panic(expected = "JoinError::Panic")]
+    #[should_panic(
+        expected = "attempted to seek to offset 10, but current high watermark for partition 0 is 2"
+    )]
     async fn sequence_number_after_watermark() {
         maybe_start_logging();
 
@@ -821,7 +643,9 @@ mod tests {
     }
 
     #[tokio::test]
-    #[should_panic(expected = "JoinError::Panic")]
+    #[should_panic(
+        expected = "attempted to seek to offset 10, but current high watermark for partition 0 is 2"
+    )]
     async fn sequence_number_after_watermark_skip_to_oldest_available() {
         maybe_start_logging();
 
@@ -845,40 +669,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn skip_to_oldest_available() {
-        maybe_start_logging();
-
-        let ingest_ts1 = Time::from_timestamp_millis(42);
-        let write_operations = vec![DmlWrite::new(
-            "foo",
-            lines_to_batches("cpu bar=2 20", 0).unwrap(),
-            Some("1970-01-01".into()),
-            DmlMeta::sequenced(
-                Sequence::new(ShardIndex::new(0), SequenceNumber::new(10)),
-                ingest_ts1,
-                None,
-                150,
-            ),
-        )];
-
-        // Set the min unpersisted to something bigger than the write's sequence number to
-        // cause an UnknownSequenceNumber error. Skip to oldest available = true, so ingester
-        // should find data
-        let (ingester, shard, namespace) = ingester_test_setup(write_operations, 1, true).await;
-
-        verify_ingester_buffer_has_data(ingester, shard, namespace, |first_batch| {
-            assert_eq!(
-                first_batch.min_sequence_number,
-                SequenceNumber::new(10),
-                "re-initialization didn't seek to the beginning",
-            );
-        })
-        .await;
-    }
-
-    #[tokio::test]
     async fn limits_concurrent_queries() {
-        let mut ingester = TestIngester::new().await;
+        let (mut ingester, _, _) = ingester_test_setup(vec![], 0, true).await;
         let request = IngesterQueryRequest {
             namespace: "foo".to_string(),
             table: "cpu".to_string(),
@@ -886,93 +678,14 @@ mod tests {
             predicate: None,
         };
 
-        let res = ingester.ingester.query(request.clone()).await.unwrap_err();
+        let res = ingester.query(request.clone(), None).await.unwrap_err();
         assert!(matches!(
             res,
             crate::querier_handler::Error::NamespaceNotFound { .. }
         ));
 
-        ingester.ingester.request_sem = Semaphore::new(0);
-        let res = ingester.ingester.query(request).await.unwrap_err();
+        ingester.request_sem = Semaphore::new(0);
+        let res = ingester.query(request, None).await.unwrap_err();
         assert!(matches!(res, crate::querier_handler::Error::RequestLimit));
-    }
-
-    struct TestIngester {
-        catalog: Arc<dyn Catalog>,
-        shard: Shard,
-        namespace: Namespace,
-        topic: TopicMetadata,
-        shard_index: ShardIndex,
-        query_pool: QueryPool,
-        metrics: Arc<metric::Registry>,
-        write_buffer_state: MockBufferSharedState,
-        ingester: IngestHandlerImpl,
-    }
-
-    impl TestIngester {
-        async fn new() -> Self {
-            let metrics: Arc<metric::Registry> = Default::default();
-            let catalog: Arc<dyn Catalog> = Arc::new(MemCatalog::new(Arc::clone(&metrics)));
-
-            let mut txn = catalog.start_transaction().await.unwrap();
-            let topic = txn.topics().create_or_get("whatevs").await.unwrap();
-            let query_pool = txn.query_pools().create_or_get("whatevs").await.unwrap();
-            let shard_index = ShardIndex::new(0);
-            let namespace = txn
-                .namespaces()
-                .create("foo", "inf", topic.id, query_pool.id)
-                .await
-                .unwrap();
-            let shard = txn
-                .shards()
-                .create_or_get(&topic, shard_index)
-                .await
-                .unwrap();
-            txn.commit().await.unwrap();
-
-            let mut shard_states = BTreeMap::new();
-            shard_states.insert(shard_index, shard);
-
-            let write_buffer_state =
-                MockBufferSharedState::empty_with_n_shards(NonZeroU32::try_from(1).unwrap());
-            let reading: Arc<dyn WriteBufferReading> =
-                Arc::new(MockBufferForReading::new(write_buffer_state.clone(), None).unwrap());
-            let object_store = Arc::new(InMemory::new());
-
-            let lifecycle_config = LifecycleConfig::new(
-                1000000,
-                1000,
-                1000,
-                Duration::from_secs(10),
-                Duration::from_secs(10),
-                10000000,
-            );
-            let ingester = IngestHandlerImpl::new(
-                lifecycle_config,
-                topic.clone(),
-                shard_states,
-                Arc::clone(&catalog),
-                object_store,
-                reading,
-                Arc::new(Executor::new(1)),
-                Arc::clone(&metrics),
-                false,
-                1,
-            )
-            .await
-            .unwrap();
-
-            Self {
-                catalog,
-                shard,
-                namespace,
-                topic,
-                shard_index,
-                query_pool,
-                metrics,
-                write_buffer_state,
-                ingester,
-            }
-        }
     }
 }

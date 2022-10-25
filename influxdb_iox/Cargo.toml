@@ -1,9 +1,10 @@
 [package]
 name = "influxdb_iox"
-version = "0.1.0"
-authors = ["Paul Dix <paul@pauldix.net>"]
-edition = "2021"
 default-run = "influxdb_iox"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
 
 [dependencies]
 # Workspace dependencies, in alphabetical order
@@ -13,7 +14,7 @@ data_types = { path = "../data_types" }
 datafusion = { path = "../datafusion" }
 generated_types = { path = "../generated_types" }
 import = { path = "../import" }
-influxdb_iox_client = { path = "../influxdb_iox_client", features = ["flight", "format", "write_lp"] }
+influxdb_iox_client = { path = "../influxdb_iox_client", features = ["flight", "format"] }
 influxdb_storage_client = { path = "../influxdb_storage_client" }
 influxrpc_parser = { path = "../influxrpc_parser"}
 iox_catalog = { path = "../iox_catalog" }
@@ -25,11 +26,12 @@ ioxd_querier = { path = "../ioxd_querier"}
 ioxd_router = { path = "../ioxd_router"}
 ioxd_test = { path = "../ioxd_test"}
 metric = { path = "../metric" }
-object_store = "0.4.0"
+object_store = "0.5.1"
 object_store_metrics = { path = "../object_store_metrics" }
 observability_deps = { path = "../observability_deps" }
 panic_logging = { path = "../panic_logging" }
 parquet_file = { path = "../parquet_file" }
+parquet_to_line_protocol = { path = "../parquet_to_line_protocol" }
 iox_query = { path = "../iox_query" }
 schema = { path = "../schema" }
 sharder = { path = "../sharder" }
@@ -38,29 +40,32 @@ trace_exporters = { path = "../trace_exporters" }
 trogging = { path = "../trogging", default-features = false, features = ["clap"] }
 
 # Crates.io dependencies, in alphabetical order
-ansi_term = "0.12"
-arrow = { version = "21.0.0", features = ["prettyprint"] }
+nu-ansi-term = "0.46.0"
+arrow = { version = "25.0.0", features = ["prettyprint"] }
 backtrace = "0.3"
 bytes = "1.2"
-clap = { version = "3", features = ["derive", "env"] }
-console-subscriber = { version = "0.1.7", optional = true, features = ["parking_lot"] }
-dotenvy = "0.15.1"
+clap = { version = "4", features = ["derive", "env"] }
+comfy-table = { version = "6.1", default-features = false }
+console-subscriber = { version = "0.1.8", optional = true, features = ["parking_lot"] }
+dotenvy = "0.15.6"
 futures = "0.3"
+futures-util = { version = "0.3" }
+flate2 = "1.0"
 hashbrown = "0.12"
 http = "0.2.8"
 humantime = "2.1.0"
-itertools = "0.10.1"
+itertools = "0.10.5"
 libc = { version = "0.2" }
 num_cpus = "1.13.0"
-once_cell = { version = "1.13.1", features = ["parking_lot"] }
+once_cell = { version = "1.15.0", features = ["parking_lot"] }
 rustyline = { version = "10.0", default-features = false }
-serde_json = "1.0.83"
+serde_json = "1.0.87"
 snafu = "0.7"
-thiserror = "1.0.33"
+thiserror = "1.0.37"
 tikv-jemalloc-ctl = { version = "0.5.0", optional = true }
-tokio = { version = "1.20", features = ["macros", "net", "parking_lot", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1.21", features = ["macros", "net", "parking_lot", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-stream = { version = "0.1", features = ["net"] }
-tokio-util = { version = "0.7.3" }
+tokio-util = { version = "0.7.4" }
 tonic = "0.8"
 uuid = { version = "1", features = ["v4"] }
 # jemalloc-sys with unprefixed_malloc_on_supported_platforms feature and heappy are mutually exclusive
@@ -70,7 +75,7 @@ workspace-hack = { path = "../workspace-hack"}
 [dev-dependencies]
 # In alphabetical order
 arrow_util = { path = "../arrow_util" }
-assert_cmd = "2.0.2"
+assert_cmd = "2.0.5"
 predicate = { path = "../predicate" }
 predicates = "2.1.0"
 tempfile = "3.1.0"

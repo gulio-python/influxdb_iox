@@ -3,23 +3,33 @@ use influxdb_iox_client::connection::Connection;
 use snafu::prelude::*;
 
 mod namespace;
+mod parquet_to_lp;
 mod print_cpu;
 mod schema;
+mod skipped_compactions;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(context(false))]
     #[snafu(display("Error in schema subcommand: {}", source))]
-    SchemaError { source: schema::Error },
+    Schema { source: schema::Error },
 
     #[snafu(context(false))]
     #[snafu(display("Error in namespace subcommand: {}", source))]
-    NamespaceError { source: namespace::Error },
+    Namespace { source: namespace::Error },
+
+    #[snafu(context(false))]
+    #[snafu(display("Error in parquet_to_lp subcommand: {}", source))]
+    ParquetToLp { source: parquet_to_lp::Error },
+
+    #[snafu(context(false))]
+    #[snafu(display("Error in skipped-compactions subcommand: {}", source))]
+    SkippedCompactions { source: skipped_compactions::Error },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-/// Interrogate internal database data
+/// Debugging commands
 #[derive(Debug, clap::Parser)]
 pub struct Config {
     #[clap(subcommand)]
@@ -36,6 +46,12 @@ enum Command {
 
     /// Interrogate the schema of a namespace
     Schema(schema::Config),
+
+    /// Convert IOx Parquet files back into line protocol format
+    ParquetToLp(parquet_to_lp::Config),
+
+    /// Interrogate skipped compactions
+    SkippedCompactions(skipped_compactions::Config),
 }
 
 pub async fn command<C, CFut>(connection: C, config: Config) -> Result<()>
@@ -52,6 +68,11 @@ where
         Command::Schema(config) => {
             let connection = connection().await;
             schema::command(connection, config).await?
+        }
+        Command::ParquetToLp(config) => parquet_to_lp::command(config).await?,
+        Command::SkippedCompactions(config) => {
+            let connection = connection().await;
+            skipped_compactions::command(connection, config).await?
         }
     }
 

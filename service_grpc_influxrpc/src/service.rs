@@ -12,6 +12,7 @@ use crate::{
     StorageService,
 };
 use data_types::{org_and_bucket_to_database, DatabaseName};
+use datafusion::error::DataFusionError;
 use futures::Stream;
 use generated_types::{
     google::protobuf::Empty, literal_or_regex::Value as RegexOrLiteralValue,
@@ -33,7 +34,7 @@ use iox_query::{
 };
 use observability_deps::tracing::{error, info, trace};
 use pin_project::pin_project;
-use service_common::{planner::Planner, QueryDatabaseProvider};
+use service_common::{datafusion_error_to_tonic_code, planner::Planner, QueryDatabaseProvider};
 use snafu::{OptionExt, ResultExt, Snafu};
 use std::{
     collections::{BTreeSet, HashMap},
@@ -41,7 +42,7 @@ use std::{
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use tonic::Status;
+use tonic::{metadata::MetadataMap, Status};
 use trace::{ctx::SpanContext, span::SpanExt};
 use trace_http::ctx::{RequestLogContext, RequestLogContextExt};
 use tracker::InstrumentedAsyncOwnedSemaphorePermit;
@@ -54,43 +55,43 @@ pub enum Error {
     #[snafu(display("Error listing tables in database '{}': {}", db_name, source))]
     ListingTables {
         db_name: String,
-        source: Box<dyn std::error::Error + Send + Sync>,
+        source: DataFusionError,
     },
 
     #[snafu(display("Error listing columns in database '{}': {}", db_name, source))]
     ListingColumns {
         db_name: String,
-        source: Box<dyn std::error::Error + Send + Sync>,
+        source: DataFusionError,
     },
 
     #[snafu(display("Error listing fields in database '{}': {}", db_name, source))]
     ListingFields {
         db_name: String,
-        source: Box<dyn std::error::Error + Send + Sync>,
+        source: DataFusionError,
     },
 
     #[snafu(display("Error creating series plans for database '{}': {}", db_name, source))]
     PlanningFilteringSeries {
         db_name: String,
-        source: Box<dyn std::error::Error + Send + Sync>,
+        source: DataFusionError,
     },
 
     #[snafu(display("Error creating group plans for database '{}': {}", db_name, source))]
     PlanningGroupSeries {
         db_name: String,
-        source: Box<dyn std::error::Error + Send + Sync>,
+        source: DataFusionError,
     },
 
     #[snafu(display("Error running series plans for database '{}': {}", db_name, source))]
     FilteringSeries {
         db_name: String,
-        source: Box<dyn std::error::Error + Send + Sync>,
+        source: DataFusionError,
     },
 
     #[snafu(display("Error running grouping plans for database '{}': {}", db_name, source))]
     GroupingSeries {
         db_name: String,
-        source: Box<dyn std::error::Error + Send + Sync>,
+        source: DataFusionError,
     },
 
     #[snafu(display(
@@ -102,7 +103,7 @@ pub enum Error {
     ListingTagValues {
         db_name: String,
         tag_name: String,
-        source: Box<dyn std::error::Error + Send + Sync>,
+        source: DataFusionError,
     },
 
     #[snafu(display("Error converting Predicate '{}: {}", rpc_predicate_string, source))]
@@ -176,46 +177,57 @@ impl From<Error> for tonic::Status {
     /// Converts a result from the business logic into the appropriate tonic
     /// status
     fn from(err: Error) -> Self {
-        error!("Error handling gRPC request: {}", err);
-        err.to_status()
+        error!(e=%err, "Error handling gRPC request");
+        err.into_status()
     }
 }
 
 impl Error {
     /// Converts a result from the business logic into the appropriate tonic
     /// status
-    fn to_status(&self) -> tonic::Status {
-        match &self {
-            Self::DatabaseNotFound { .. } => Status::not_found(self.to_string()),
-            Self::ListingTables { .. } => Status::internal(self.to_string()),
-            Self::ListingColumns { .. } => {
-                // TODO: distinguish between input errors and internal errors
-                Status::invalid_argument(self.to_string())
+    fn into_status(self) -> tonic::Status {
+        let msg = self.to_string();
+
+        let code = match self {
+            Self::DatabaseNotFound { .. } => tonic::Code::NotFound,
+            Self::ListingTables { source, .. }
+            | Self::ListingColumns { source, .. }
+            | Self::ListingFields { source, .. }
+            | Self::PlanningFilteringSeries { source, .. }
+            | Self::PlanningGroupSeries { source, .. }
+            | Self::FilteringSeries { source, .. }
+            | Self::GroupingSeries { source, .. }
+            | Self::ListingTagValues { source, .. } => datafusion_error_to_tonic_code(&source),
+            Self::ConvertingPredicate { .. }
+            | Self::ConvertingReadGroupAggregate { .. }
+            | Self::ConvertingReadGroupType { .. }
+            | Self::ConvertingWindowAggregate { .. }
+            | Self::ConvertingTagKeyInTagValues { .. }
+            | Self::ComputingGroupedSeriesSet { .. }
+            | Self::ConvertingFieldList { .. }
+            | Self::MeasurementLiteralOrRegex { .. }
+            | Self::MissingTagKeyPredicate {}
+            | Self::InvalidTagKeyRegex { .. } => tonic::Code::InvalidArgument,
+            Self::SendingResults { .. } | Self::InternalHintsFieldNotSupported { .. } => {
+                tonic::Code::Internal
             }
-            Self::ListingFields { .. } => {
-                // TODO: distinguish between input errors and internal errors
-                Status::invalid_argument(self.to_string())
-            }
-            Self::PlanningFilteringSeries { .. } => Status::invalid_argument(self.to_string()),
-            Self::PlanningGroupSeries { .. } => Status::invalid_argument(self.to_string()),
-            Self::FilteringSeries { .. } => Status::invalid_argument(self.to_string()),
-            Self::GroupingSeries { .. } => Status::invalid_argument(self.to_string()),
-            Self::ListingTagValues { .. } => Status::invalid_argument(self.to_string()),
-            Self::ConvertingPredicate { .. } => Status::invalid_argument(self.to_string()),
-            Self::ConvertingReadGroupAggregate { .. } => Status::invalid_argument(self.to_string()),
-            Self::ConvertingReadGroupType { .. } => Status::invalid_argument(self.to_string()),
-            Self::ConvertingWindowAggregate { .. } => Status::invalid_argument(self.to_string()),
-            Self::ConvertingTagKeyInTagValues { .. } => Status::invalid_argument(self.to_string()),
-            Self::ComputingGroupedSeriesSet { .. } => Status::invalid_argument(self.to_string()),
-            Self::ConvertingFieldList { .. } => Status::invalid_argument(self.to_string()),
-            Self::SendingResults { .. } => Status::internal(self.to_string()),
-            Self::InternalHintsFieldNotSupported { .. } => Status::internal(self.to_string()),
-            Self::NotYetImplemented { .. } => Status::internal(self.to_string()),
-            Self::MeasurementLiteralOrRegex { .. } => Status::invalid_argument(self.to_string()),
-            Self::MissingTagKeyPredicate {} => Status::invalid_argument(self.to_string()),
-            Self::InvalidTagKeyRegex { .. } => Status::invalid_argument(self.to_string()),
-        }
+            Self::NotYetImplemented { .. } => tonic::Code::Unimplemented,
+        };
+
+        let mut status = tonic::Status::new(code, msg);
+        add_headers(status.metadata_mut());
+        status
     }
+}
+
+/// Add IOx specific headers to the response
+///
+/// storage-type: iox (needed so IDPE can show the errors to users)
+///   see <https://github.com/influxdata/conductor/issues/1208>
+fn add_headers(metadata: &mut MetadataMap) {
+    // Note we can't use capital letters otherwise the http header
+    // library asserts, so return lowercase storage-type
+    metadata.insert("storage-type", "iox".parse().unwrap());
 }
 
 /// Implements the protobuf defined Storage service for a DatabaseStore
@@ -267,10 +279,7 @@ where
             query_completed_token.set_success();
         }
 
-        Ok(tonic::Response::new(StreamWithPermit::new(
-            futures::stream::iter(results),
-            permit,
-        )))
+        make_response(futures::stream::iter(results), permit)
     }
 
     type ReadGroupStream =
@@ -341,7 +350,7 @@ where
             &ctx,
         )
         .await
-        .map_err(|e| e.to_status())?
+        .map_err(|e| e.into_status())?
         .into_iter()
         .map(Ok)
         .collect::<Vec<_>>();
@@ -350,10 +359,7 @@ where
             query_completed_token.set_success();
         }
 
-        Ok(tonic::Response::new(StreamWithPermit::new(
-            futures::stream::iter(results),
-            permit,
-        )))
+        make_response(futures::stream::iter(results), permit)
     }
 
     type ReadWindowAggregateStream =
@@ -423,7 +429,7 @@ where
             &ctx,
         )
         .await
-        .map_err(|e| e.to_status())?
+        .map_err(|e| e.into_status())?
         .into_iter()
         .map(Ok)
         .collect::<Vec<_>>();
@@ -432,10 +438,7 @@ where
             query_completed_token.set_success();
         }
 
-        Ok(tonic::Response::new(StreamWithPermit::new(
-            futures::stream::iter(results),
-            permit,
-        )))
+        make_response(futures::stream::iter(results), permit)
     }
 
     type TagKeysStream = StreamWithPermit<ReceiverStream<Result<StringValuesResponse, Status>>>;
@@ -489,7 +492,7 @@ where
             &ctx,
         )
         .await
-        .map_err(|e| e.to_status());
+        .map_err(|e| e.into_status());
 
         if response.is_ok() {
             query_completed_token.set_success();
@@ -499,10 +502,7 @@ where
             .await
             .expect("sending tag_keys response to server");
 
-        Ok(tonic::Response::new(StreamWithPermit::new(
-            ReceiverStream::new(rx),
-            permit,
-        )))
+        make_response(ReceiverStream::new(rx), permit)
     }
 
     type TagValuesStream = StreamWithPermit<ReceiverStream<Result<StringValuesResponse, Status>>>;
@@ -560,7 +560,7 @@ where
                         operation: "tag_value for a measurement, with general predicate"
                             .to_string(),
                     }
-                    .to_status());
+                    .into_status());
                 }
 
                 measurement_name_impl(Arc::clone(&db), db_name, range, predicate, &ctx).await
@@ -593,7 +593,7 @@ where
             }
         };
 
-        let response = response.map_err(|e| e.to_status());
+        let response = response.map_err(|e| e.into_status());
 
         if response.is_ok() {
             query_completed_token.set_success();
@@ -603,10 +603,7 @@ where
             .await
             .expect("sending tag_values response to server");
 
-        Ok(tonic::Response::new(StreamWithPermit::new(
-            ReceiverStream::new(rx),
-            permit,
-        )))
+        make_response(ReceiverStream::new(rx), permit)
     }
 
     type TagValuesGroupedByMeasurementAndTagKeyStream = StreamWithPermit<
@@ -652,7 +649,7 @@ where
         let results =
             tag_values_grouped_by_measurement_and_tag_key_impl(Arc::clone(&db), db_name, req, &ctx)
                 .await
-                .map_err(|e| e.to_status())?
+                .map_err(|e| e.into_status())?
                 .into_iter()
                 .map(Ok)
                 .collect::<Vec<_>>();
@@ -661,10 +658,7 @@ where
             query_completed_token.set_success();
         }
 
-        Ok(tonic::Response::new(StreamWithPermit::new(
-            futures::stream::iter(results),
-            permit,
-        )))
+        make_response(futures::stream::iter(results), permit)
     }
 
     type ReadSeriesCardinalityStream = ReceiverStream<Result<Int64ValuesResponse, Status>>;
@@ -762,7 +756,7 @@ where
 
         let response = measurement_name_impl(Arc::clone(&db), db_name, range, predicate, &ctx)
             .await
-            .map_err(|e| e.to_status());
+            .map_err(|e| e.into_status());
 
         if response.is_ok() {
             query_completed_token.set_success();
@@ -772,10 +766,7 @@ where
             .await
             .expect("sending measurement names response to server");
 
-        Ok(tonic::Response::new(StreamWithPermit::new(
-            ReceiverStream::new(rx),
-            permit,
-        )))
+        make_response(ReceiverStream::new(rx), permit)
     }
 
     type MeasurementTagKeysStream =
@@ -833,7 +824,7 @@ where
             &ctx,
         )
         .await
-        .map_err(|e| e.to_status());
+        .map_err(|e| e.into_status());
 
         if response.is_ok() {
             query_completed_token.set_success();
@@ -843,10 +834,7 @@ where
             .await
             .expect("sending measurement_tag_keys response to server");
 
-        Ok(tonic::Response::new(StreamWithPermit::new(
-            ReceiverStream::new(rx),
-            permit,
-        )))
+        make_response(ReceiverStream::new(rx), permit)
     }
 
     type MeasurementTagValuesStream =
@@ -907,7 +895,7 @@ where
             &ctx,
         )
         .await
-        .map_err(|e| e.to_status());
+        .map_err(|e| e.into_status());
 
         if response.is_ok() {
             query_completed_token.set_success();
@@ -917,10 +905,7 @@ where
             .await
             .expect("sending measurement_tag_values response to server");
 
-        Ok(tonic::Response::new(StreamWithPermit::new(
-            ReceiverStream::new(rx),
-            permit,
-        )))
+        make_response(ReceiverStream::new(rx), permit)
     }
 
     type MeasurementFieldsStream =
@@ -981,9 +966,9 @@ where
         .map(|fieldlist| {
             fieldlist_to_measurement_fields_response(fieldlist)
                 .context(ConvertingFieldListSnafu)
-                .map_err(|e| e.to_status())
+                .map_err(|e| e.into_status())
         })
-        .map_err(|e| e.to_status())?;
+        .map_err(|e| e.into_status())?;
 
         if response.is_ok() {
             query_completed_token.set_success();
@@ -993,10 +978,7 @@ where
             .await
             .expect("sending measurement_fields response to server");
 
-        Ok(tonic::Response::new(StreamWithPermit::new(
-            ReceiverStream::new(rx),
-            permit,
-        )))
+        make_response(ReceiverStream::new(rx), permit)
     }
 
     async fn offsets(
@@ -1048,13 +1030,11 @@ where
     let plan = Planner::new(ctx)
         .table_names(db, predicate)
         .await
-        .map_err(|e| Box::new(e) as _)
         .context(ListingTablesSnafu { db_name })?;
 
     let table_names = ctx
         .to_string_set(plan)
         .await
-        .map_err(|e| Box::new(e) as _)
         .context(ListingTablesSnafu { db_name })?;
 
     // Map the resulting collection of Strings into a Vec<Vec<u8>>for return
@@ -1095,13 +1075,11 @@ where
     let tag_key_plan = Planner::new(ctx)
         .tag_keys(db, predicate)
         .await
-        .map_err(|e| Box::new(e) as _)
         .context(ListingColumnsSnafu { db_name })?;
 
     let tag_keys = ctx
         .to_string_set(tag_key_plan)
         .await
-        .map_err(|e| Box::new(e) as _)
         .context(ListingColumnsSnafu { db_name })?;
 
     // Map the resulting collection of Strings into a Vec<Vec<u8>>for return
@@ -1142,13 +1120,11 @@ where
     let tag_value_plan = Planner::new(ctx)
         .tag_values(db, tag_name, predicate)
         .await
-        .map_err(|e| Box::new(e) as _)
         .context(ListingTagValuesSnafu { db_name, tag_name })?;
 
     let tag_values = ctx
         .to_string_set(tag_value_plan)
         .await
-        .map_err(|e| Box::new(e) as _)
         .context(ListingTagValuesSnafu { db_name, tag_name })?;
 
     // Map the resulting collection of Strings into a Vec<Vec<u8>>for return
@@ -1266,14 +1242,12 @@ where
     let series_plan = Planner::new(ctx)
         .read_filter(db, predicate)
         .await
-        .map_err(|e| Box::new(e) as _)
         .context(PlanningFilteringSeriesSnafu { db_name })?;
 
     // Execute the plans.
     let series_or_groups = ctx
         .to_series_and_groups(series_plan)
         .await
-        .map_err(|e| Box::new(e) as _)
         .context(FilteringSeriesSnafu { db_name })
         .log_if_error("Running series set plan")?;
 
@@ -1319,9 +1293,8 @@ where
                 .await
         }
     };
-    let grouped_series_set_plan = grouped_series_set_plan
-        .map_err(|e| Box::new(e) as _)
-        .context(PlanningGroupSeriesSnafu { db_name })?;
+    let grouped_series_set_plan =
+        grouped_series_set_plan.context(PlanningGroupSeriesSnafu { db_name })?;
 
     // PERF - This used to send responses to the client before execution had
     // completed, but now it doesn't. We may need to revisit this in the future
@@ -1331,7 +1304,6 @@ where
     let series_or_groups = ctx
         .to_series_and_groups(grouped_series_set_plan)
         .await
-        .map_err(|e| Box::new(e) as _)
         .context(GroupingSeriesSnafu { db_name })
         .log_if_error("Running Grouped SeriesSet Plan")?;
 
@@ -1370,13 +1342,11 @@ where
     let field_list_plan = Planner::new(ctx)
         .field_columns(db, predicate)
         .await
-        .map_err(|e| Box::new(e) as _)
         .context(ListingFieldsSnafu { db_name })?;
 
     let field_list = ctx
         .to_field_list(field_list_plan)
         .await
-        .map_err(|e| Box::new(e) as _)
         .context(ListingFieldsSnafu { db_name })?;
 
     trace!(field_names=?field_list, "Field names response");
@@ -1576,6 +1546,16 @@ impl<T, E: std::fmt::Debug> ErrorLogger for Result<T, E> {
     }
 }
 
+/// Return the stream of results as a gRPC (tonic) response
+pub fn make_response<S>(
+    stream: S,
+    permit: InstrumentedAsyncOwnedSemaphorePermit,
+) -> Result<tonic::Response<StreamWithPermit<S>>, tonic::Status> {
+    let mut response = tonic::Response::new(StreamWithPermit::new(stream, permit));
+    add_headers(response.metadata_mut());
+    Ok(response)
+}
+
 /// Helper to keep a semaphore permit attached to a stream.
 #[pin_project]
 pub struct StreamWithPermit<S> {
@@ -1610,11 +1590,12 @@ where
 mod tests {
     use super::*;
     use data_types::ChunkId;
-    use datafusion::logical_plan::{col, lit, Expr};
+    use datafusion::prelude::{col, Expr};
+    use datafusion_util::lit_dict;
     use futures::Future;
     use generated_types::{i_ox_testing_client::IOxTestingClient, tag_key_predicate::Value};
     use influxdb_storage_client::{
-        connection::{Builder as ConnectionBuilder, Connection},
+        connection::{Builder as ConnectionBuilder, Connection, GrpcConnection},
         generated_types::*,
         Client as StorageClient, OrgAndBucket,
     };
@@ -1629,7 +1610,7 @@ mod tests {
         num::NonZeroU64,
         sync::Arc,
     };
-    use test_helpers::{assert_contains, tracing::TracingCapture};
+    use test_helpers::{assert_contains, maybe_start_logging, tracing::TracingCapture};
     use tokio::{pin, task::JoinHandle};
     use tokio_stream::wrappers::TcpListenerStream;
 
@@ -1643,15 +1624,15 @@ mod tests {
         fixture: &Fixture,
         path: &'static str,
         status: &'static str,
-        count: u64,
+        expected: u64,
     ) {
-        let metric = fixture
+        let metrics = fixture
             .test_storage
             .metric_registry
             .get_instrument::<Metric<U64Counter>>("grpc_requests")
             .unwrap();
 
-        let observation = metric
+        let observation = metrics
             .get_observer(&Attributes::from([
                 (
                     "path",
@@ -1662,7 +1643,11 @@ mod tests {
             .unwrap()
             .fetch();
 
-        assert_eq!(observation, count);
+        assert_eq!(
+            observation, expected,
+            "\n\npath: {}\nstatus:{}\nobservation:{}\nexpected:{}\n\nAll metrics:\n\n{:#?}",
+            path, status, observation, expected, metrics
+        );
     }
 
     #[tokio::test]
@@ -1801,11 +1786,13 @@ mod tests {
         // Note multiple tables / measureemnts:
         let chunk0 = TestChunk::new("m1")
             .with_id(0)
+            .with_tag_column("state")
             .with_tag_column("k1")
             .with_tag_column("k2");
 
         let chunk1 = TestChunk::new("m2")
             .with_id(1)
+            .with_tag_column("state")
             .with_tag_column("k3")
             .with_tag_column("k4");
 
@@ -1825,7 +1812,7 @@ mod tests {
         };
 
         let actual_tag_keys = fixture.storage_client.tag_keys(request).await.unwrap();
-        let expected_tag_keys = vec!["_f(0xff)", "_m(0x00)", "k1", "k2", "k3", "k4"];
+        let expected_tag_keys = vec!["_f(0xff)", "_m(0x00)", "k1", "k2", "k3", "k4", "state"];
 
         assert_eq!(actual_tag_keys, expected_tag_keys,);
 
@@ -1878,7 +1865,7 @@ mod tests {
         let response = fixture.storage_client.tag_keys(request).await;
         assert_contains!(response.unwrap_err().to_string(), "Sugar we are going down");
 
-        grpc_request_metric_has_count(&fixture, "TagKeys", "client_error", 1);
+        grpc_request_metric_has_count(&fixture, "TagKeys", "server_error", 1);
     }
 
     /// test the plumbing of the RPC layer for measurement_tag_keys--
@@ -1897,6 +1884,7 @@ mod tests {
             .with_tag_column("k0");
 
         let chunk1 = TestChunk::new("m4")
+            .with_tag_column("state")
             .with_tag_column("k1")
             .with_tag_column("k2")
             .with_tag_column("k3")
@@ -1926,7 +1914,7 @@ mod tests {
             .measurement_tag_keys(request)
             .await
             .unwrap();
-        let expected_tag_keys = vec!["_f(0xff)", "_m(0x00)", "k1", "k2", "k3", "k4"];
+        let expected_tag_keys = vec!["_f(0xff)", "_m(0x00)", "k1", "k2", "k3", "k4", "state"];
 
         assert_eq!(
             actual_tag_keys, expected_tag_keys,
@@ -1984,7 +1972,7 @@ mod tests {
         let response = fixture.storage_client.measurement_tag_keys(request).await;
         assert_contains!(response.unwrap_err().to_string(), "This is an error");
 
-        grpc_request_metric_has_count(&fixture, "MeasurementTagKeys", "client_error", 1);
+        grpc_request_metric_has_count(&fixture, "MeasurementTagKeys", "server_error", 1);
     }
 
     /// test the plumbing of the RPC layer for tag_values -- specifically that
@@ -2120,7 +2108,9 @@ mod tests {
 
         let db_info = org_and_bucket();
 
-        let chunk = TestChunk::new("my_table").with_error("Sugar we are going down");
+        let chunk = TestChunk::new("my_table")
+            .with_tag_column("the_tag_key")
+            .with_error("Sugar we are going down");
 
         fixture
             .test_storage
@@ -2171,7 +2161,11 @@ mod tests {
             "Error converting tag_key to UTF-8 in tag_values request"
         );
 
-        grpc_request_metric_has_count(&fixture, "TagValues", "client_error", 2);
+        // error from backend error
+        grpc_request_metric_has_count(&fixture, "TagValues", "server_error", 1);
+
+        // error from bad utf8
+        grpc_request_metric_has_count(&fixture, "TagValues", "client_error", 1);
     }
 
     #[tokio::test]
@@ -2182,10 +2176,12 @@ mod tests {
 
         let db_info = org_and_bucket();
         let chunk1 = TestChunk::new("table_a")
+            .with_time_column()
             .with_id(0)
             .with_tag_column("state")
             .with_one_row_of_data();
         let chunk2 = TestChunk::new("table_b")
+            .with_time_column()
             .with_id(1)
             .with_tag_column("state")
             .with_one_row_of_data();
@@ -2486,7 +2482,9 @@ mod tests {
 
         let db_info = org_and_bucket();
 
-        let chunk = TestChunk::new("m5").with_error("Sugar we are going down");
+        let chunk = TestChunk::new("m5")
+            .with_tag_column("the_tag_key")
+            .with_error("Sugar we are going down");
 
         fixture
             .test_storage
@@ -2518,7 +2516,7 @@ mod tests {
 
         assert_contains!(response_string, "Sugar we are going down");
 
-        grpc_request_metric_has_count(&fixture, "MeasurementTagValues", "client_error", 1);
+        grpc_request_metric_has_count(&fixture, "MeasurementTagValues", "server_error", 1);
     }
 
     #[tokio::test]
@@ -2617,7 +2615,7 @@ mod tests {
             // should NOT have CASE nonsense for handling empty strings as
             // that should bave been optimized by the time it gets to
             // the chunk
-            .with_expr(col("state").eq(lit("MA")));
+            .with_expr(col("state").eq(lit_dict("MA")));
 
         fixture
             .expect_predicates(
@@ -2680,7 +2678,7 @@ mod tests {
             // comparison to empty string conversion results in a messier translation
             // to handle backwards compatibility semantics
             // #state IS NULL OR #state = Utf8("")
-            .with_expr(col("state").is_null().or(col("state").eq(lit(""))));
+            .with_expr(col("state").is_null().or(col("state").eq(lit_dict(""))));
 
         fixture
             .expect_predicates(
@@ -2724,7 +2722,7 @@ mod tests {
         let response = fixture.storage_client.read_filter(request).await;
         assert_contains!(response.unwrap_err().to_string(), "Sugar we are going down");
 
-        grpc_request_metric_has_count(&fixture, "ReadFilter", "client_error", 1);
+        grpc_request_metric_has_count(&fixture, "ReadFilter", "server_error", 1);
     }
 
     #[tokio::test]
@@ -2816,7 +2814,7 @@ mod tests {
             .to_string();
         assert_contains!(response_string, "Sugar we are going down");
 
-        grpc_request_metric_has_count(&fixture, "ReadGroup", "client_error", 1);
+        grpc_request_metric_has_count(&fixture, "ReadGroup", "server_error", 1);
     }
 
     #[tokio::test]
@@ -2982,7 +2980,7 @@ mod tests {
 
         assert_contains!(response_string, "Sugar we are going down");
 
-        grpc_request_metric_has_count(&fixture, "ReadWindowAggregate", "client_error", 1);
+        grpc_request_metric_has_count(&fixture, "ReadWindowAggregate", "server_error", 1);
     }
 
     #[tokio::test]
@@ -3262,6 +3260,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_query_semaphore() {
+        maybe_start_logging();
         let semaphore_size = 2;
         let test_storage = Arc::new(TestDatabaseStore::new_with_semaphore_size(semaphore_size));
 
@@ -3397,6 +3396,84 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    // ensure that the expected IOx header is included with successes
+    async fn test_headers() {
+        test_helpers::maybe_start_logging();
+        // Start a test gRPC server on a randomally allocated port
+        let fixture = Fixture::new().await.expect("Connecting to test server");
+
+        let db_info = org_and_bucket();
+
+        // Add a chunk with a field
+        let chunk = TestChunk::new("TheMeasurement")
+            .with_time_column()
+            .with_tag_column("state")
+            .with_one_row_of_data();
+
+        fixture
+            .test_storage
+            .db_or_create(db_info.db_name())
+            .await
+            .add_chunk("my_partition_key", Arc::new(chunk));
+
+        // use the raw gRPR client to examine the headers
+        let mut storage_client = storage_client::StorageClient::new(
+            fixture.client_connection.clone().into_grpc_connection(),
+        );
+
+        let source = Some(StorageClient::read_source(&db_info, 1));
+
+        let request = ReadFilterRequest {
+            read_source: source.clone(),
+            range: None,
+            predicate: None,
+            ..Default::default()
+        };
+
+        let response = storage_client.read_filter(request).await.unwrap();
+
+        println!("Result is {:?}", response);
+        assert_eq!(response.metadata().get("storage-type").unwrap(), "iox");
+    }
+
+    #[tokio::test]
+    // ensure that the expected IOx header is included with errors
+    async fn test_headers_error() {
+        test_helpers::maybe_start_logging();
+        // Start a test gRPC server on a randomally allocated port
+        let fixture = Fixture::new().await.expect("Connecting to test server");
+
+        let db_info = org_and_bucket();
+
+        let chunk = TestChunk::new("my_table").with_error("Sugar we are going down");
+
+        fixture
+            .test_storage
+            .db_or_create(db_info.db_name())
+            .await
+            .add_chunk("my_partition_key", Arc::new(chunk));
+
+        // use the raw gRPR client to examine the headers
+        let mut storage_client = storage_client::StorageClient::new(
+            fixture.client_connection.clone().into_grpc_connection(),
+        );
+
+        let source = Some(StorageClient::read_source(&db_info, 1));
+
+        let request = ReadFilterRequest {
+            read_source: source.clone(),
+            range: None,
+            predicate: None,
+            ..Default::default()
+        };
+
+        let response = storage_client.read_filter(request).await.unwrap_err();
+
+        println!("Result is {:?}", response);
+        assert_eq!(response.metadata().get("storage-type").unwrap(), "iox");
+    }
+
     fn make_timestamp_range(start: i64, end: i64) -> TimestampRange {
         TimestampRange { start, end }
     }
@@ -3456,7 +3533,7 @@ mod tests {
     ///
     /// state="MA"
     fn make_state_ma_expr() -> Expr {
-        col("state").eq(lit("MA"))
+        col("state").eq(lit_dict("MA"))
     }
 
     /// Convert to a Vec<String> to facilitate comparison with results of client
@@ -3475,7 +3552,8 @@ mod tests {
 
     // Wrapper around raw clients and test database
     struct Fixture {
-        iox_client: IOxTestingClient<Connection>,
+        client_connection: Connection,
+        iox_client: IOxTestingClient<GrpcConnection>,
         storage_client: StorageClient,
         test_storage: Arc<TestDatabaseStore>,
         join_handle: JoinHandle<()>,
@@ -3529,17 +3607,19 @@ mod tests {
 
             let join_handle = tokio::task::spawn(server);
 
-            let conn = ConnectionBuilder::default()
+            let client_connection = ConnectionBuilder::default()
                 .connect_timeout(std::time::Duration::from_secs(30))
                 .build(format!("http://{}", bind_addr))
                 .await
                 .unwrap();
 
-            let iox_client = IOxTestingClient::new(conn.clone());
+            let iox_client =
+                IOxTestingClient::new(client_connection.clone().into_grpc_connection());
 
-            let storage_client = StorageClient::new(conn);
+            let storage_client = StorageClient::new(client_connection.clone());
 
             Ok(Self {
+                client_connection,
                 iox_client,
                 storage_client,
                 test_storage,

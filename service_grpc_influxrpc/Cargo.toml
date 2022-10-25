@@ -1,12 +1,15 @@
 [package]
 name = "service_grpc_influxrpc"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
 
 [dependencies]
 # Workspace dependencies, in alphabetical order
 data_types = { path = "../data_types" }
 datafusion = { path = "../datafusion" }
+datafusion_util = { path = "../datafusion_util" }
 generated_types = { path = "../generated_types" }
 observability_deps = { path = "../observability_deps" }
 predicate = { path = "../predicate" }
@@ -19,22 +22,23 @@ trace_http = { path = "../trace_http"}
 tracker = { path = "../tracker" }
 
 # Crates.io dependencies, in alphabetical order
-arrow = { version = "21.0.0", features = ["prettyprint"] }
+arrow = { version = "25.0.0", features = ["prettyprint"] }
 async-trait = "0.1"
 futures = "0.3"
 pin-project = "1.0"
 prost = "0.11"
 regex = "1.6.0"
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0.83"
+serde_json = "1.0.87"
 snafu = "0.7"
-tokio = { version = "1.20", features = ["macros", "net", "parking_lot", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1.21", features = ["macros", "net", "parking_lot", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 tonic = "0.8"
 workspace-hack = { path = "../workspace-hack"}
 
 [dev-dependencies]
 # Workspace dependencies, in alphabetical order
+datafusion_util = { path = "../datafusion_util" }
 influxdb_storage_client = { path = "../influxdb_storage_client" }
 metric = { path = "../metric" }
 panic_logging = { path = "../panic_logging" }

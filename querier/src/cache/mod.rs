@@ -1,5 +1,6 @@
 //! Caches used by the querier.
 use ::object_store::ObjectStore;
+use ::parquet_file::storage::{ParquetStorage, StorageId};
 use backoff::BackoffConfig;
 use cache_system::backend::policy::lru::ResourcePool;
 use iox_catalog::interface::Catalog;
@@ -10,8 +11,7 @@ use tokio::runtime::Handle;
 use self::{
     namespace::NamespaceCache, object_store::ObjectStoreCache, parquet_file::ParquetFileCache,
     partition::PartitionCache, processed_tombstones::ProcessedTombstonesCache,
-    projected_schema::ProjectedSchemaCache, ram::RamSize, read_buffer::ReadBufferCache,
-    tombstones::TombstoneCache,
+    projected_schema::ProjectedSchemaCache, ram::RamSize, tombstones::TombstoneCache,
 };
 
 pub mod namespace;
@@ -21,7 +21,6 @@ pub mod partition;
 pub mod processed_tombstones;
 pub mod projected_schema;
 mod ram;
-pub mod read_buffer;
 pub mod tombstones;
 
 #[cfg(test)]
@@ -47,9 +46,6 @@ pub struct CatalogCache {
 
     /// tombstone cache
     tombstone_cache: TombstoneCache,
-
-    /// Read buffer chunk cache
-    read_buffer_cache: ReadBufferCache,
 
     /// Projected schema cache.
     projected_schema_cache: ProjectedSchemaCache,
@@ -174,13 +170,6 @@ impl CatalogCache {
             Arc::clone(&ram_pool_metadata),
             testing,
         );
-        let read_buffer_cache = ReadBufferCache::new(
-            backoff_config.clone(),
-            Arc::clone(&time_provider),
-            Arc::clone(&metric_registry),
-            Arc::clone(&ram_pool_data),
-            testing,
-        );
         let projected_schema_cache = ProjectedSchemaCache::new(
             Arc::clone(&time_provider),
             &metric_registry,
@@ -203,7 +192,6 @@ impl CatalogCache {
             processed_tombstones_cache,
             parquet_file_cache,
             tombstone_cache,
-            read_buffer_cache,
             projected_schema_cache,
             object_store_cache,
             metric_registry,
@@ -251,11 +239,6 @@ impl CatalogCache {
         &self.tombstone_cache
     }
 
-    /// Read buffer chunk cache.
-    pub(crate) fn read_buffer(&self) -> &ReadBufferCache {
-        &self.read_buffer_cache
-    }
-
     /// Projected schema cache.
     pub(crate) fn projected_schema(&self) -> &ProjectedSchemaCache {
         &self.projected_schema_cache
@@ -265,5 +248,13 @@ impl CatalogCache {
     #[allow(dead_code)]
     pub(crate) fn object_store(&self) -> &ObjectStoreCache {
         &self.object_store_cache
+    }
+
+    /// Parquet store that points to the cached object store.
+    pub fn parquet_store(&self) -> ParquetStorage {
+        ParquetStorage::new(
+            Arc::clone(self.object_store_cache.object_store()),
+            StorageId::from("iox_cached"),
+        )
     }
 }

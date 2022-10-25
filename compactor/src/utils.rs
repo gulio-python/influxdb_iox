@@ -1,7 +1,12 @@
 //! Helpers of the Compactor
 
-use crate::query::QueryableParquetChunk;
-use data_types::{ParquetFile, ParquetFileId, TableSchema, Timestamp, Tombstone, TombstoneId};
+use crate::{compact, query::QueryableParquetChunk, PartitionCompactionCandidateWithInfo};
+use backoff::Backoff;
+use data_types::{
+    CompactionLevel, ParquetFile, ParquetFileId, TableSchema, Timestamp, TimestampMinMax,
+    Tombstone, TombstoneId,
+};
+use metric::Attributes;
 use observability_deps::tracing::*;
 use parquet_file::{chunk::ParquetChunk, storage::ParquetStorage};
 use schema::{sort::SortKey, Schema};
@@ -9,6 +14,46 @@ use std::{
     collections::{BTreeMap, HashSet},
     sync::Arc,
 };
+
+/// Given a compactor, a string describing the compaction type for logging and metrics, and a
+/// fallible function that returns compaction candidates, retry with backoff and return the
+/// candidates. Record metrics on the compactor about how long it took to get the candidates.
+pub(crate) async fn get_candidates_with_retry<Q, Fut>(
+    compactor: Arc<compact::Compactor>,
+    compaction_type: &'static str,
+    query_function: Q,
+) -> Vec<Arc<PartitionCompactionCandidateWithInfo>>
+where
+    Q: Fn(Arc<compact::Compactor>) -> Fut + Send + Sync + 'static,
+    Fut: futures::Future<
+            Output = Result<Vec<Arc<PartitionCompactionCandidateWithInfo>>, compact::Error>,
+        > + Send,
+{
+    let backoff_task_name = format!("{compaction_type}_partitions_to_compact");
+    debug!(compaction_type, "start collecting partitions to compact");
+    let attributes = Attributes::from(&[("partition_type", compaction_type)]);
+
+    let start_time = compactor.time_provider.now();
+
+    let candidates = Backoff::new(&compactor.backoff_config)
+        .retry_all_errors(&backoff_task_name, || {
+            let compactor = Arc::clone(&compactor);
+            async { query_function(compactor).await }
+        })
+        .await
+        .expect("retry forever");
+
+    if let Some(delta) = compactor
+        .time_provider
+        .now()
+        .checked_duration_since(start_time)
+    {
+        let duration = compactor.candidate_selection_duration.recorder(attributes);
+        duration.record(delta);
+    }
+
+    candidates
+}
 
 /// Wrapper of group of parquet files with their min time and total size
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,6 +157,7 @@ impl ParquetFileWithTombstone {
         table_name: String,
         table_schema: &TableSchema,
         partition_sort_key: Option<SortKey>,
+        target_level: CompactionLevel,
     ) -> QueryableParquetChunk {
         let column_id_lookup = table_schema.column_id_map();
         let selection: Vec<_> = self
@@ -127,7 +173,9 @@ impl ParquetFileWithTombstone {
             .select_by_names(&selection)
             .expect("schema in-sync");
         let pk = schema.primary_key();
-        let sort_key = partition_sort_key.as_ref().map(|sk| sk.filter_to(&pk));
+        let sort_key = partition_sort_key
+            .as_ref()
+            .map(|sk| sk.filter_to(&pk, self.partition_id.get()));
 
         let parquet_chunk = ParquetChunk::new(Arc::clone(&self.data), Arc::new(schema), store);
 
@@ -152,6 +200,7 @@ impl ParquetFileWithTombstone {
             sort_key,
             partition_sort_key,
             self.data.compaction_level,
+            target_level,
         )
     }
 }
@@ -179,6 +228,7 @@ impl ParquetFileWithTombstone {
 ///     13 = 7 (previous time) + 6 (time range)
 ///     19 = 13 (previous time) + 6 (time range)
 pub(crate) fn compute_split_time(
+    chunk_times: Vec<TimestampMinMax>,
     min_time: i64,
     max_time: i64,
     total_size: u64,
@@ -199,15 +249,23 @@ pub(crate) fn compute_split_time(
     let mut min = min_time;
     loop {
         let split_time = min + ((max_time - min_time) as f64 * percentage).ceil() as i64;
-        if split_time < max_time {
-            split_times.push(split_time);
-            min = split_time;
-        } else {
+
+        if split_time >= max_time {
             break;
+        } else if time_range_present(&chunk_times, min, split_time) {
+            split_times.push(split_time);
         }
+        min = split_time;
     }
 
     split_times
+}
+
+// time_range_present returns true if the given time range is included in any of the chunks.
+fn time_range_present(chunk_times: &[TimestampMinMax], min_time: i64, max_time: i64) -> bool {
+    chunk_times
+        .iter()
+        .any(|&chunk| chunk.max >= min_time && chunk.min <= max_time)
 }
 
 #[cfg(test)]
@@ -220,22 +278,44 @@ mod tests {
         let max_time = 11;
         let total_size = 100;
         let max_desired_file_size = 100;
+        let chunk_times = vec![TimestampMinMax {
+            min: min_time,
+            max: max_time,
+        }];
 
         // no split
-        let result = compute_split_time(min_time, max_time, total_size, max_desired_file_size);
+        let result = compute_split_time(
+            chunk_times.clone(),
+            min_time,
+            max_time,
+            total_size,
+            max_desired_file_size,
+        );
         assert_eq!(result.len(), 1);
         assert_eq!(result[0], max_time);
 
         // split 70% and 30%
         let max_desired_file_size = 70;
-        let result = compute_split_time(min_time, max_time, total_size, max_desired_file_size);
+        let result = compute_split_time(
+            chunk_times.clone(),
+            min_time,
+            max_time,
+            total_size,
+            max_desired_file_size,
+        );
         // only need to store the last split time
         assert_eq!(result.len(), 1);
         assert_eq!(result[0], 8); // = 1 (min_time) + 7
 
         // split 40%, 40%, 20%
         let max_desired_file_size = 40;
-        let result = compute_split_time(min_time, max_time, total_size, max_desired_file_size);
+        let result = compute_split_time(
+            chunk_times,
+            min_time,
+            max_time,
+            total_size,
+            max_desired_file_size,
+        );
         // store first and second split time
         assert_eq!(result.len(), 2);
         assert_eq!(result[0], 5); // = 1 (min_time) + 4
@@ -254,8 +334,18 @@ mod tests {
 
         let total_size = 200;
         let max_desired_file_size = 100;
+        let chunk_times = vec![TimestampMinMax {
+            min: min_time,
+            max: max_time,
+        }];
 
-        let result = compute_split_time(min_time, max_time, total_size, max_desired_file_size);
+        let result = compute_split_time(
+            chunk_times,
+            min_time,
+            max_time,
+            total_size,
+            max_desired_file_size,
+        );
 
         // must return vector of one containing max_time
         assert_eq!(result.len(), 1);
@@ -271,8 +361,54 @@ mod tests {
 
         let total_size = 600000;
         let max_desired_file_size = 10000;
+        let chunk_times = vec![TimestampMinMax {
+            min: min_time,
+            max: max_time,
+        }];
 
-        let result = compute_split_time(min_time, max_time, total_size, max_desired_file_size);
+        let result = compute_split_time(
+            chunk_times,
+            min_time,
+            max_time,
+            total_size,
+            max_desired_file_size,
+        );
         assert_eq!(result.len(), 9);
+    }
+
+    #[test]
+    fn compute_split_time_chunk_gaps() {
+        // When the chunks have large gaps, we should not introduce a splits that cause time ranges
+        // known to be empty.  Split T2 below should not exist.
+        //                   │               │
+        //┌────────────────┐                   ┌──────────────┐
+        //│    Chunk 1     │ │               │ │   Chunk 2    │
+        //└────────────────┘                   └──────────────┘
+        //                   │               │
+        //                Split T1       Split T2
+
+        // Create a scenario where naive splitting would produce 2 splits (3 chunks) as shown above, but
+        // the only chunk data present is in the highest and lowest quarters, similar to what's shown above.
+        let min_time = 1;
+        let max_time = 100;
+
+        let total_size = 200;
+        let max_desired_file_size = total_size / 3;
+        let chunk_times = vec![
+            TimestampMinMax { min: 1, max: 24 },
+            TimestampMinMax { min: 75, max: 100 },
+        ];
+
+        let result = compute_split_time(
+            chunk_times,
+            min_time,
+            max_time,
+            total_size,
+            max_desired_file_size,
+        );
+
+        // must return vector of one, containing a Split T1 shown above.
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0], 34);
     }
 }

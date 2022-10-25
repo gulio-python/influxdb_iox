@@ -15,18 +15,21 @@ use arrow::{
 
 use data_types::TimestampMinMax;
 use datafusion::{
-    datasource::MemTable,
+    self,
+    common::{DFSchema, ToDFSchema},
+    datasource::{provider_as_source, MemTable},
     error::{DataFusionError, Result as DatafusionResult},
     execution::context::ExecutionProps,
-    logical_plan::{
-        lit, provider_as_source, DFSchema, Expr, ExprRewriter, ExprSchemable, LogicalPlan,
-        LogicalPlanBuilder,
+    logical_expr::{
+        expr_rewriter::ExprRewriter, BinaryExpr, ExprSchemable, LogicalPlan, LogicalPlanBuilder,
     },
+    optimizer::expr_simplifier::{ExprSimplifier, SimplifyContext},
     physical_expr::create_physical_expr,
     physical_plan::{
         expressions::{col as physical_col, PhysicalSortExpr},
         ExecutionPlan, PhysicalExpr,
     },
+    prelude::{binary_expr, lit, Expr},
     scalar::ScalarValue,
 };
 
@@ -111,34 +114,25 @@ pub fn arrow_sort_key_exprs(
         .collect()
 }
 
-/// Build a datafusion physical expression from its logical one
+/// Build a datafusion physical expression from a logical one
 pub fn df_physical_expr(
     input: &dyn ExecutionPlan,
     expr: Expr,
 ) -> std::result::Result<Arc<dyn PhysicalExpr>, DataFusionError> {
-    df_physical_expr_from_schema_and_expr(input.schema(), expr)
-}
+    let schema = input.schema();
 
-/// Build a datafusion physical expression from its logical one and a provided schema
-pub fn df_physical_expr_from_schema_and_expr(
-    schema: Arc<ArrowSchema>,
-    expr: Expr,
-) -> std::result::Result<Arc<dyn PhysicalExpr>, DataFusionError> {
-    let execution_props = ExecutionProps::new();
+    let df_schema = Arc::clone(&schema).to_dfschema_ref()?;
 
-    let input_physical_schema = schema;
-    let input_logical_schema: DFSchema = input_physical_schema.as_ref().clone().try_into()?;
+    let props = ExecutionProps::new();
+    let simplifier =
+        ExprSimplifier::new(SimplifyContext::new(&props).with_schema(Arc::clone(&df_schema)));
 
-    trace!(%expr, "logical expression");
-    trace!(%input_logical_schema, "input logical schema");
-    trace!(%input_physical_schema, "input physical schema");
+    // apply type coercion here to ensure types match
+    trace!(%df_schema, "input schema");
+    let expr = simplifier.coerce(expr, Arc::clone(&df_schema))?;
+    trace!(%expr, "coerced logical expression");
 
-    create_physical_expr(
-        &expr,
-        &input_logical_schema,
-        &input_physical_schema,
-        &execution_props,
-    )
+    create_physical_expr(&expr, df_schema.as_ref(), schema.as_ref(), &props)
 }
 
 /// Rewrites the provided expr such that references to any column that
@@ -219,14 +213,10 @@ impl<'a> ExprRewriter for MissingColumnsToNull<'a> {
         // Until then, we need to know what type of expr the column is
         // being compared with, so workaround by finding the datatype of the other arg
         match expr {
-            Expr::BinaryExpr { left, op, right } => {
+            Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
                 let left = self.rewrite_op_arg(*left, &right)?;
                 let right = self.rewrite_op_arg(*right, &left)?;
-                Ok(Expr::BinaryExpr {
-                    left: Box::new(left),
-                    op,
-                    right: Box::new(right),
-                })
+                Ok(binary_expr(left, op, right))
             }
             Expr::IsNull(expr) if self.is_null_column(&expr) => Ok(lit(true)),
             Expr::IsNotNull(expr) if self.is_null_column(&expr) => Ok(lit(false)),
@@ -285,7 +275,8 @@ pub fn compute_timenanosecond_min_max_for_one_record_batch(
 mod tests {
     use arrow::datatypes::DataType;
     use datafusion::{
-        logical_plan::{col, lit, ExprRewritable},
+        logical_expr::expr_rewriter::ExprRewritable,
+        prelude::{col, lit},
         scalar::ScalarValue,
     };
     use schema::builder::SchemaBuilder;
@@ -297,10 +288,15 @@ mod tests {
         let schema = SchemaBuilder::new()
             .tag("tag")
             .field("str", DataType::Utf8)
+            .unwrap()
             .field("int", DataType::Int64)
+            .unwrap()
             .field("uint", DataType::UInt64)
+            .unwrap()
             .field("float", DataType::Float64)
+            .unwrap()
             .field("bool", DataType::Boolean)
+            .unwrap()
             .build()
             .unwrap();
 

@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use clap_blocks::querier::{IngesterAddresses, QuerierConfig};
 use hyper::{Body, Request, Response};
 use iox_catalog::interface::Catalog;
-use iox_query::exec::Executor;
+use iox_query::exec::{Executor, ExecutorType};
 use iox_time::TimeProvider;
 use ioxd_common::{
     add_service,
@@ -14,7 +14,6 @@ use ioxd_common::{
 };
 use metric::Registry;
 use object_store::DynObjectStore;
-use parquet_file::storage::ParquetStorage;
 use querier::{
     create_ingester_connections_by_shard, QuerierCatalogCache, QuerierDatabase, QuerierHandler,
     QuerierHandlerImpl, QuerierServer,
@@ -152,12 +151,6 @@ pub struct QuerierServerTypeArgs<'a> {
 
 #[derive(Debug, Error)]
 pub enum Error {
-    #[error("failed to initialise write buffer connection: {0}")]
-    WriteBuffer(#[from] write_buffer::core::WriteBufferError),
-
-    #[error("failed to create ShardIndex from id: {0}")]
-    InvalidData(#[from] std::num::TryFromIntError),
-
     #[error("querier error: {0}")]
     Querier(#[from] querier::QuerierDatabaseError),
 }
@@ -176,6 +169,20 @@ pub async fn create_querier_server_type(
         &Handle::current(),
     ));
 
+    // register cached object store with the execution context
+    let parquet_store = catalog_cache.parquet_store();
+    let existing = args
+        .exec
+        .new_context(ExecutorType::Query)
+        .inner()
+        .runtime_env()
+        .register_object_store(
+            "iox",
+            parquet_store.id(),
+            Arc::clone(parquet_store.object_store()),
+        );
+    assert!(existing.is_none());
+
     let ingester_connection = match args.ingester_addresses {
         IngesterAddresses::None => None,
         IngesterAddresses::ByShardIndex(map) => Some(create_ingester_connections_by_shard(
@@ -188,7 +195,6 @@ pub async fn create_querier_server_type(
         QuerierDatabase::new(
             catalog_cache,
             Arc::clone(&args.metric_registry),
-            ParquetStorage::new(args.object_store),
             args.exec,
             ingester_connection,
             args.querier_config.max_concurrent_queries(),

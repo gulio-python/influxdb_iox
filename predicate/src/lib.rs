@@ -5,12 +5,13 @@
     clippy::explicit_iter_loop,
     clippy::future_not_send,
     clippy::use_self,
-    clippy::clone_on_ref_ptr
+    clippy::clone_on_ref_ptr,
+    clippy::todo,
+    clippy::dbg_macro
 )]
 
 pub mod delete_expr;
 pub mod delete_predicate;
-pub mod rewrite;
 pub mod rpc_predicate;
 
 use arrow::{
@@ -22,10 +23,10 @@ use arrow::{
 use data_types::{InfluxDbType, TableSummary, TimestampRange};
 use datafusion::{
     error::DataFusionError,
-    logical_expr::{binary_expr, utils::expr_to_columns},
-    logical_plan::{col, lit_timestamp_nano, Expr, Operator},
+    logical_expr::{binary_expr, utils::expr_to_columns, BinaryExpr, Operator},
     optimizer::utils::split_conjunction,
     physical_optimizer::pruning::{PruningPredicate, PruningStatistics},
+    prelude::{col, lit_timestamp_nano, Expr},
 };
 use datafusion_util::{make_range_expr, nullable_schema};
 use observability_deps::tracing::debug;
@@ -58,7 +59,7 @@ pub const EMPTY_PREDICATE: Predicate = Predicate {
 /// Example:
 /// ```
 /// use predicate::Predicate;
-/// use datafusion::logical_plan::{col, lit};
+/// use datafusion::prelude::{col, lit};
 ///
 /// let p = Predicate::new()
 ///    .with_range(1, 100)
@@ -66,10 +67,10 @@ pub const EMPTY_PREDICATE: Predicate = Predicate {
 ///
 /// assert_eq!(
 ///   p.to_string(),
-///   "Predicate range: [1 - 100] exprs: [#foo = Int32(42)]"
+///   "Predicate range: [1 - 100] exprs: [foo = Int32(42)]"
 /// );
 /// ```
-#[derive(Clone, Debug, Default, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd)]
 pub struct Predicate {
     /// Optional field (aka "column") restriction. If present,
     /// restricts the results to only tables which have *at least one*
@@ -300,10 +301,7 @@ struct SummaryWrapper<'a> {
 }
 
 impl<'a> PruningStatistics for SummaryWrapper<'a> {
-    fn min_values(
-        &self,
-        column: &datafusion::logical_plan::Column,
-    ) -> Option<arrow::array::ArrayRef> {
+    fn min_values(&self, column: &datafusion::prelude::Column) -> Option<arrow::array::ArrayRef> {
         let col = self.summary.column(&column.name)?;
         let stats = &col.stats;
 
@@ -326,10 +324,7 @@ impl<'a> PruningStatistics for SummaryWrapper<'a> {
         Some(array)
     }
 
-    fn max_values(
-        &self,
-        column: &datafusion::logical_plan::Column,
-    ) -> Option<arrow::array::ArrayRef> {
+    fn max_values(&self, column: &datafusion::prelude::Column) -> Option<arrow::array::ArrayRef> {
         let col = self.summary.column(&column.name)?;
         let stats = &col.stats;
 
@@ -357,10 +352,7 @@ impl<'a> PruningStatistics for SummaryWrapper<'a> {
         1
     }
 
-    fn null_counts(
-        &self,
-        column: &datafusion::logical_plan::Column,
-    ) -> Option<arrow::array::ArrayRef> {
+    fn null_counts(&self, column: &datafusion::prelude::Column) -> Option<arrow::array::ArrayRef> {
         let null_count = self.summary.column(&column.name)?.stats.null_count();
 
         Some(Arc::new(UInt64Array::from(vec![null_count])))
@@ -497,24 +489,19 @@ impl Predicate {
     pub fn with_pushdown_exprs(mut self, filters: &[Expr]) -> Self {
         // For each expression of the filters, recursively split it, if it is is an AND conjunction
         // For example, expression (x AND y) will be split into a vector of 2 expressions [x, y]
-        let mut exprs = vec![];
-        filters
-            .iter()
-            .for_each(|expr| split_conjunction(expr, &mut exprs));
+        let mut exprs = filters.iter().flat_map(split_conjunction);
 
         // Only keep single_column and primitive binary expressions
         let mut pushdown_exprs: Vec<Expr> = vec![];
-        let exprs_result = exprs
-            .into_iter()
-            .try_for_each::<_, Result<_, DataFusionError>>(|expr| {
-                let mut columns = HashSet::new();
-                expr_to_columns(expr, &mut columns)?;
+        let exprs_result = exprs.try_for_each::<_, Result<_, DataFusionError>>(|expr| {
+            let mut columns = HashSet::new();
+            expr_to_columns(expr, &mut columns)?;
 
-                if columns.len() == 1 && Self::primitive_binary_expr(expr) {
-                    pushdown_exprs.push(expr.clone());
-                }
-                Ok(())
-            });
+            if columns.len() == 1 && Self::primitive_binary_expr(expr) {
+                pushdown_exprs.push(expr.clone());
+            }
+            Ok(())
+        });
 
         match exprs_result {
             Ok(()) => {
@@ -533,7 +520,7 @@ impl Predicate {
     // and op must be a comparison one
     pub fn primitive_binary_expr(expr: &Expr) -> bool {
         match expr {
-            Expr::BinaryExpr { left, op, right } => {
+            Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
                 matches!(
                     (&**left, &**right),
                     (Expr::Column(_), Expr::Literal(_)) | (Expr::Literal(_), Expr::Column(_))
@@ -554,7 +541,7 @@ impl Predicate {
 
 // Wrapper around `Expr::BinaryExpr` where left input is known to be
 // single Column reference to the `_value` column
-#[derive(Clone, Debug, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd)]
 pub struct ValueExpr {
     expr: Expr,
 }
@@ -566,11 +553,11 @@ impl TryFrom<Expr> for ValueExpr {
     /// tries to create a new ValueExpr. If `expr` follows the
     /// expected pattrn, returns Ok(Self). If not, returns Err(expr)
     fn try_from(expr: Expr) -> Result<Self, Self::Error> {
-        if let Expr::BinaryExpr {
+        if let Expr::BinaryExpr(BinaryExpr {
             left,
             op: _,
             right: _,
-        } = &expr
+        }) = &expr
         {
             if let Expr::Column(inner) = left.as_ref() {
                 if inner.name == VALUE_COLUMN_NAME {
@@ -586,7 +573,7 @@ impl ValueExpr {
     /// Returns a new [`Expr`] with the reference to the `_value`
     /// column replaced with the specified column name
     pub fn replace_col(&self, name: &str) -> Expr {
-        if let Expr::BinaryExpr { left: _, op, right } = &self.expr {
+        if let Expr::BinaryExpr(BinaryExpr { left: _, op, right }) = &self.expr {
             binary_expr(col(name), *op, right.as_ref().clone())
         } else {
             unreachable!("Unexpected content in ValueExpr")
@@ -605,7 +592,7 @@ mod tests {
     use super::*;
     use arrow::datatypes::DataType as ArrowDataType;
     use data_types::{ColumnSummary, InfluxDbType, StatValues, MAX_NANO_TIME, MIN_NANO_TIME};
-    use datafusion::logical_plan::{col, lit};
+    use datafusion::prelude::{col, lit};
     use schema::builder::SchemaBuilder;
     use test_helpers::maybe_start_logging;
 
@@ -726,7 +713,7 @@ mod tests {
 
         assert_eq!(
             p.to_string(),
-            "Predicate range: [1 - 100] exprs: [#foo = Int32(42) AND #bar < Int32(11)]"
+            "Predicate range: [1 - 100] exprs: [foo = Int32(42) AND bar < Int32(11)]"
         );
     }
 
@@ -739,7 +726,7 @@ mod tests {
 
         assert_eq!(
             p.to_string(),
-            "Predicate field_columns: {f1, f2} range: [1 - 100] exprs: [#foo = Int32(42)]"
+            "Predicate field_columns: {f1, f2} range: [1 - 100] exprs: [foo = Int32(42)]"
         );
     }
 
@@ -802,7 +789,9 @@ mod tests {
 
         let schema = SchemaBuilder::new()
             .field("foo", ArrowDataType::Int64)
+            .unwrap()
             .field("bar", ArrowDataType::Int64)
+            .unwrap()
             .timestamp()
             .build()
             .unwrap();
@@ -909,6 +898,7 @@ mod tests {
 
         let schema = SchemaBuilder::new()
             .field("foo", ArrowDataType::Int64)
+            .unwrap()
             .timestamp()
             .build()
             .unwrap();

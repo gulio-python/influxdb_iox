@@ -1,8 +1,10 @@
 [package]
 name = "mutable_batch_tests"
-version = "0.1.0"
-edition = "2021"
 description = "MutableBatch integration tests and benchmarks"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
 
 [dependencies]
 dml = { path = "../dml" }
@@ -15,7 +17,7 @@ prost = "0.11"
 
 [dev-dependencies]
 bytes = "1.2"
-criterion = "0.3"
+criterion = { version = "0.4", default-features = false, features = ["rayon"]}
 
 [[bench]]
 name = "write_lp"

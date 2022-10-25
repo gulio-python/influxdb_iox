@@ -3,13 +3,16 @@ use clap_blocks::{
     compactor::CompactorOnceConfig,
     object_store::{make_object_store, ObjectStoreConfig},
 };
-use iox_query::exec::Executor;
+use iox_query::exec::{Executor, ExecutorConfig};
 use iox_time::{SystemProvider, TimeProvider};
 use ioxd_compactor::build_compactor_from_config;
 use object_store::DynObjectStore;
 use object_store_metrics::ObjectStoreMetrics;
+use parquet_file::storage::{ParquetStorage, StorageId};
 use snafu::prelude::*;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
+
+mod generate;
 
 #[derive(Debug, clap::Parser)]
 pub struct Config {
@@ -32,13 +35,28 @@ pub enum Command {
 
         /// Number of threads to use for the compactor query execution, compaction and persistence.
         #[clap(
-            long = "--query-exec-thread-count",
+            long = "query-exec-thread-count",
             env = "INFLUXDB_IOX_QUERY_EXEC_THREAD_COUNT",
             default_value = "4",
             action
         )]
         query_exec_thread_count: usize,
     },
+
+    /// Generate Parquet files and catalog entries with different characteristics for the purposes
+    /// of investigating how the compactor handles them.
+    ///
+    /// Only works with `--object-store file` because this is for generating local development
+    /// data.
+    ///
+    /// Within the directory specified by `--data-dir`, will generate a
+    /// `compactor_data/line_protocol` subdirectory to avoid interfering with other existing IOx
+    /// files that may be in the `--data-dir`.
+    ///
+    /// WARNING: On every run of this tool, the `compactor_data/line_protocol` subdirectory will be
+    /// removed. If you want to keep any previously generated files, move or copy them before
+    /// running this tool again.
+    Generate(generate::Config),
 }
 
 pub async fn command(config: Config) -> Result<()> {
@@ -65,14 +83,22 @@ pub async fn command(config: Config) -> Result<()> {
                 Arc::clone(&time_provider),
                 &*metric_registry,
             ));
+            let parquet_store = ParquetStorage::new(object_store, StorageId::from("iox"));
 
-            let exec = Arc::new(Executor::new(query_exec_thread_count));
+            let exec = Arc::new(Executor::new_with_config(ExecutorConfig {
+                num_threads: query_exec_thread_count,
+                target_query_partitions: query_exec_thread_count,
+                object_stores: HashMap::from([(
+                    parquet_store.id(),
+                    Arc::clone(parquet_store.object_store()),
+                )]),
+            }));
             let time_provider = Arc::new(SystemProvider::new());
 
             let compactor = build_compactor_from_config(
                 compactor_config,
                 catalog,
-                object_store,
+                parquet_store,
                 exec,
                 time_provider,
                 metric_registry,
@@ -81,6 +107,9 @@ pub async fn command(config: Config) -> Result<()> {
             let compactor = Arc::new(compactor);
 
             compactor::handler::run_compactor_once(compactor).await;
+        }
+        Command::Generate(config) => {
+            generate::run(config).await?;
         }
     }
 
@@ -101,6 +130,9 @@ pub enum Error {
 
     #[snafu(context(false))]
     Compacting { source: ioxd_compactor::Error },
+
+    #[snafu(context(false))]
+    Generating { source: generate::Error },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

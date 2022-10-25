@@ -5,7 +5,7 @@ use data_types::{
     org_and_bucket_to_database, ColumnType, Namespace, NamespaceSchema, OrgBucketMappingError,
     Partition, PartitionKey, QueryPoolId, ShardId, TableSchema, TopicId,
 };
-use influxdb_iox_client::connection::Connection;
+use influxdb_iox_client::connection::{Connection, GrpcConnection};
 use iox_catalog::interface::{get_schema_by_name, Catalog, ColumnUpsertRequest, RepoCollection};
 use schema::{
     sort::{adjust_sort_key_columns, SortKey, SortKeyBuilder},
@@ -98,7 +98,7 @@ pub async fn update_iox_catalog<'a>(
     // initialise a client of the shard service in the router. we will use it to find out which
     // shard a table/namespace combo would shard to, without exposing the implementation
     // details of the sharding
-    let mut shard_client = ShardServiceClient::new(connection);
+    let mut shard_client = ShardServiceClient::new(connection.into_grpc_connection());
     update_catalog_schema_with_merged(
         namespace_name.as_str(),
         iox_schema,
@@ -176,7 +176,7 @@ async fn update_catalog_schema_with_merged<R>(
     iox_schema: NamespaceSchema,
     merged_tsm_schema: &AggregateTSMSchema,
     repos: &mut R,
-    shard_client: &mut ShardServiceClient<Connection>,
+    shard_client: &mut ShardServiceClient<GrpcConnection>,
 ) -> Result<(), UpdateCatalogError>
 where
     R: RepoCollection + ?Sized,
@@ -220,7 +220,6 @@ where
                     // column doesn't exist; add it
                     column_batch.push(ColumnUpsertRequest {
                         name: tag.name.as_str(),
-                        table_id: table.id,
                         column_type: ColumnType::Tag,
                     });
                 }
@@ -257,7 +256,6 @@ where
                     // column doesn't exist; add it
                     column_batch.push(ColumnUpsertRequest {
                         name: field.name.as_str(),
-                        table_id: table.id,
                         column_type: ColumnType::from(influx_column_type),
                     });
                 }
@@ -270,7 +268,10 @@ where
             // that with short-lived loop variables.
             // since this is a CLI tool rather than something called a lot on the write path, i
             // figure it's okay.
-            repos.columns().create_or_get_many(&column_batch).await?;
+            repos
+                .columns()
+                .create_or_get_many_unchecked(table.id, &column_batch)
+                .await?;
         }
         // create a partition for every day in the date range.
         // N.B. this will need updating if we someday support partitioning by inputs other than
@@ -945,7 +946,7 @@ mod tests {
             .repositories()
             .await
             .topics()
-            .create_or_get("iox_shared")
+            .create_or_get("iox-shared")
             .await
             .expect("topic created");
         let (connection, _join_handle, requests) = create_test_shard_service(MapToShardResponse {
@@ -984,8 +985,8 @@ mod tests {
         let agg_schema: AggregateTSMSchema = json.try_into().unwrap();
         update_iox_catalog(
             &agg_schema,
-            "iox_shared",
-            Some("iox_shared"),
+            "iox-shared",
+            Some("iox-shared"),
             Some("inf"),
             Arc::clone(&catalog),
             connection,
@@ -1313,9 +1314,8 @@ mod tests {
             id: PartitionId::new(1),
             shard_id: ShardId::new(1),
             table_id: TableId::new(1),
+            persisted_sequence_number: None,
             partition_key: PartitionKey::from("2022-06-21"),
-            // N.B. empty sort key at this point; will return as None from the getter and will be
-            // computed
             sort_key: Vec::new(),
         };
         let sort_key = get_sort_key(&partition, &m).1.unwrap();
@@ -1361,6 +1361,7 @@ mod tests {
             id: PartitionId::new(1),
             shard_id: ShardId::new(1),
             table_id: TableId::new(1),
+            persisted_sequence_number: None,
             partition_key: PartitionKey::from("2022-06-21"),
             // N.B. sort key is already what it will computed to; here we're testing the `adjust_sort_key_columns` code path
             sort_key: vec!["host".to_string(), "arch".to_string(), "time".to_string()],
@@ -1407,6 +1408,7 @@ mod tests {
             id: PartitionId::new(1),
             shard_id: ShardId::new(1),
             table_id: TableId::new(1),
+            persisted_sequence_number: None,
             partition_key: PartitionKey::from("2022-06-21"),
             // N.B. is missing host so will need updating
             sort_key: vec!["arch".to_string(), "time".to_string()],
@@ -1455,6 +1457,7 @@ mod tests {
             id: PartitionId::new(1),
             shard_id: ShardId::new(1),
             table_id: TableId::new(1),
+            persisted_sequence_number: None,
             partition_key: PartitionKey::from("2022-06-21"),
             // N.B. is missing arch so will need updating
             sort_key: vec!["host".to_string(), "time".to_string()],

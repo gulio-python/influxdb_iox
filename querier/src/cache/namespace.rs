@@ -29,10 +29,19 @@ use trace::span::Span;
 use super::ram::RamSize;
 
 /// Duration to keep existing namespaces.
-pub const TTL_EXISTING: Duration = Duration::from_secs(60);
+pub const TTL_EXISTING: Duration = Duration::from_secs(300);
 
-// When to refresh an existing namespace.
-pub const REFRESH_EXISTING: Duration = Duration::from_secs(10);
+/// When to refresh an existing namespace.
+///
+/// This policy is chosen to:
+/// 1. decorrelate refreshes which smooths out catalog load
+/// 2. refresh commonly accessed keys less frequently
+pub const REFRESH_EXISTING: BackoffConfig = BackoffConfig {
+    init_backoff: Duration::from_secs(30),
+    max_backoff: Duration::MAX,
+    base: 2.0,
+    deadline: None,
+};
 
 /// Duration to keep non-existing namespaces.
 ///
@@ -43,8 +52,7 @@ pub const REFRESH_EXISTING: Duration = Duration::from_secs(10);
 ///              SOME TTL mechanism attached.
 ///              The TTL is not relevant for prod at the moment because other layers should prevent/filter queries for
 ///              non-existing namespaces.
-pub const TTL_NON_EXISTING: Duration = Duration::from_nanos(2);
-pub const REFRESH_NON_EXISTING: Duration = Duration::from_nanos(1);
+pub const TTL_NON_EXISTING: Duration = Duration::from_nanos(1);
 
 const CACHE_ID: &str = "namespace";
 
@@ -94,7 +102,7 @@ impl NamespaceCache {
                     .await
                     .expect("retry forever")?;
 
-                Some(Arc::new((&schema).into()))
+                Some(Arc::new(schema.into()))
             }
         });
         let loader = Arc::new(MetricsLoader::new(
@@ -115,8 +123,9 @@ impl NamespaceCache {
             metric_registry,
         ));
         backend.add_policy(RefreshPolicy::new(
+            Arc::clone(&time_provider),
             Arc::new(OptionalValueRefreshDurationProvider::new(
-                Some(REFRESH_NON_EXISTING),
+                None,
                 Some(REFRESH_EXISTING),
             )),
             Arc::clone(&loader) as _,
@@ -167,25 +176,30 @@ impl NamespaceCache {
         should_cover: &[(&str, &HashSet<ColumnId>)],
         span: Option<Span>,
     ) -> Option<Arc<CachedNamespace>> {
-        self.remove_if_handle.remove_if(&name, |cached_namespace| {
-            if let Some(namespace) = cached_namespace.as_ref() {
-                should_cover.iter().any(|(table_name, columns)| {
-                    if let Some(table) = namespace.tables.get(*table_name) {
-                        columns
-                            .iter()
-                            .any(|col| !table.column_id_map.contains_key(col))
+        self.remove_if_handle
+            .remove_if_and_get(
+                &self.cache,
+                name,
+                |cached_namespace| {
+                    if let Some(namespace) = cached_namespace.as_ref() {
+                        should_cover.iter().any(|(table_name, columns)| {
+                            if let Some(table) = namespace.tables.get(*table_name) {
+                                columns
+                                    .iter()
+                                    .any(|col| !table.column_id_map.contains_key(col))
+                            } else {
+                                // table unknown => need to update
+                                true
+                            }
+                        })
                     } else {
-                        // table unknown => need to update
-                        true
+                        // namespace unknown => need to update if should cover anything
+                        !should_cover.is_empty()
                     }
-                })
-            } else {
-                // namespace unknown => need to update if should cover anything
-                !should_cover.is_empty()
-            }
-        });
-
-        self.cache.get(name, ((), span)).await
+                },
+                ((), span),
+            )
+            .await
     }
 }
 
@@ -209,8 +223,8 @@ impl CachedTable {
     }
 }
 
-impl From<&TableSchema> for CachedTable {
-    fn from(table: &TableSchema) -> Self {
+impl From<TableSchema> for CachedTable {
+    fn from(table: TableSchema) -> Self {
         let mut column_id_map: HashMap<ColumnId, Arc<str>> = table
             .columns
             .iter()
@@ -220,12 +234,7 @@ impl From<&TableSchema> for CachedTable {
 
         Self {
             id: table.id,
-            schema: Arc::new(
-                table
-                    .clone()
-                    .try_into()
-                    .expect("Catalog table schema broken"),
-            ),
+            schema: Arc::new(table.try_into().expect("Catalog table schema broken")),
             column_id_map,
         }
     }
@@ -234,13 +243,13 @@ impl From<&TableSchema> for CachedTable {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CachedNamespace {
     pub id: NamespaceId,
-    pub tables: HashMap<Arc<str>, CachedTable>,
+    pub tables: HashMap<Arc<str>, Arc<CachedTable>>,
 }
 
 impl CachedNamespace {
     /// RAM-bytes EXCLUDING `self`.
     fn size(&self) -> usize {
-        self.tables.capacity() * size_of::<(Arc<str>, Arc<Schema>)>()
+        self.tables.capacity() * size_of::<(Arc<str>, Arc<CachedTable>)>()
             + self
                 .tables
                 .iter()
@@ -249,12 +258,15 @@ impl CachedNamespace {
     }
 }
 
-impl From<&NamespaceSchema> for CachedNamespace {
-    fn from(ns: &NamespaceSchema) -> Self {
-        let mut tables: HashMap<Arc<str>, CachedTable> = ns
+impl From<NamespaceSchema> for CachedNamespace {
+    fn from(ns: NamespaceSchema) -> Self {
+        let mut tables: HashMap<Arc<str>, Arc<CachedTable>> = ns
             .tables
-            .iter()
-            .map(|(name, table)| (Arc::from(name.clone()), table.into()))
+            .into_iter()
+            .map(|(name, table)| {
+                let table: CachedTable = table.into();
+                (Arc::from(name), Arc::new(table))
+            })
             .collect();
         tables.shrink_to_fit();
 
@@ -310,11 +322,12 @@ mod tests {
             tables: HashMap::from([
                 (
                     Arc::from("table1"),
-                    CachedTable {
+                    Arc::new(CachedTable {
                         id: table11.table.id,
                         schema: Arc::new(
                             SchemaBuilder::new()
                                 .field("col1", DataType::Int64)
+                                .unwrap()
                                 .tag("col2")
                                 .timestamp()
                                 .build()
@@ -325,15 +338,16 @@ mod tests {
                             (col112.column.id, Arc::from(col112.column.name.clone())),
                             (col113.column.id, Arc::from(col113.column.name.clone())),
                         ]),
-                    },
+                    }),
                 ),
                 (
                     Arc::from("table2"),
-                    CachedTable {
+                    Arc::new(CachedTable {
                         id: table12.table.id,
                         schema: Arc::new(
                             SchemaBuilder::new()
                                 .field("col1", DataType::Float64)
+                                .unwrap()
                                 .timestamp()
                                 .build()
                                 .unwrap(),
@@ -342,7 +356,7 @@ mod tests {
                             (col121.column.id, Arc::from(col121.column.name.clone())),
                             (col122.column.id, Arc::from(col122.column.name.clone())),
                         ]),
-                    },
+                    }),
                 ),
             ]),
         };
@@ -357,14 +371,14 @@ mod tests {
             id: ns2.namespace.id,
             tables: HashMap::from([(
                 Arc::from("table1"),
-                CachedTable {
+                Arc::new(CachedTable {
                     id: table21.table.id,
                     schema: Arc::new(SchemaBuilder::new().timestamp().build().unwrap()),
                     column_id_map: HashMap::from([(
                         col211.column.id,
                         Arc::from(col211.column.name.clone()),
                     )]),
-                },
+                }),
             )]),
         };
         assert_eq!(actual_ns_2.as_ref(), &expected_ns_2);

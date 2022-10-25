@@ -1,19 +1,24 @@
+mod column_rewrite;
 mod field_rewrite;
 mod measurement_rewrite;
+mod rewrite;
 mod value_rewrite;
 
-use crate::{rewrite, Predicate};
+use crate::Predicate;
 
+use datafusion::common::{ExprSchema, ToDFSchema};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::context::ExecutionProps;
-use datafusion::logical_expr::lit;
-use datafusion::logical_plan::{
-    Column, Expr, ExprSchema, ExprSchemable, ExprSimplifiable, SimplifyInfo,
-};
+use datafusion::logical_expr::expr_rewriter::ExprRewritable;
+use datafusion::logical_expr::ExprSchemable;
+use datafusion::optimizer::expr_simplifier::{ExprSimplifier, SimplifyInfo};
+use datafusion::prelude::{lit, Column, Expr};
+use observability_deps::tracing::{debug, trace};
 use schema::Schema;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use self::column_rewrite::MissingColumnRewriter;
 use self::field_rewrite::FieldProjectionRewriter;
 use self::measurement_rewrite::rewrite_measurement_references;
 use self::value_rewrite::rewrite_field_value_references;
@@ -187,31 +192,50 @@ fn normalize_predicate(
     let mut predicate = predicate.clone();
 
     let mut field_projections = FieldProjectionRewriter::new(Arc::clone(&schema));
+    let mut missing_columums = MissingColumnRewriter::new(Arc::clone(&schema));
 
     let mut field_value_exprs = vec![];
+
+    // TODO find some better interface than a DFSchema :vomit:
+    let df_schema = schema.as_arrow().to_dfschema_ref()?;
 
     predicate.exprs = predicate
         .exprs
         .into_iter()
         .map(|e| {
-            rewrite_measurement_references(table_name, e)
+            let simplifier = ExprSimplifier::new(SimplifyAdapter::new(schema.as_ref()));
+
+            debug!(?e, "rewriting expr");
+
+            let e = rewrite_measurement_references(table_name, e)
+                .map(|e| log_rewrite(e, "rewrite_measurement_references"))
                 // Rewrite any references to `_value = some_value` to literal true values.
                 // Keeps track of these expressions, which can then be used to
                 // augment field projections with conditions using `CASE` statements.
                 .and_then(|e| rewrite_field_value_references(&mut field_value_exprs, e))
+                .map(|e| log_rewrite(e, "rewrite_field_value_references"))
                 // Rewrite any references to `_field` with a literal
                 // and keep track of referenced field names to add to
                 // the field column projection set.
                 .and_then(|e| field_projections.rewrite_field_exprs(e))
+                .map(|e| log_rewrite(e, "field_projections"))
+                // remove references to columns that don't exist in this schema
+                .and_then(|e| e.rewrite(&mut missing_columums))
+                .map(|e| log_rewrite(e, "missing_columums"))
                 // apply IOx specific rewrites (that unlock other simplifications)
                 .and_then(rewrite::rewrite)
-                // Call the core DataFusion simplification logic
-                .and_then(|e| {
-                    let adapter = SimplifyAdapter::new(schema.as_ref());
-                    // simplify twice to ensure "full" cleanup
-                    e.simplify(&adapter)?.simplify(&adapter)
-                })
+                .map(|e| log_rewrite(e, "rewrite"))
+                // apply type_coercing so datafuson simplification can deal with this
+                .and_then(|e| simplifier.coerce(e, Arc::clone(&df_schema)))
+                .map(|e| log_rewrite(e, "coerce_expr"))
+                // Call DataFusion simplification logic
+                .and_then(|e| simplifier.simplify(e))
+                .map(|e| log_rewrite(e, "simplify_expr"))
                 .and_then(rewrite::simplify_predicate)
+                .map(|e| log_rewrite(e, "simplify_predicate"));
+
+            debug!(?e, "rewritten expr");
+            e
         })
         // Filter out literal true so is_empty works correctly
         .filter(|f| match f {
@@ -225,6 +249,11 @@ fn normalize_predicate(
 
     // save any field projections
     field_projections.add_to_predicate(predicate)
+}
+
+fn log_rewrite(expr: Expr, description: &str) -> Expr {
+    trace!(?expr, %description, "After rewrite");
+    expr
 }
 
 struct SimplifyAdapter<'a> {
@@ -290,8 +319,27 @@ mod tests {
 
     use super::*;
     use arrow::datatypes::DataType;
-    use datafusion::logical_plan::{col, lit};
+    use datafusion::{
+        prelude::{col, lit},
+        scalar::ScalarValue,
+    };
+    use datafusion_util::lit_dict;
     use test_helpers::assert_contains;
+
+    #[test]
+    fn test_normalize_predicate_coerced() {
+        let schema = schema();
+        let predicate = normalize_predicate(
+            "table",
+            Arc::clone(&schema),
+            &Predicate::new().with_expr(col("t1").eq(lit("f1"))),
+        )
+        .unwrap();
+
+        let expected = Predicate::new().with_expr(col("t1").eq(lit_dict("f1")));
+
+        assert_eq!(predicate, expected);
+    }
 
     #[test]
     fn test_normalize_predicate_field_rewrite() {
@@ -337,6 +385,20 @@ mod tests {
     }
 
     #[test]
+    fn test_normalize_predicate_field_non_tag() {
+        // should treat
+        let predicate = normalize_predicate(
+            "table",
+            schema(),
+            &Predicate::new().with_expr(col("not_a_tag").eq(lit("blarg"))),
+        )
+        .unwrap();
+
+        let expected = Predicate::new().with_expr(lit(ScalarValue::Boolean(None)));
+        assert_eq!(predicate, expected);
+    }
+
+    #[test]
     fn test_normalize_predicate_field_rewrite_multi_field_unsupported() {
         let err = normalize_predicate(
             "table",
@@ -351,7 +413,7 @@ mod tests {
         )
         .unwrap_err();
 
-        let expected = r#"Error during planning: Unsupported _field predicate: #t1 = Utf8("my_awesome_tag_value") OR #_field = Utf8("f2")"#;
+        let expected = r#"Error during planning: Unsupported _field predicate: t1 = Utf8("my_awesome_tag_value") OR _field = Utf8("f2")"#;
 
         assert_contains!(err.to_string(), expected);
     }
@@ -392,10 +454,19 @@ mod tests {
             .tag("t1")
             .tag("t2")
             .field("f1", DataType::Int64)
+            .unwrap()
             .field("f2", DataType::Int64)
+            .unwrap()
             .build()
             .unwrap();
 
         Arc::new(schema)
     }
+
+    #[allow(dead_code)]
+    const fn assert_send<T: Send>() {}
+
+    // `InfluxRpcPredicate` shall be `Send`, otherwise we will have problems constructing plans for InfluxRPC
+    // concurrently.
+    const _: () = assert_send::<InfluxRpcPredicate>();
 }

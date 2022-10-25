@@ -1,485 +1,409 @@
 //! Logic for filtering a set of Parquet files to the desired set to be used for an optimal
 //! compaction operation.
 
-use crate::{
-    compact::PartitionCompactionCandidateWithInfo, parquet_file_lookup::ParquetFilesForCompaction,
-};
-use data_types::{ColumnType, ColumnTypeCount, ParquetFile};
+use crate::{compact::PartitionCompactionCandidateWithInfo, parquet_file::CompactorParquetFile};
+use data_types::CompactionLevel;
 use metric::{Attributes, Metric, U64Gauge, U64Histogram};
 use observability_deps::tracing::*;
+use std::{borrow::Cow, sync::Arc};
 
-const AVERAGE_TAG_VALUE_LENGTH: i64 = 200;
-const STRING_LENGTH: i64 = 1000;
-const DICTIONARY_BYTE: i64 = 8;
-const VALUE_BYTE: i64 = 8;
-const BOOL_BYTE: i64 = 1;
-const AVERAGE_ROW_COUNT_CARDINALITY_RATIO: i64 = 2;
-
-type Error = Box<dyn std::error::Error>;
-fn estimate_arrow_bytes_for_file(
-    columns: &[ColumnTypeCount],
-    row_count: i64,
-) -> Result<u64, Error> {
-    let average_cardinality = row_count / AVERAGE_ROW_COUNT_CARDINALITY_RATIO;
-
-    // Bytes needed for number columns
-    let mut value_bytes = 0;
-    let mut string_bytes = 0;
-    let mut bool_bytes = 0;
-    let mut dictionary_key_bytes = 0;
-    let mut dictionary_value_bytes = 0;
-    for c in columns {
-        match ColumnType::try_from(c.col_type)? {
-            ColumnType::I64 | ColumnType::U64 | ColumnType::F64 | ColumnType::Time => {
-                value_bytes += c.count * row_count * VALUE_BYTE;
-            }
-            ColumnType::String => {
-                string_bytes += row_count * STRING_LENGTH;
-            }
-            ColumnType::Bool => {
-                bool_bytes += row_count * BOOL_BYTE;
-            }
-            ColumnType::Tag => {
-                dictionary_key_bytes += average_cardinality * AVERAGE_TAG_VALUE_LENGTH;
-                dictionary_value_bytes = row_count * DICTIONARY_BYTE;
-            }
-        }
-    }
-
-    let estimated_arrow_bytes_for_file =
-        value_bytes + string_bytes + bool_bytes + dictionary_key_bytes + dictionary_value_bytes;
-
-    Ok(estimated_arrow_bytes_for_file as u64)
-}
-
-/// Files and the budget in bytes neeeded to compact them
+/// Groups of files, their partition, and the estimated budget for compacting this group
 #[derive(Debug)]
 pub(crate) struct FilteredFiles {
-    /// Files with computed budget and will be compacted
-    pub files: Vec<ParquetFile>,
-    /// Bugdet needed to compact the files
-    /// If this value is 0 and the files are empty, nothing to compact.
-    /// If the value is 0 and the files are not empty, there is error during estimating the budget.
-    /// If the value is not 0 but the files are empty, the budget is greater than the allowed one.
-    budget_bytes: u64,
+    /// Files and the budget in bytes neeeded to compact them
+    pub filter_result: FilterResult,
     /// Partition of the files
-    pub partition: PartitionCompactionCandidateWithInfo,
+    pub partition: Arc<PartitionCompactionCandidateWithInfo>,
 }
 
 #[derive(Debug, PartialEq)]
 pub(crate) enum FilterResult {
     NothingToCompact,
-    ErrorEstimatingBudget,
-    OverBudget,
-    Proceeed,
-}
-
-impl FilteredFiles {
-    pub fn new(
-        files: Vec<ParquetFile>,
+    OverLimitFileNum {
+        num_files: usize,
         budget_bytes: u64,
-        partition: PartitionCompactionCandidateWithInfo,
-    ) -> Self {
-        Self {
-            files,
-            budget_bytes,
-            partition,
-        }
-    }
-
-    pub fn filter_result(&self) -> FilterResult {
-        if self.files.is_empty() && self.budget_bytes == 0 {
-            FilterResult::NothingToCompact
-        } else if !self.files.is_empty() && self.budget_bytes == 0 {
-            FilterResult::ErrorEstimatingBudget
-        } else if self.files.is_empty() && self.budget_bytes != 0 {
-            FilterResult::OverBudget
-        } else {
-            FilterResult::Proceeed
-        }
-    }
-
-    pub fn budget_bytes(&self) -> u64 {
-        self.budget_bytes
-    }
+    },
+    OverBudget {
+        budget_bytes: u64,
+        num_files: usize,
+    },
+    Proceed {
+        files: Vec<CompactorParquetFile>,
+        budget_bytes: u64,
+    },
 }
 
-/// Given a list of hot level 0 files sorted by max sequence number and a list of level 1 files for
-/// a partition, select a subset set of files that:
+/// Given a list of sorted level N files and a list of level N + 1 files for a partition, select a
+/// subset set of files that:
 ///
-/// - Has a subset of the level 0 files selected, from the start of the sorted level 0 list
+/// - Has a subset of the level N files selected, from the start of the sorted level N list
 /// - Has a total size less than `max_bytes`
-/// - Has only level 1 files that overlap in time with the level 0 files
+/// - Has only level N + 1 files that overlap in time with the level N files
 ///
-/// The returned files will be ordered with the level 1 files first, then the level 0 files ordered
-/// in ascending order by their max sequence number.
-pub(crate) fn filter_hot_parquet_files(
+/// The returned files will be ordered with the level N + 1 files first, then the level N files
+/// in the same order as they were in the input.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn filter_parquet_files(
     // partition of the parquet files
-    partition: PartitionCompactionCandidateWithInfo,
-    // Level 0 files sorted by max sequence number and level 1 files in arbitrary order for one
-    // partition
-    parquet_files_for_compaction: ParquetFilesForCompaction,
-    // Stop considering level 0 files when the total size of all files selected for compaction so
-    // far exceeds this value
+    partition: Arc<PartitionCompactionCandidateWithInfo>,
+    // Level N files, sorted
+    level_n: Vec<CompactorParquetFile>,
+    // Level N + 1 files
+    level_n_plus_1: Vec<CompactorParquetFile>,
+    // Stop considering level N files when the total estimated arrow size of all files selected for
+    // compaction so far exceeds this value
     max_bytes: u64,
-    // column types and their counts of the table of this partition
-    column_types: &[ColumnTypeCount],
+    // stop considering level N files when the total files selected for compaction so far exceeds
+    // this value
+    max_num_files: usize,
+    // max desired output file size in bytes
+    max_desired_file_size_bytes: u64,
     // Gauge for the number of Parquet file candidates
     parquet_file_candidate_gauge: &Metric<U64Gauge>,
     // Histogram for the number of bytes of Parquet file candidates
     parquet_file_candidate_bytes: &Metric<U64Histogram>,
 ) -> FilteredFiles {
-    let ParquetFilesForCompaction {
-        level_0,
-        level_1: mut remaining_level_1,
-    } = parquet_files_for_compaction;
-
-    if level_0.is_empty() {
-        info!("No hot level 0 files to consider for compaction");
-        return FilteredFiles::new(vec![], 0, partition);
-    }
-
-    // Guaranteed to exist because of the empty check and early return above. Also assuming all
-    // files are for the same partition.
-    let partition_id = level_0[0].partition_id;
-
-    let num_level_0_considering = level_0.len();
-    let num_level_1_considering = remaining_level_1.len();
-
-    // This will start by holding the level 1 files that are found to overlap an included level 0
-    // file. At the end of this function, the level 0 files are added to the end so they are sorted
-    // last.
-    let mut files_to_return = Vec::with_capacity(level_0.len() + remaining_level_1.len());
-    // Estimated memory bytes needed to compact returned L1 files
-    let mut l1_estimated_budget = Vec::with_capacity(level_0.len() + remaining_level_1.len());
-    // Keep track of level 0 files to include in this compaction operation; maintain assumed
-    // ordering by max sequence number.
-    let mut level_0_to_return = Vec::with_capacity(level_0.len());
-    // Estimated memory bytes needed to compact returned L0 files
-    let mut l0_estimated_budget = Vec::with_capacity(level_0.len());
-
-    // Memory needed to compact the returned files
-    let mut total_estimated_budget = 0;
-    for level_0_file in level_0 {
-        // Estimate memory needed for this L0 file
-        let estimated_file_bytes =
-            estimate_arrow_bytes_for_file(column_types, level_0_file.row_count);
-        if let Err(e) = estimated_file_bytes {
-            // Error while estimating the memory needed, return the file and 0
-            warn!(
-                ?e,
-                ?partition_id,
-                "hot compaction failed estimating memory bytes"
-            );
-            return FilteredFiles::new(vec![level_0_file], 0, partition);
-        }
-        let l0_estimated_file_bytes = estimated_file_bytes.unwrap();
-
-        // Note: even though we can stop here if the l0_estimated_file_bytes is larger than the given budget,
-        // we still continue estimated the memory needed for its overlapped L1 to return the total memory needed
-        // to compact this L0 with all of its overlapped L1s
-
-        // Find all level 1 files that overlap with this level 0 file.
-        let (overlaps, non_overlaps): (Vec<_>, Vec<_>) = remaining_level_1
-            .into_iter()
-            .partition(|level_1_file| overlaps_in_time(level_1_file, &level_0_file));
-
-        // Estimate memory needed for each of L1
-        let mut current_l1_estimated_file_bytes = Vec::with_capacity(overlaps.len());
-        for file in &overlaps {
-            let estimated_bytes = estimate_arrow_bytes_for_file(column_types, file.row_count);
-            if let Err(e) = estimated_bytes {
-                // Error while estimating the memory needed, return the file and 0
-                warn!(
-                    ?e,
-                    ?partition_id,
-                    "hot compaction failed estimating memory bytes"
-                );
-                return FilteredFiles::new(vec![file.clone()], 0, partition);
-            }
-            current_l1_estimated_file_bytes.push(estimated_bytes.unwrap());
-        }
-        let estimated_file_bytes =
-            l0_estimated_file_bytes + current_l1_estimated_file_bytes.iter().sum::<u64>();
-
-        // Over budget
-        if total_estimated_budget + estimated_file_bytes > max_bytes {
-            if total_estimated_budget == 0 {
-                // Cannot compact this partition further with the given budget
-                return FilteredFiles::new(vec![], estimated_file_bytes, partition);
-            } else {
-                // Only compact the ones under the given budget
-                break;
-            }
-        } else {
-            // still under budget
-            total_estimated_budget += estimated_file_bytes;
-            l0_estimated_budget.push(l0_estimated_file_bytes);
-            l1_estimated_budget.extend(current_l1_estimated_file_bytes);
-
-            // Move the overlapping level 1 files to `files_to_return` so they're not considered again;
-            // a level 1 file overlapping with one level 0 file is enough for its inclusion. This way,
-            // we also don't include level 1 files multiple times.
-            files_to_return.extend(overlaps);
-
-            // The remaining level 1 files to possibly include in future iterations are the remaining
-            // ones that did not overlap with this level 0 file.
-            remaining_level_1 = non_overlaps;
-
-            // Move the level 0 file into the list of level 0 files to return
-            level_0_to_return.push(level_0_file);
-        }
-    }
-
-    let num_level_0_compacting = level_0_to_return.len();
-    let num_level_1_compacting = files_to_return.len();
-
-    info!(
-        partition_id = partition_id.get(),
-        num_level_0_considering,
-        num_level_1_considering,
-        num_level_0_compacting,
-        num_level_1_compacting,
-        "filtered hot Parquet files for compaction",
-    );
-
-    record_file_metrics(
+    let filter_result = filter_parquet_files_inner(
+        level_n,
+        level_n_plus_1,
+        max_bytes,
+        max_num_files,
+        max_desired_file_size_bytes,
         parquet_file_candidate_gauge,
-        num_level_0_considering as u64,
-        num_level_1_considering as u64,
-        num_level_0_compacting as u64,
-        num_level_1_compacting as u64,
-    );
-
-    record_byte_metrics(
         parquet_file_candidate_bytes,
-        level_0_to_return
-            .iter()
-            .map(|pf| pf.file_size_bytes as u64)
-            .collect(),
-        files_to_return
-            .iter()
-            .map(|pf| pf.file_size_bytes as u64)
-            .collect(),
-        l0_estimated_budget,
-        l1_estimated_budget,
     );
 
-    // Return the level 1 files first, followed by the level 0 files assuming we've maintained
-    // their ordering by max sequence number.
-    files_to_return.extend(level_0_to_return);
-    FilteredFiles::new(files_to_return, total_estimated_budget, partition)
+    FilteredFiles {
+        filter_result,
+        partition,
+    }
 }
 
-/// Given a list of cold level 0 files sorted by max sequence number and a list of level 1 files for
-/// a partition, select a subset set of files that:
-///
-/// - Has all of the level 0 files selected
-/// - Has only level 1 files that overlap in time with the level 0 files
-///
-/// The returned files will be ordered with the level 1 files first, then the level 0 files ordered
-/// in ascending order by their max sequence number.
-///
-/// If only one level 0 file is returned, it can be upgraded to level 1 without running compaction.
-pub(crate) fn filter_cold_parquet_files(
-    // Level 0 files sorted by max sequence number and level 1 files in arbitrary order for one
-    // partition
-    parquet_files_for_compaction: ParquetFilesForCompaction,
-    // Stop considering level 0 files when the total size of all files selected for compaction so
-    // far exceeds this value
+fn filter_parquet_files_inner(
+    // Level N files, sorted
+    level_n: Vec<CompactorParquetFile>,
+    // Level N + 1 files
+    mut remaining_level_n_plus_1: Vec<CompactorParquetFile>,
+    // Stop considering level N files when the total estimated arrow size of all files selected for
+    // compaction so far exceeds this value
     max_bytes: u64,
-    // Stop considering level 0 files when the count of L0 + L1 files selected for compaction so
-    // far exceeds this value
-    input_file_count_threshold: usize,
+    // stop considering level N files when the total files selected for compaction so far exceeds
+    // this value
+    max_num_files: usize,
+    // max desired output file size in bytes
+    max_desired_file_size_bytes: u64,
     // Gauge for the number of Parquet file candidates
     parquet_file_candidate_gauge: &Metric<U64Gauge>,
     // Histogram for the number of bytes of Parquet file candidates
     parquet_file_candidate_bytes: &Metric<U64Histogram>,
-) -> Vec<ParquetFile> {
-    let ParquetFilesForCompaction {
-        level_0,
-        level_1: mut remaining_level_1,
-    } = parquet_files_for_compaction;
-
-    if level_0.is_empty() {
-        info!("No cold level 0 files to consider for compaction");
-        return Vec::new();
+) -> FilterResult {
+    if level_n.is_empty() {
+        info!("No level N files to consider for compaction");
+        return FilterResult::NothingToCompact;
     }
 
     // Guaranteed to exist because of the empty check and early return above. Also assuming all
     // files are for the same partition.
-    let partition_id = level_0[0].partition_id;
+    let partition_id = level_n[0].partition_id();
 
-    let num_level_0_considering = level_0.len();
-    let num_level_1_considering = remaining_level_1.len();
+    let compaction_level_n = level_n[0].compaction_level();
+    let compaction_level_n_plus_1 = compaction_level_n.next();
 
-    // This will start by holding the level 1 files that are found to overlap an included level 0
-    // file. At the end of this function, the level 0 files are added to the end so they are sorted
-    // last.
-    let mut files_to_return = Vec::with_capacity(level_0.len() + remaining_level_1.len());
-    // Keep track of level 0 files to include in this compaction operation; maintain assumed
+    let num_level_n_considering = level_n.len();
+    let num_level_n_plus_1_considering = remaining_level_n_plus_1.len();
+
+    // This will start by holding the level N + 1 files that are found to overlap an included level
+    // N file. At the end of this function, the level N files are added to the end.
+    let mut files_to_return = Vec::with_capacity(level_n.len() + remaining_level_n_plus_1.len());
+    // Estimated memory bytes needed to compact returned LN+1 files
+    let mut ln_plus_1_estimated_budget =
+        Vec::with_capacity(level_n.len() + remaining_level_n_plus_1.len());
+    // Keep track of level N files to include in this compaction operation; maintain assumed
     // ordering by max sequence number.
-    let mut level_0_to_return = Vec::with_capacity(level_0.len());
-    // Running total of the size, in bytes, of level 0 files and level 1 files for inclusion.
-    // The levels are counted up separately for metrics.
-    let mut total_level_0_bytes = 0;
-    let mut total_level_1_bytes = 0;
+    let mut level_n_to_return = Vec::with_capacity(level_n.len());
+    // Estimated memory bytes needed to compact returned LN files
+    let mut ln_estimated_budget = Vec::with_capacity(level_n.len());
 
-    for level_0_file in level_0 {
-        // Check we haven't exceeded `input_file_count_threshold`, if we have, stop considering
-        // level 0 files
-        if (level_0_to_return.len() + files_to_return.len()) >= input_file_count_threshold {
-            break;
-        }
+    // Memory needed to compact the returned files
+    // Estimated memory include:
+    //  a. bytes needed to store the file in memory
+    //  b. bytes to stream the file
+    //  c. bytes needed for output streams
+    // If we have n input files and m output streams, the estimated memory is:
+    //    n * (a + b ) + m * c
+    //  . a will be different for different file and depends on their file size
+    //  . b will be different for different file and depends on the number of columns,
+    //    their data types, and cardinality which is estimated using their row counts.
+    //    Since files in a partition of a table would have similar schema, unless they
+    //    have very different row count, their b would be similar.
+    //  . c is computed similar to b, but since it is the estimate of an output stream
+    //    that we do not know ahead, we will use value of b for the first input file for c.
+    let mut total_estimated_budget = 0;
+    for level_n_file in level_n {
+        // Estimate memory needed for this LN file
+        let ln_estimated_file_bytes =
+            level_n_file.estimated_file_total_bytes_for_in_memory_storing_and_scanning();
 
-        // Include at least one level 0 file without checking against `max_bytes`
-        total_level_0_bytes += level_0_file.file_size_bytes as u64;
+        // Note: even though we can stop here if the ln_estimated_file_bytes is larger than the
+        // given budget,we still continue estimated the memory needed for its overlapped LN+1 to
+        // return the total memory needed to compact this LN with all of its overlapped LN+1s
 
-        // Find all level 1 files that overlap with this level 0 file.
-        let (overlaps, non_overlaps): (Vec<_>, Vec<_>) = remaining_level_1
+        // Find all level N+1 files that overlap with this level N file.
+        let (overlaps, non_overlaps): (Vec<_>, Vec<_>) = remaining_level_n_plus_1
             .into_iter()
-            .partition(|level_1_file| overlaps_in_time(level_1_file, &level_0_file));
+            .partition(|level_n_plus_1_file| overlaps_in_time(level_n_plus_1_file, &level_n_file));
 
-        // Increase the running total by the size of all the overlapping level 1 files
-        total_level_1_bytes += overlaps.iter().map(|f| f.file_size_bytes).sum::<i64>() as u64;
+        // Estimate memory needed for each LN+1
+        let current_ln_plus_1_estimated_file_bytes: Vec<_> = overlaps
+            .iter()
+            .map(|file| file.estimated_file_total_bytes_for_in_memory_storing_and_scanning())
+            .collect();
+        let estimated_processing_file_bytes =
+            ln_estimated_file_bytes + current_ln_plus_1_estimated_file_bytes.iter().sum::<u64>();
 
-        // Move the overlapping level 1 files to `files_to_return` so they're not considered again;
-        // a level 1 file overlapping with one level 0 file is enough for its inclusion. This way,
-        // we also don't include level 1 files multiple times.
-        files_to_return.extend(overlaps);
+        // Estimate memory needed for the output streams if the files are large enough to split
+        // Get total size of ln files (level_n_file and level_n_to_return) and ln+1 files (overlaps
+        // and files_to_return)
+        let total_file_size_bytes = level_n_file.file_size_bytes()
+            + overlaps.iter().map(|f| f.file_size_bytes()).sum::<i64>()
+            + level_n_to_return
+                .iter()
+                .map(|f: &CompactorParquetFile| f.file_size_bytes())
+                .sum::<i64>()
+            + files_to_return
+                .iter()
+                .map(|f: &CompactorParquetFile| f.file_size_bytes())
+                .sum::<i64>();
+        let estimated_memory_for_output_streams = estimate_memory_for_output_streams(
+            total_file_size_bytes as u64,
+            max_desired_file_size_bytes,
+            &level_n_file,
+        );
 
-        // The remaining level 1 files to possibly include in future iterations are the remaining
-        // ones that did not overlap with this level 0 file.
-        remaining_level_1 = non_overlaps;
+        // memory needed if we only compact the current ln and its overlapped ln_plus files
+        let budget_for_current_ln_and_ln_plus =
+            estimated_processing_file_bytes + estimated_memory_for_output_streams;
 
-        // Move the level 0 file into the list of level 0 files to return
-        level_0_to_return.push(level_0_file);
-
-        // Stop considering level 0 files if the total size of all files is over or equal to
-        // `max_bytes`
-        if (total_level_0_bytes + total_level_1_bytes) >= max_bytes {
+        // Over limit of num files
+        // At this stage files_to_return only includes LN+1 files. To get both returning LN+1 and
+        // LN files, we need to consider both files_to_return and level_n_to_return
+        if files_to_return.len() + level_n_to_return.len() + 1 /* LN file */ + overlaps.len()
+            > max_num_files
+        {
+            if files_to_return.is_empty() && level_n_to_return.is_empty() {
+                // Cannot compact this partition because its first set of overlapped files
+                // exceed the file limit
+                return FilterResult::OverLimitFileNum {
+                    num_files: 1 + overlaps.len(),
+                    budget_bytes: budget_for_current_ln_and_ln_plus,
+                };
+            } else {
+                // Only compact files that are under limit number of files
+                break;
+            }
+        } else if total_estimated_budget + budget_for_current_ln_and_ln_plus > max_bytes {
+            // Over budget
+            if total_estimated_budget == 0 {
+                // Cannot compact this partition further with the given budget
+                return FilterResult::OverBudget {
+                    budget_bytes: budget_for_current_ln_and_ln_plus,
+                    num_files: 1 + overlaps.len(),
+                };
+            } else {
+                // Only compact the ones under the given budget
+                break;
+            }
+        } else if compaction_level_n == CompactionLevel::FileNonOverlapped
+            && total_file_size_bytes as u64 > max_desired_file_size_bytes
+            // Don't limit to 0 files if the first L1 file is already over the limit, let it
+            // be added to the group anyway
+            && !level_n_to_return.is_empty()
+        {
+            // Only compact the level 1 files under the desired file size
             break;
+        } else {
+            // Still under budget and under limit of number of files.
+            // We do not add memory budget for output stream yet becasue it will change when we add
+            // more files
+            total_estimated_budget += estimated_processing_file_bytes;
+            ln_estimated_budget.push(ln_estimated_file_bytes);
+            ln_plus_1_estimated_budget.extend(current_ln_plus_1_estimated_file_bytes);
+
+            // Move the overlapping level N+1 files to `files_to_return` so they're not considered
+            // again; a level N+1 file overlapping with one level N file is enough for its
+            // inclusion. This way, we also don't include level N+1 files multiple times.
+            files_to_return.extend(overlaps);
+
+            // The remaining level N+1 files to possibly include in future iterations are the
+            // remaining ones that did not overlap with this level N file.
+            remaining_level_n_plus_1 = non_overlaps;
+
+            // Move the level N file into the list of level N files to return
+            level_n_to_return.push(level_n_file);
         }
     }
 
-    let num_level_0_compacting = level_0_to_return.len();
-    let num_level_1_compacting = files_to_return.len();
+    let num_level_n_compacting = level_n_to_return.len();
+    let num_level_n_plus_1_compacting = files_to_return.len();
 
     info!(
         partition_id = partition_id.get(),
-        num_level_0_considering,
-        num_level_1_considering,
-        num_level_0_compacting,
-        num_level_1_compacting,
-        "filtered cold Parquet files for compaction",
+        num_level_n_considering,
+        num_level_n_plus_1_considering,
+        num_level_n_compacting,
+        num_level_n_plus_1_compacting,
+        "filtered Parquet files for compaction",
     );
 
     record_file_metrics(
         parquet_file_candidate_gauge,
-        num_level_0_considering as u64,
-        num_level_1_considering as u64,
-        num_level_0_compacting as u64,
-        num_level_1_compacting as u64,
+        compaction_level_n,
+        compaction_level_n_plus_1,
+        num_level_n_considering as u64,
+        num_level_n_plus_1_considering as u64,
+        num_level_n_compacting as u64,
+        num_level_n_plus_1_compacting as u64,
     );
+
     record_byte_metrics(
         parquet_file_candidate_bytes,
-        level_0_to_return
+        compaction_level_n,
+        compaction_level_n_plus_1,
+        level_n_to_return
             .iter()
-            .map(|pf| pf.file_size_bytes as u64)
+            .map(|pf| pf.file_size_bytes() as u64)
             .collect(),
         files_to_return
             .iter()
-            .map(|pf| pf.file_size_bytes as u64)
+            .map(|pf| pf.file_size_bytes() as u64)
             .collect(),
-        // todo: replace these 2 params with the actual estimated budgets when
-        // changing compact cold partition
-        level_0_to_return
-            .iter()
-            .map(|pf| pf.file_size_bytes as u64)
-            .collect(),
-        files_to_return
-            .iter()
-            .map(|pf| pf.file_size_bytes as u64)
-            .collect(),
+        ln_estimated_budget,
+        ln_plus_1_estimated_budget,
     );
 
-    // Return the level 1 files first, followed by the level 0 files assuming we've maintained
-    // their ordering by max sequence number.
-    files_to_return.extend(level_0_to_return);
-    files_to_return
+    // Return the level N+1 files first, followed by the level N files. The order is arbitrary;
+    // ordering for deduplication happens using `QueryChunk.order`.
+    files_to_return.extend(level_n_to_return);
+
+    // Add estimated memory for output streams
+    if !files_to_return.is_empty() {
+        let output_size = (files_to_return
+            .iter()
+            .map(|f| f.file_size_bytes())
+            .sum::<i64>()) as u64;
+        total_estimated_budget += estimate_memory_for_output_streams(
+            output_size,
+            max_desired_file_size_bytes,
+            &files_to_return[0],
+        );
+    }
+
+    FilterResult::Proceed {
+        files: files_to_return,
+        budget_bytes: total_estimated_budget,
+    }
 }
 
-fn overlaps_in_time(a: &ParquetFile, b: &ParquetFile) -> bool {
-    (a.min_time <= b.min_time && a.max_time >= b.min_time)
-        || (a.min_time > b.min_time && a.min_time <= b.max_time)
+fn estimate_memory_for_output_streams(
+    total_size: u64,
+    max_output_size: u64,
+    file: &CompactorParquetFile,
+) -> u64 {
+    let estimated_num_streams = (total_size as f64 / max_output_size as f64).ceil() as u64;
+    let etimated_memory_for_one_output_stream =
+        file.estimated_arrow_bytes_for_streaming_query_plan();
+
+    estimated_num_streams * etimated_memory_for_one_output_stream
+}
+
+fn overlaps_in_time(a: &CompactorParquetFile, b: &CompactorParquetFile) -> bool {
+    (a.min_time() <= b.min_time() && a.max_time() >= b.min_time())
+        || (a.min_time() > b.min_time() && a.min_time() <= b.max_time())
 }
 
 fn record_file_metrics(
     gauge: &Metric<U64Gauge>,
-    num_level_0_considering: u64,
-    num_level_1_considering: u64,
-    num_level_0_compacting: u64,
-    num_level_1_compacting: u64,
+    compaction_level_n: CompactionLevel,
+    compaction_level_n_plus_1: CompactionLevel,
+    num_level_n_considering: u64,
+    num_level_n_plus_1_considering: u64,
+    num_level_n_compacting: u64,
+    num_level_n_plus_1_compacting: u64,
 ) {
-    let attributes = Attributes::from(&[
-        ("compaction_level", "0"),
-        ("status", "selected_for_compaction"),
-    ]);
-    let recorder = gauge.recorder(attributes);
-    recorder.set(num_level_0_compacting);
+    let compaction_level_n_string = Cow::from(format!("{}", compaction_level_n as i16));
+    let mut level_n_attributes =
+        Attributes::from([("compaction_level", compaction_level_n_string)]);
 
-    let attributes = Attributes::from(&[
-        ("compaction_level", "0"),
-        ("status", "not_selected_for_compaction"),
-    ]);
-    let recorder = gauge.recorder(attributes);
-    recorder.set(num_level_0_considering - num_level_0_compacting);
+    level_n_attributes.insert("status", "selected_for_compaction");
+    let recorder = gauge.recorder(level_n_attributes.clone());
+    recorder.set(num_level_n_compacting);
 
-    let attributes = Attributes::from(&[
-        ("compaction_level", "1"),
-        ("status", "selected_for_compaction"),
-    ]);
-    let recorder = gauge.recorder(attributes);
-    recorder.set(num_level_1_compacting);
+    level_n_attributes.insert("status", "not_selected_for_compaction");
+    let recorder = gauge.recorder(level_n_attributes);
+    recorder.set(num_level_n_considering - num_level_n_compacting);
 
-    let attributes = Attributes::from(&[
-        ("compaction_level", "1"),
-        ("status", "not_selected_for_compaction"),
-    ]);
-    let recorder = gauge.recorder(attributes);
-    recorder.set(num_level_1_considering - num_level_1_compacting);
+    let compaction_level_n_plus_1_string =
+        Cow::from(format!("{}", compaction_level_n_plus_1 as i16));
+    let mut level_n_plus_1_attributes =
+        Attributes::from([("compaction_level", compaction_level_n_plus_1_string)]);
+
+    level_n_plus_1_attributes.insert("status", "selected_for_compaction");
+    let recorder = gauge.recorder(level_n_plus_1_attributes.clone());
+    recorder.set(num_level_n_plus_1_compacting);
+
+    level_n_plus_1_attributes.insert("status", "not_selected_for_compaction");
+    let recorder = gauge.recorder(level_n_plus_1_attributes);
+    recorder.set(num_level_n_plus_1_considering - num_level_n_plus_1_compacting);
 }
 
 fn record_byte_metrics(
     histogram: &Metric<U64Histogram>,
-    level_0_sizes: Vec<u64>,
-    level_1_sizes: Vec<u64>,
-    level_0_estimated_compacting_budgets: Vec<u64>,
-    level_1_estimated_compacting_budgets: Vec<u64>,
+    compaction_level_n: CompactionLevel,
+    compaction_level_n_plus_1: CompactionLevel,
+    level_n_sizes: Vec<u64>,
+    level_n_plus_1_sizes: Vec<u64>,
+    level_n_estimated_compacting_budgets: Vec<u64>,
+    level_n_plus_1_estimated_compacting_budgets: Vec<u64>,
 ) {
-    let attributes = Attributes::from(&[("file_size_compaction_level", "0")]);
-    let recorder = histogram.recorder(attributes);
-    for size in level_0_sizes {
+    let compaction_level_n_string = Cow::from(format!("{}", compaction_level_n as i16));
+    let level_n_attributes = Attributes::from([(
+        "file_size_compaction_level",
+        compaction_level_n_string.clone(),
+    )]);
+
+    let compaction_level_n_plus_1_string =
+        Cow::from(format!("{}", compaction_level_n_plus_1 as i16));
+    let level_n_plus_1_attributes = Attributes::from([(
+        "file_size_compaction_level",
+        compaction_level_n_plus_1_string.clone(),
+    )]);
+
+    let recorder = histogram.recorder(level_n_attributes);
+    for size in level_n_sizes {
         recorder.record(size);
     }
 
-    let attributes = Attributes::from(&[("file_size_compaction_level", "1")]);
-    let recorder = histogram.recorder(attributes);
-    for size in level_1_sizes {
+    let recorder = histogram.recorder(level_n_plus_1_attributes);
+    for size in level_n_plus_1_sizes {
         recorder.record(size);
     }
 
-    let attributes =
-        Attributes::from(&[("file_estimated_compacting_budget_compaction_level", "0")]);
-    let recorder = histogram.recorder(attributes);
-    for size in level_0_estimated_compacting_budgets {
+    let level_n_attributes = Attributes::from([(
+        "file_estimated_compacting_budget_compaction_level",
+        compaction_level_n_string,
+    )]);
+    let recorder = histogram.recorder(level_n_attributes);
+    for size in level_n_estimated_compacting_budgets {
         recorder.record(size);
     }
 
-    let attributes =
-        Attributes::from(&[("file_estimated_compacting_budget_compaction_level", "1")]);
-    let recorder = histogram.recorder(attributes);
-    for size in level_1_estimated_compacting_budgets {
+    let level_n_plus_1_attributes = Attributes::from([(
+        "file_estimated_compacting_budget_compaction_level",
+        compaction_level_n_plus_1_string,
+    )]);
+
+    let recorder = histogram.recorder(level_n_plus_1_attributes);
+    for size in level_n_plus_1_estimated_compacting_budgets {
         recorder.record(size);
     }
 }
@@ -488,12 +412,11 @@ fn record_byte_metrics(
 mod tests {
     use super::*;
     use data_types::{
-        ColumnSet, CompactionLevel, Namespace, NamespaceId, ParquetFileId, PartitionId,
-        PartitionParam, QueryPoolId, SequenceNumber, ShardId, Table, TableId, TableSchema,
-        Timestamp, TopicId,
+        ColumnSet, CompactionLevel, NamespaceId, ParquetFile, ParquetFileId, PartitionId,
+        SequenceNumber, ShardId, TableId, Timestamp,
     };
-    use metric::{ObservationBucket, U64HistogramOptions};
-    use std::{collections::BTreeMap, sync::Arc};
+    use metric::U64HistogramOptions;
+    use std::sync::Arc;
     use uuid::Uuid;
 
     const BUCKET_500_KB: u64 = 500 * 1024;
@@ -577,773 +500,982 @@ mod tests {
         (parquet_file_candidate_gauge, parquet_file_candidate_bytes)
     }
 
+    const MEMORY_BUDGET: u64 = 1024 * 1024 * 10;
+    const FILE_NUM_LIMIT: usize = 20;
+    const DEFAULT_MAX_OUTPUT_SIZE: u64 = 1024 * 1024 * 1024;
+    const ESTIMATED_STREAM_BYTES: u64 = 1176;
+    const FILE_SIZE_BYTES: i64 = 10;
+
     #[test]
-    fn test_estimate_arrow_bytes_for_file() {
-        let row_count = 11;
+    fn empty_in_empty_out() {
+        let level_0 = vec![];
+        let level_1 = vec![];
+        let (files_metric, bytes_metric) = metrics();
 
-        // Time, U64, I64, F64
-        let columns = vec![
-            ColumnTypeCount::new(ColumnType::Time, 1),
-            ColumnTypeCount::new(ColumnType::U64, 2),
-            ColumnTypeCount::new(ColumnType::F64, 3),
-            ColumnTypeCount::new(ColumnType::I64, 4),
-        ];
-        let bytes = estimate_arrow_bytes_for_file(&columns, row_count).unwrap();
-        assert_eq!(bytes, 880); // 11 * (1+2+3+4) * 8
+        let filter_result = filter_parquet_files_inner(
+            level_0,
+            level_1,
+            MEMORY_BUDGET,
+            FILE_NUM_LIMIT,
+            DEFAULT_MAX_OUTPUT_SIZE,
+            &files_metric,
+            &bytes_metric,
+        );
 
-        // Tag
-        let columns = vec![ColumnTypeCount::new(ColumnType::Tag, 1)];
-        let bytes = estimate_arrow_bytes_for_file(&columns, row_count).unwrap();
-        assert_eq!(bytes, 1088); // 5 * 200 + 11 * 8
-
-        // String
-        let columns = vec![ColumnTypeCount::new(ColumnType::String, 1)];
-        let bytes = estimate_arrow_bytes_for_file(&columns, row_count).unwrap();
-        assert_eq!(bytes, 11000); // 11 * 1000
-
-        // Bool
-        let columns = vec![ColumnTypeCount::new(ColumnType::Bool, 1)];
-        let bytes = estimate_arrow_bytes_for_file(&columns, row_count).unwrap();
-        assert_eq!(bytes, 11); // 11 * 1
-
-        // all types
-        let columns = vec![
-            ColumnTypeCount::new(ColumnType::Time, 1),
-            ColumnTypeCount::new(ColumnType::U64, 2),
-            ColumnTypeCount::new(ColumnType::F64, 3),
-            ColumnTypeCount::new(ColumnType::I64, 4),
-            ColumnTypeCount::new(ColumnType::Tag, 1),
-            ColumnTypeCount::new(ColumnType::String, 1),
-            ColumnTypeCount::new(ColumnType::Bool, 1),
-        ];
-        let bytes = estimate_arrow_bytes_for_file(&columns, row_count).unwrap();
-        assert_eq!(bytes, 12979); // 880 + 1088 + 11000 + 11
+        assert_eq!(filter_result, FilterResult::NothingToCompact);
     }
 
-    mod hot {
-        use super::*;
+    #[test]
+    fn budget_0_returns_over_budget() {
+        let level_0 = vec![ParquetFileBuilder::level_0().id(1).build()];
+        let level_1 = vec![];
+        let (files_metric, bytes_metric) = metrics();
 
-        const MEMORY_BUDGET: u64 = 1024 * 1024 * 10;
+        let bytes_stored_the_file_in_memory = (2 * level_0[0].file_size_bytes()) as u64;
+        let expected_estimated_budget =
+            bytes_stored_the_file_in_memory + 2 * ESTIMATED_STREAM_BYTES; // one input stream, one output stream
 
-        #[test]
-        fn empty_in_empty_out() {
-            let parquet_files_for_compaction = ParquetFilesForCompaction {
-                level_0: vec![],
-                level_1: vec![],
-            };
-            let (files_metric, bytes_metric) = metrics();
+        let filter_result = filter_parquet_files_inner(
+            level_0,
+            level_1,
+            0,
+            FILE_NUM_LIMIT,
+            DEFAULT_MAX_OUTPUT_SIZE,
+            &files_metric,
+            &bytes_metric,
+        );
 
-            // values of these inputs do not mean much in this test case
-            let partition = ParquetFileBuilder::level_0()
-                .id(1)
-                .build_partition_with_extra_info();
-            let table_columns = vec![];
-
-            let to_compact = filter_hot_parquet_files(
-                partition,
-                parquet_files_for_compaction,
-                MEMORY_BUDGET,
-                &table_columns,
-                &files_metric,
-                &bytes_metric,
-            );
-
-            let result = to_compact.filter_result();
-            assert_eq!(result, FilterResult::NothingToCompact);
-        }
-
-        #[test]
-        fn budget_0_returns_over_budget() {
-            let parquet_files_for_compaction = ParquetFilesForCompaction {
-                level_0: vec![ParquetFileBuilder::level_0().id(1).build()],
-                level_1: vec![],
-            };
-            let (files_metric, bytes_metric) = metrics();
-
-            let partition = ParquetFileBuilder::level_0()
-                .id(1)
-                .build_partition_with_extra_info();
-            let table_columns = one_tag_one_time_cols();
-
-            let to_compact = filter_hot_parquet_files(
-                partition,
-                parquet_files_for_compaction,
-                0,
-                &table_columns,
-                &files_metric,
-                &bytes_metric,
-            );
-
-            let result = to_compact.filter_result();
-            assert_eq!(result, FilterResult::OverBudget);
-        }
-
-        #[test]
-        fn budget_1000_returns_over_budget() {
-            let parquet_files_for_compaction = ParquetFilesForCompaction {
-                level_0: vec![ParquetFileBuilder::level_0().id(1).build()],
-                level_1: vec![],
-            };
-            let (files_metric, bytes_metric) = metrics();
-
-            let partition = ParquetFileBuilder::level_0()
-                .id(1)
-                .build_partition_with_extra_info();
-            // 2 columns including a tag and 11 rows will have budget over 1000 bytes
-            let table_columns = one_tag_one_time_cols();
-
-            // One tag and one time, the budget will be as below for a file of 11 rows
-            // time_bytes = 1 * 11 * 8 = 88
-            // tag:
-            //   dictionary_key_bytes = 1 * floor(11/2) * 200 = 1000
-            //   dictionary_value_bytes = 1 * 11 * 8 = 88
-            // total memory for 1 file = 88 + 1100 + 88 = 1176
-
-            let to_compact = filter_hot_parquet_files(
-                partition,
-                parquet_files_for_compaction,
-                1000,
-                &table_columns,
-                &files_metric,
-                &bytes_metric,
-            );
-
-            let result = to_compact.filter_result();
-            assert_eq!(result, FilterResult::OverBudget);
-        }
-
-        #[test]
-        fn large_budget_returns_one_level_0_file_and_its_level_1_overlaps() {
-            let parquet_files_for_compaction = ParquetFilesForCompaction {
-                level_0: vec![ParquetFileBuilder::level_0()
-                    .id(1)
-                    .min_time(200)
-                    .max_time(300)
-                    .build()],
-                level_1: vec![
-                    // Too early
-                    ParquetFileBuilder::level_1()
-                        .id(101)
-                        .min_time(1)
-                        .max_time(50)
-                        .build(),
-                    // Completely contains the level 0 times
-                    ParquetFileBuilder::level_1()
-                        .id(102)
-                        .min_time(150)
-                        .max_time(350)
-                        .build(),
-                    // Too late
-                    ParquetFileBuilder::level_1()
-                        .id(103)
-                        .min_time(400)
-                        .max_time(500)
-                        .build(),
-                ],
-            };
-            let (files_metric, bytes_metric) = metrics();
-
-            let partition = ParquetFileBuilder::level_0()
-                .id(1)
-                .build_partition_with_extra_info();
-            let table_columns = one_tag_one_time_cols();
-
-            let to_compact = filter_hot_parquet_files(
-                partition,
-                parquet_files_for_compaction,
-                MEMORY_BUDGET,
-                &table_columns,
-                &files_metric,
-                &bytes_metric,
-            );
-
-            let result = to_compact.filter_result();
-            assert_eq!(result, FilterResult::Proceeed);
-            // memory budget for 2 files each has a tag and a u64
-            assert_eq!(to_compact.budget_bytes(), 2 * 1176);
-
-            let files = to_compact.files;
-            assert_eq!(files.len(), 2);
-            assert_eq!(files[0].id.get(), 102);
-            assert_eq!(files[1].id.get(), 1);
-        }
-
-        #[test]
-        fn returns_only_overlapping_level_1_files_in_order() {
-            let parquet_files_for_compaction = ParquetFilesForCompaction {
-                level_0: vec![
-                    // Level 0 files that overlap in time slightly.
-                    ParquetFileBuilder::level_0()
-                        .id(1)
-                        .min_time(200)
-                        .max_time(300)
-                        .file_size_bytes(10)
-                        .build(),
-                    ParquetFileBuilder::level_0()
-                        .id(2)
-                        .min_time(280)
-                        .max_time(310)
-                        .file_size_bytes(10)
-                        .build(),
-                    ParquetFileBuilder::level_0()
-                        .id(3)
-                        .min_time(309)
-                        .max_time(350)
-                        .file_size_bytes(10)
-                        .build(),
-                ],
-                // Level 1 files can be assumed not to overlap each other.
-                level_1: vec![
-                    // Does not overlap any level 0, times are too early
-                    ParquetFileBuilder::level_1()
-                        .id(101)
-                        .min_time(1)
-                        .max_time(50)
-                        .file_size_bytes(10)
-                        .build(),
-                    // Overlaps file 1
-                    ParquetFileBuilder::level_1()
-                        .id(102)
-                        .min_time(199)
-                        .max_time(201)
-                        .file_size_bytes(10)
-                        .build(),
-                    // Overlaps files 1 and 2
-                    ParquetFileBuilder::level_1()
-                        .id(103)
-                        .min_time(290)
-                        .max_time(300)
-                        .file_size_bytes(10)
-                        .build(),
-                    // Overlaps file 2
-                    ParquetFileBuilder::level_1()
-                        .id(104)
-                        .min_time(305)
-                        .max_time(305)
-                        .file_size_bytes(10)
-                        .build(),
-                    // Overlaps files 2 and 3
-                    ParquetFileBuilder::level_1()
-                        .id(105)
-                        .min_time(308)
-                        .max_time(311)
-                        .file_size_bytes(10)
-                        .build(),
-                    // Overlaps file 3
-                    ParquetFileBuilder::level_1()
-                        .id(106)
-                        .min_time(340)
-                        .max_time(360)
-                        .file_size_bytes(BUCKET_500_KB as i64 + 1) // exercise metrics
-                        .build(),
-                    // Does not overlap any level 0, times are too late
-                    ParquetFileBuilder::level_1()
-                        .id(107)
-                        .min_time(390)
-                        .max_time(399)
-                        .file_size_bytes(10)
-                        .build(),
-                ],
-            };
-
-            // total needed budget for one file with a tag, a time and 11 rows = 1176
-            let (files_metric, bytes_metric) = metrics();
-            let partition = ParquetFileBuilder::level_0()
-                .id(1)
-                .build_partition_with_extra_info();
-            let table_columns = one_tag_one_time_cols();
-
-            let to_compact = filter_hot_parquet_files(
-                partition.clone(),
-                parquet_files_for_compaction.clone(),
-                1176 * 3 + 5, // enough for 3 files
-                &table_columns,
-                &files_metric,
-                &bytes_metric,
-            );
-
-            let result = to_compact.filter_result();
-            assert_eq!(result, FilterResult::Proceeed);
-            // memory budget for 3 files
-            assert_eq!(to_compact.budget_bytes(), 3 * 1176);
-
-            let files = to_compact.files;
-            let ids: Vec<_> = files.iter().map(|f| f.id.get()).collect();
-            assert_eq!(ids, [102, 103, 1]);
-            assert_eq!(
-                extract_file_metrics(&files_metric),
-                ExtractedFileMetrics {
-                    level_0_selected: 1,
-                    level_0_not_selected: 2,
-                    level_1_selected: 2,
-                    level_1_not_selected: 5,
-                }
-            );
-
-            // Increase budget to more than 6 files; 1st two level 0 files & their overlapping level 1 files get
-            // returned
-            let (files_metric, bytes_metric) = metrics();
-
-            let to_compact = filter_hot_parquet_files(
-                partition,
-                parquet_files_for_compaction,
-                1176 * 6 + 5,
-                &table_columns,
-                &files_metric,
-                &bytes_metric,
-            );
-
-            let result = to_compact.filter_result();
-            assert_eq!(result, FilterResult::Proceeed);
-
-            // memory budget for 3 files
-            assert_eq!(to_compact.budget_bytes(), 6 * 1176);
-
-            let files = to_compact.files;
-            let ids: Vec<_> = files.iter().map(|f| f.id.get()).collect();
-            assert_eq!(ids, [102, 103, 104, 105, 1, 2]);
-            assert_eq!(
-                extract_file_metrics(&files_metric),
-                ExtractedFileMetrics {
-                    level_0_selected: 2,
-                    level_0_not_selected: 1,
-                    level_1_selected: 4,
-                    level_1_not_selected: 3,
-                }
-            );
-        }
+        assert_eq!(
+            filter_result,
+            FilterResult::OverBudget {
+                budget_bytes: expected_estimated_budget,
+                num_files: 1
+            }
+        );
     }
 
-    mod cold {
-        use super::*;
+    #[test]
+    fn budget_0_small_output_returns_over_budget() {
+        let level_0 = vec![ParquetFileBuilder::level_0().id(1).build()];
+        let file_size_bytes = level_0[0].file_size_bytes();
+        let level_1 = vec![];
+        let (files_metric, bytes_metric) = metrics();
 
-        const DEFAULT_MAX_FILE_SIZE: u64 = 1024 * 1024 * 10;
-        const DEFAULT_INPUT_FILE_COUNT: usize = 100;
+        let bytes_stored_the_file_in_memory = (2 * level_0[0].file_size_bytes()) as u64;
+        let expected_estimated_budget =
+            bytes_stored_the_file_in_memory + 3 * ESTIMATED_STREAM_BYTES; // one input stream, two output streams
 
-        #[test]
-        fn empty_in_empty_out() {
-            let parquet_files_for_compaction = ParquetFilesForCompaction {
-                level_0: vec![],
-                level_1: vec![],
-            };
-            let (files_metric, bytes_metric) = metrics();
+        let filter_result = filter_parquet_files_inner(
+            level_0,
+            level_1,
+            0,
+            FILE_NUM_LIMIT,
+            // output size smaller than input size to force return 2 output streams
+            (file_size_bytes - 1) as u64,
+            &files_metric,
+            &bytes_metric,
+        );
 
-            let files = filter_cold_parquet_files(
-                parquet_files_for_compaction,
-                DEFAULT_MAX_FILE_SIZE,
-                DEFAULT_INPUT_FILE_COUNT,
+        assert_eq!(
+            filter_result,
+            FilterResult::OverBudget {
+                budget_bytes: expected_estimated_budget,
+                num_files: 1
+            }
+        );
+    }
+
+    #[test]
+    fn budget_0_super_small_output_returns_over_budget() {
+        let level_0 = vec![ParquetFileBuilder::level_0().id(1).build()];
+        let file_size_bytes = level_0[0].file_size_bytes();
+        let level_1 = vec![];
+        let (files_metric, bytes_metric) = metrics();
+
+        let bytes_stored_the_file_in_memory = (2 * level_0[0].file_size_bytes()) as u64;
+        let expected_estimated_budget =
+            bytes_stored_the_file_in_memory + 4 * ESTIMATED_STREAM_BYTES; // one input stream, three output streams
+
+        let filter_result = filter_parquet_files_inner(
+            level_0,
+            level_1,
+            0,
+            FILE_NUM_LIMIT,
+            // max desired output size ~1/3 input size to force returning 3 output streams
+            (file_size_bytes / 3 + 1) as u64,
+            &files_metric,
+            &bytes_metric,
+        );
+
+        assert_eq!(
+            filter_result,
+            FilterResult::OverBudget {
+                budget_bytes: expected_estimated_budget,
+                num_files: 1
+            }
+        );
+    }
+
+    #[test]
+    fn budget_1000_returns_over_budget() {
+        let level_0 = vec![ParquetFileBuilder::level_0().id(1).build()];
+        let level_1 = vec![];
+        let (files_metric, bytes_metric) = metrics();
+
+        let bytes_stored_the_file_in_memory = (2 * level_0[0].file_size_bytes()) as u64;
+        let expected_estimated_budget =
+            bytes_stored_the_file_in_memory + 2 * ESTIMATED_STREAM_BYTES; // one input stream, one output stream
+
+        let filter_result = filter_parquet_files_inner(
+            level_0,
+            level_1,
+            1000,
+            FILE_NUM_LIMIT,
+            DEFAULT_MAX_OUTPUT_SIZE,
+            &files_metric,
+            &bytes_metric,
+        );
+
+        assert_eq!(
+            filter_result,
+            FilterResult::OverBudget {
+                budget_bytes: expected_estimated_budget,
+                num_files: 1
+            }
+        );
+    }
+
+    #[test]
+    fn file_num_0_returns_over_file_limit() {
+        let level_0 = vec![ParquetFileBuilder::level_0().id(1).build()];
+        let level_1 = vec![];
+        let (files_metric, bytes_metric) = metrics();
+
+        let bytes_stored_the_file_in_memory = (2 * level_0[0].file_size_bytes()) as u64;
+        let expected_estimated_budget =
+            bytes_stored_the_file_in_memory + 2 * ESTIMATED_STREAM_BYTES; // one input stream, one output stream
+
+        let filter_result = filter_parquet_files_inner(
+            level_0,
+            level_1,
+            MEMORY_BUDGET,
+            0,
+            DEFAULT_MAX_OUTPUT_SIZE,
+            &files_metric,
+            &bytes_metric,
+        );
+
+        assert_eq!(
+            filter_result,
+            FilterResult::OverLimitFileNum {
+                num_files: 1,
+                budget_bytes: expected_estimated_budget // one input stream, one output stream
+            }
+        );
+    }
+
+    #[test]
+    fn file_num_limit_1_return_over_file_limit() {
+        let level_0 = vec![ParquetFileBuilder::level_0()
+            .id(1)
+            .min_time(200)
+            .max_time(300)
+            .build()];
+        let level_1 = vec![
+            // Completely contains the level 0 times
+            ParquetFileBuilder::level_1()
+                .id(102)
+                .min_time(150)
+                .max_time(350)
+                .build(),
+        ];
+        let (files_metric, bytes_metric) = metrics();
+
+        let bytes_stored_2_files_in_memory = 2 * (2 * level_0[0].file_size_bytes()) as u64;
+        let expected_estimated_budget = bytes_stored_2_files_in_memory + 3 * ESTIMATED_STREAM_BYTES; // two input streams, one output stream
+
+        let filter_result = filter_parquet_files_inner(
+            level_0,
+            level_1,
+            MEMORY_BUDGET,
+            1,
+            DEFAULT_MAX_OUTPUT_SIZE,
+            &files_metric,
+            &bytes_metric,
+        );
+
+        assert_eq!(
+            filter_result,
+            FilterResult::OverLimitFileNum {
+                num_files: 2,
+                budget_bytes: expected_estimated_budget
+            }
+        );
+    }
+
+    #[test]
+    fn file_num_limit_2_return_2_files() {
+        let level_0 = vec![
+            // Level 0 files that overlap in time slightly.
+            ParquetFileBuilder::level_0()
+                .id(1)
+                .min_time(200)
+                .max_time(300)
+                .file_size_bytes(FILE_SIZE_BYTES)
+                .build(),
+            ParquetFileBuilder::level_0()
+                .id(2)
+                .min_time(280)
+                .max_time(310)
+                .file_size_bytes(FILE_SIZE_BYTES)
+                .build(),
+            ParquetFileBuilder::level_0()
+                .id(3)
+                .min_time(309)
+                .max_time(350)
+                .file_size_bytes(FILE_SIZE_BYTES)
+                .build(),
+        ];
+
+        let level_1 = vec![
+            // overlaps in time with second and third L0s
+            ParquetFileBuilder::level_1()
+                .id(101)
+                .min_time(301)
+                .max_time(500)
+                .file_size_bytes(FILE_SIZE_BYTES)
+                .build(),
+            // overlaps in time with first and second L0s
+            ParquetFileBuilder::level_1()
+                .id(102)
+                .min_time(150)
+                .max_time(250)
+                .file_size_bytes(FILE_SIZE_BYTES)
+                .build(),
+        ];
+        let (files_metric, bytes_metric) = metrics();
+
+        // bytes stored 2 files in memory: first L0 (id=1) and second L1 (id=102)
+        let bytes_stored_2_files_in_memory = 2 * (2 * level_0[0].file_size_bytes()) as u64;
+        let mut expected_estimated_budget =
+            bytes_stored_2_files_in_memory + 3 * ESTIMATED_STREAM_BYTES; // two input streams, one output stream
+
+        // Test 1: allow large output size --> only one output stream
+        let filter_result = filter_parquet_files_inner(
+            level_0.clone(),
+            level_1.clone(),
+            MEMORY_BUDGET,
+            2,
+            DEFAULT_MAX_OUTPUT_SIZE,
+            &files_metric,
+            &bytes_metric,
+        );
+
+        // should include 2 files: first L0 (id=1) and second L1 (id=102)
+        assert!(
+            matches!(
+                &filter_result,
+                FilterResult::Proceed { files, budget_bytes }
+                    if files.len() == 2
+                        && files.iter().map(|f| f.id().get()).collect::<Vec<_>>() == [102, 1]
+                        && *budget_bytes == expected_estimated_budget
+            ),
+            "Match failed, got: {filter_result:?}"
+        );
+
+        // Test 2: max output size small
+        let filter_result = filter_parquet_files_inner(
+            level_0,
+            level_1,
+            MEMORY_BUDGET,
+            2,
+            // max output size is just over 1/3 of (10 + 10) which is size of first L0 (id=1) and second L1 (id=102)
+            8,
+            &files_metric,
+            &bytes_metric,
+        );
+
+        // add budget for 2 two more output streams
+        expected_estimated_budget += 2 * ESTIMATED_STREAM_BYTES;
+
+        // should include 2 files: first L0 (id=1) and second L1 (id=102)
+        assert!(
+            matches!(
+                &filter_result,
+                FilterResult::Proceed { files, budget_bytes }
+                    if files.len() == 2
+                        && files.iter().map(|f| f.id().get()).collect::<Vec<_>>() == [102, 1]
+                        && *budget_bytes == expected_estimated_budget// 2 input streams & 3 output streams
+            ),
+            "Match failed, got: {filter_result:?}"
+        );
+    }
+
+    #[test]
+    fn file_num_limit_10_return_all_5_files() {
+        let level_0 = vec![
+            // Level 0 files that overlap in time slightly.
+            ParquetFileBuilder::level_0()
+                .id(1)
+                .min_time(200)
+                .max_time(300)
+                .file_size_bytes(FILE_SIZE_BYTES)
+                .build(),
+            ParquetFileBuilder::level_0()
+                .id(2)
+                .min_time(280)
+                .max_time(310)
+                .file_size_bytes(FILE_SIZE_BYTES)
+                .build(),
+            ParquetFileBuilder::level_0()
+                .id(3)
+                .min_time(309)
+                .max_time(350)
+                .file_size_bytes(FILE_SIZE_BYTES)
+                .build(),
+        ];
+
+        let level_1 = vec![
+            // overlaps in time with second and third L0s
+            ParquetFileBuilder::level_1()
+                .id(101)
+                .min_time(301)
+                .max_time(500)
+                .build(),
+            // overlaps in time with first and second L0s
+            ParquetFileBuilder::level_1()
+                .id(102)
+                .min_time(150)
+                .max_time(250)
+                .build(),
+        ];
+        let (files_metric, bytes_metric) = metrics();
+
+        let bytes_stored_5_files_in_memory = 5 * (2 * level_0[0].file_size_bytes()) as u64;
+        let expected_estimated_budget = bytes_stored_5_files_in_memory + 6 * ESTIMATED_STREAM_BYTES; // 5 input streams, one output stream
+
+        let filter_result = filter_parquet_files_inner(
+            level_0,
+            level_1,
+            MEMORY_BUDGET,
+            10,
+            DEFAULT_MAX_OUTPUT_SIZE,
+            &files_metric,
+            &bytes_metric,
+        );
+
+        // should include 2 files: first L0 (id=1) and second L1 (id=102)
+        assert!(
+            matches!(
+                &filter_result,
+                FilterResult::Proceed { files, budget_bytes }
+                    if files.len() == 5
+                        && files.iter().map(|f| f.id().get()).collect::<Vec<_>>()
+                            == [102, 101, 1, 2, 3]
+                        && *budget_bytes ==  expected_estimated_budget
+            ),
+            "Match failed, got: {filter_result:?}"
+        );
+    }
+
+    // bug: https://github.com/influxdata/conductor/issues/1178
+    #[test]
+    fn file_num_limit_3_five_l0_one_l1_files() {
+        let level_0 = vec![
+            // Level 0 files that overlap in time slightly.
+            ParquetFileBuilder::level_0()
+                .id(1)
+                .min_time(200)
+                .max_time(300)
+                .file_size_bytes(FILE_SIZE_BYTES)
+                .build(),
+            ParquetFileBuilder::level_0()
+                .id(2)
+                .min_time(280)
+                .max_time(310)
+                .file_size_bytes(FILE_SIZE_BYTES)
+                .build(),
+            ParquetFileBuilder::level_0()
+                .id(3)
+                .min_time(309)
+                .max_time(350)
+                .file_size_bytes(FILE_SIZE_BYTES)
+                .build(),
+            ParquetFileBuilder::level_0()
+                .id(4)
+                .min_time(309)
+                .max_time(350)
+                .file_size_bytes(FILE_SIZE_BYTES)
+                .build(),
+            ParquetFileBuilder::level_0()
+                .id(5)
+                .min_time(309)
+                .max_time(350)
+                .file_size_bytes(FILE_SIZE_BYTES)
+                .build(),
+        ];
+
+        let level_1 = vec![
+            // overlaps in time with first and second L0s
+            ParquetFileBuilder::level_1()
+                .id(101)
+                .min_time(150)
+                .max_time(250)
+                .build(),
+        ];
+        let (files_metric, bytes_metric) = metrics();
+        let bytes_stored_3_files_in_memory = 3 * (2 * level_0[0].file_size_bytes()) as u64;
+        let expected_estimated_budget = bytes_stored_3_files_in_memory + 4 * ESTIMATED_STREAM_BYTES; // 3 input streams, one output stream
+
+        let filter_result = filter_parquet_files_inner(
+            level_0,
+            level_1,
+            MEMORY_BUDGET,
+            3,
+            DEFAULT_MAX_OUTPUT_SIZE,
+            &files_metric,
+            &bytes_metric,
+        );
+
+        // should include 3 files: first 2 L0s (id=1 and id=2) and sthe L1 (id=101)
+        assert!(
+            matches!(
+                &filter_result,
+                FilterResult::Proceed { files, budget_bytes }
+                    if files.len() == 3
+                        && files.iter().map(|f| f.id().get()).collect::<Vec<_>>() == [101, 1, 2]
+                        && *budget_bytes == expected_estimated_budget
+            ),
+            "Match failed, got: {filter_result:?}"
+        );
+    }
+
+    #[test]
+    fn large_budget_returns_one_level_0_file_and_its_level_1_overlaps() {
+        let level_0 = vec![ParquetFileBuilder::level_0()
+            .id(1)
+            .min_time(200)
+            .max_time(300)
+            .build()];
+        let level_1 = vec![
+            // Too early
+            ParquetFileBuilder::level_1()
+                .id(101)
+                .min_time(1)
+                .max_time(50)
+                .build(),
+            // Completely contains the level 0 times
+            ParquetFileBuilder::level_1()
+                .id(102)
+                .min_time(150)
+                .max_time(350)
+                .build(),
+            // Too late
+            ParquetFileBuilder::level_1()
+                .id(103)
+                .min_time(400)
+                .max_time(500)
+                .build(),
+        ];
+        let (files_metric, bytes_metric) = metrics();
+
+        let bytes_stored_2_files_in_memory = 2 * (2 * level_0[0].file_size_bytes()) as u64;
+        let expected_estimated_budget = bytes_stored_2_files_in_memory + 3 * ESTIMATED_STREAM_BYTES; // 2 input streams, one output stream
+
+        let filter_result = filter_parquet_files_inner(
+            level_0,
+            level_1,
+            MEMORY_BUDGET,
+            FILE_NUM_LIMIT,
+            DEFAULT_MAX_OUTPUT_SIZE,
+            &files_metric,
+            &bytes_metric,
+        );
+
+        assert!(
+            matches!(
+                &filter_result,
+                FilterResult::Proceed { files, budget_bytes }
+                    if files.len() == 2
+                        && files.iter().map(|f| f.id().get()).collect::<Vec<_>>() == [102, 1]
+                        && *budget_bytes == expected_estimated_budget
+            ),
+            "Match failed, got: {filter_result:?}"
+        );
+    }
+
+    #[test]
+    fn returns_only_overlapping_level_1_files_in_order() {
+        let level_0 = vec![
+            // Level 0 files that overlap in time slightly.
+            ParquetFileBuilder::level_0()
+                .id(1)
+                .min_time(200)
+                .max_time(300)
+                .file_size_bytes(FILE_SIZE_BYTES)
+                .build(),
+            ParquetFileBuilder::level_0()
+                .id(2)
+                .min_time(280)
+                .max_time(310)
+                .file_size_bytes(FILE_SIZE_BYTES)
+                .build(),
+            ParquetFileBuilder::level_0()
+                .id(3)
+                .min_time(309)
+                .max_time(350)
+                .file_size_bytes(FILE_SIZE_BYTES)
+                .build(),
+        ];
+
+        // Level 1 files can be assumed not to overlap each other.
+        let level_1 = vec![
+            // Does not overlap any level 0, times are too early
+            ParquetFileBuilder::level_1()
+                .id(101)
+                .min_time(1)
+                .max_time(50)
+                .file_size_bytes(FILE_SIZE_BYTES)
+                .build(),
+            // Overlaps file 1
+            ParquetFileBuilder::level_1()
+                .id(102)
+                .min_time(199)
+                .max_time(201)
+                .file_size_bytes(FILE_SIZE_BYTES)
+                .build(),
+            // Overlaps files 1 and 2
+            ParquetFileBuilder::level_1()
+                .id(103)
+                .min_time(290)
+                .max_time(300)
+                .file_size_bytes(FILE_SIZE_BYTES)
+                .build(),
+            // Overlaps file 2
+            ParquetFileBuilder::level_1()
+                .id(104)
+                .min_time(305)
+                .max_time(305)
+                .file_size_bytes(FILE_SIZE_BYTES)
+                .build(),
+            // Overlaps files 2 and 3
+            ParquetFileBuilder::level_1()
+                .id(105)
+                .min_time(308)
+                .max_time(311)
+                .file_size_bytes(FILE_SIZE_BYTES)
+                .build(),
+            // Overlaps file 3
+            ParquetFileBuilder::level_1()
+                .id(106)
+                .min_time(340)
+                .max_time(360)
+                .file_size_bytes(BUCKET_500_KB as i64 + 1) // exercise metrics
+                .build(),
+            // Does not overlap any level 0, times are too late
+            ParquetFileBuilder::level_1()
+                .id(107)
+                .min_time(390)
+                .max_time(399)
+                .file_size_bytes(FILE_SIZE_BYTES)
+                .build(),
+        ];
+
+        // Test 1: budget enough for 3 files only
+        let (files_metric, bytes_metric) = metrics();
+
+        let bytes_stored_3_files_in_memory = 3 * (2 * level_0[0].file_size_bytes()) as u64;
+        let expected_estimated_budget = bytes_stored_3_files_in_memory + 4 * ESTIMATED_STREAM_BYTES; // 3 input streams, one output stream
+
+        let filter_result = filter_parquet_files_inner(
+            level_0.clone(),
+            level_1.clone(),
+            // enough for 3 files and one output stream
+            (ESTIMATED_STREAM_BYTES * 4) + (FILE_SIZE_BYTES as u64 * 3 * 2) + 1,
+            FILE_NUM_LIMIT,
+            DEFAULT_MAX_OUTPUT_SIZE,
+            &files_metric,
+            &bytes_metric,
+        );
+
+        assert!(
+            matches!(
+                &filter_result,
+                FilterResult::Proceed { files, budget_bytes }
+                    if files.len() == 3
+                        && files
+                                .iter()
+                                .map(|f| f.id().get())
+                                .collect::<Vec<_>>() == [102, 103, 1]
+                        && *budget_bytes == expected_estimated_budget
+            ),
+            "Match failed, got: {filter_result:?}"
+        );
+
+        assert_eq!(
+            extract_file_metrics(
                 &files_metric,
-                &bytes_metric,
-            );
+                CompactionLevel::Initial,
+                CompactionLevel::FileNonOverlapped
+            ),
+            ExtractedFileMetrics {
+                level_n_selected: 1,
+                level_n_not_selected: 2,
+                level_n_plus_1_selected: 2,
+                level_n_plus_1_not_selected: 5,
+            }
+        );
 
-            assert!(files.is_empty(), "Expected empty, got: {:#?}", files);
-        }
+        // Test 2: increase udget to fit all files
+        let (files_metric, bytes_metric) = metrics();
 
-        #[test]
-        fn max_size_0_returns_one_level_0_file() {
-            let parquet_files_for_compaction = ParquetFilesForCompaction {
-                level_0: vec![ParquetFileBuilder::level_0().id(1).build()],
-                level_1: vec![],
-            };
-            let (files_metric, bytes_metric) = metrics();
+        let bytes_stored_6_files_in_memory = 6 * (2 * level_0[0].file_size_bytes()) as u64;
+        let expected_estimated_budget = bytes_stored_6_files_in_memory + 7 * ESTIMATED_STREAM_BYTES; // 6 input streams, one output stream
 
-            let files = filter_cold_parquet_files(
-                parquet_files_for_compaction,
-                0,
-                DEFAULT_INPUT_FILE_COUNT,
+        let filter_result = filter_parquet_files_inner(
+            level_0,
+            level_1,
+            // Increase budget to more than 6 files; 1st two level 0 files & their overlapping
+            // level 1 files get returned. Enough for 6 files/input streams and one output stream.
+            (ESTIMATED_STREAM_BYTES * 7) + (FILE_SIZE_BYTES as u64 * 6 * 2) + 1,
+            FILE_NUM_LIMIT,
+            DEFAULT_MAX_OUTPUT_SIZE,
+            &files_metric,
+            &bytes_metric,
+        );
+
+        assert!(
+            matches!(
+                &filter_result,
+                FilterResult::Proceed { files, budget_bytes }
+                    if files.len() == 6
+                        && files
+                                .iter()
+                                .map(|f| f.id().get())
+                                .collect::<Vec<_>>() == [102, 103, 104, 105, 1, 2]
+                        && *budget_bytes == expected_estimated_budget
+            ),
+            "Match failed, got: {filter_result:?}"
+        );
+
+        assert_eq!(
+            extract_file_metrics(
                 &files_metric,
-                &bytes_metric,
-            );
+                CompactionLevel::Initial,
+                CompactionLevel::FileNonOverlapped
+            ),
+            ExtractedFileMetrics {
+                level_n_selected: 2,
+                level_n_not_selected: 1,
+                level_n_plus_1_selected: 4,
+                level_n_plus_1_not_selected: 3,
+            }
+        );
+    }
 
-            assert_eq!(files.len(), 1);
-            assert_eq!(files[0].id.get(), 1);
-        }
+    #[test]
+    fn returns_only_overlapping_level_2_files_in_order() {
+        let level_1 = vec![
+            // Level 1 files don't overlap each other.
+            ParquetFileBuilder::level_1()
+                .id(1)
+                .min_time(200)
+                .max_time(300)
+                .file_size_bytes(FILE_SIZE_BYTES)
+                .build(),
+            ParquetFileBuilder::level_1()
+                .id(2)
+                .min_time(310)
+                .max_time(330)
+                .file_size_bytes(FILE_SIZE_BYTES)
+                .build(),
+            ParquetFileBuilder::level_1()
+                .id(3)
+                .min_time(340)
+                .max_time(350)
+                .file_size_bytes(FILE_SIZE_BYTES)
+                .build(),
+        ];
 
-        #[test]
-        fn max_file_count_0_returns_empty() {
-            let parquet_files_for_compaction = ParquetFilesForCompaction {
-                level_0: vec![ParquetFileBuilder::level_0().id(1).build()],
-                level_1: vec![],
-            };
-            let (files_metric, bytes_metric) = metrics();
+        // Level 2 files can be assumed not to overlap each other.
+        let level_2 = vec![
+            // Does not overlap any level 1, times are too early
+            ParquetFileBuilder::level_2()
+                .id(101)
+                .min_time(1)
+                .max_time(50)
+                .file_size_bytes(FILE_SIZE_BYTES)
+                .build(),
+            // Overlaps file 1
+            ParquetFileBuilder::level_2()
+                .id(102)
+                .min_time(199)
+                .max_time(201)
+                .file_size_bytes(FILE_SIZE_BYTES)
+                .build(),
+            // Overlaps files 1 and 2
+            ParquetFileBuilder::level_2()
+                .id(103)
+                .min_time(290)
+                .max_time(312)
+                .file_size_bytes(FILE_SIZE_BYTES)
+                .build(),
+            // Overlaps file 2
+            ParquetFileBuilder::level_2()
+                .id(104)
+                .min_time(315)
+                .max_time(315)
+                .file_size_bytes(FILE_SIZE_BYTES)
+                .build(),
+            // Overlaps files 2 and 3
+            ParquetFileBuilder::level_2()
+                .id(105)
+                .min_time(329)
+                .max_time(341)
+                .file_size_bytes(FILE_SIZE_BYTES)
+                .build(),
+            // Overlaps file 3
+            ParquetFileBuilder::level_2()
+                .id(106)
+                .min_time(342)
+                .max_time(360)
+                .file_size_bytes(BUCKET_500_KB as i64 + 1) // exercise metrics
+                .build(),
+            // Does not overlap any level 1, times are too late
+            ParquetFileBuilder::level_2()
+                .id(107)
+                .min_time(390)
+                .max_time(399)
+                .file_size_bytes(FILE_SIZE_BYTES)
+                .build(),
+        ];
 
-            let files = filter_cold_parquet_files(
-                parquet_files_for_compaction,
-                DEFAULT_MAX_FILE_SIZE,
-                0,
+        let (files_metric, bytes_metric) = metrics();
+
+        let bytes_stored_3_files_in_memory = 3 * (2 * level_1[0].file_size_bytes()) as u64;
+        let expected_estimated_budget = bytes_stored_3_files_in_memory + 4 * ESTIMATED_STREAM_BYTES; // 3 input streams, one output stream
+
+        let filter_result = filter_parquet_files_inner(
+            level_1.clone(),
+            level_2.clone(),
+            // enough for 3 files and one output stream
+            (ESTIMATED_STREAM_BYTES * 4) + (FILE_SIZE_BYTES as u64 * 3 * 2) + 1,
+            FILE_NUM_LIMIT,
+            DEFAULT_MAX_OUTPUT_SIZE,
+            &files_metric,
+            &bytes_metric,
+        );
+
+        assert!(
+            matches!(
+                &filter_result,
+                FilterResult::Proceed { files, budget_bytes }
+                    if files.len() == 3
+                        && files
+                                .iter()
+                                .map(|f| f.id().get())
+                                .collect::<Vec<_>>() == [102, 103, 1]
+                        && *budget_bytes == expected_estimated_budget
+            ),
+            "Match failed, got: {filter_result:?}"
+        );
+
+        assert_eq!(
+            extract_file_metrics(
                 &files_metric,
-                &bytes_metric,
-            );
+                CompactionLevel::FileNonOverlapped,
+                CompactionLevel::Final
+            ),
+            ExtractedFileMetrics {
+                level_n_selected: 1,
+                level_n_not_selected: 2,
+                level_n_plus_1_selected: 2,
+                level_n_plus_1_not_selected: 5,
+            }
+        );
 
-            assert!(files.is_empty(), "Expected empty, got: {:#?}", files);
-        }
+        let (files_metric, bytes_metric) = metrics();
 
-        #[test]
-        fn one_level_0_file_no_level_1_overlaps() {
-            let parquet_files_for_compaction = ParquetFilesForCompaction {
-                level_0: vec![ParquetFileBuilder::level_0()
-                    .id(1)
-                    .min_time(200)
-                    .max_time(300)
-                    .build()],
-                level_1: vec![
-                    // Too early
-                    ParquetFileBuilder::level_1()
-                        .id(101)
-                        .min_time(1)
-                        .max_time(50)
-                        .build(),
-                    // Too late
-                    ParquetFileBuilder::level_1()
-                        .id(103)
-                        .min_time(400)
-                        .max_time(500)
-                        .build(),
-                ],
-            };
-            let (files_metric, bytes_metric) = metrics();
+        let bytes_stored_6_files_in_memory = 6 * (2 * level_1[0].file_size_bytes()) as u64;
+        let expected_estimated_budget = bytes_stored_6_files_in_memory + 7 * ESTIMATED_STREAM_BYTES; // 6 input streams, one output stream
 
-            let files = filter_cold_parquet_files(
-                parquet_files_for_compaction,
-                DEFAULT_MAX_FILE_SIZE,
-                DEFAULT_INPUT_FILE_COUNT,
+        let filter_result = filter_parquet_files_inner(
+            level_1,
+            level_2,
+            // Increase budget to more than 6 files; 1st two level 1 files & their overlapping
+            // level 2 files get returned. Enough for 3 files and one output stream.
+            (ESTIMATED_STREAM_BYTES * 7) + (FILE_SIZE_BYTES as u64 * 6 * 2) + 1,
+            FILE_NUM_LIMIT,
+            DEFAULT_MAX_OUTPUT_SIZE,
+            &files_metric,
+            &bytes_metric,
+        );
+
+        assert!(
+            matches!(
+                &filter_result,
+                FilterResult::Proceed { files, budget_bytes }
+                    if files.len() == 6
+                        && files
+                                .iter()
+                                .map(|f| f.id().get())
+                                .collect::<Vec<_>>() == [102, 103, 104, 105, 1, 2]
+                        && *budget_bytes == expected_estimated_budget
+            ),
+            "Match failed, got: {filter_result:?}"
+        );
+
+        assert_eq!(
+            extract_file_metrics(
                 &files_metric,
-                &bytes_metric,
-            );
+                CompactionLevel::FileNonOverlapped,
+                CompactionLevel::Final
+            ),
+            ExtractedFileMetrics {
+                level_n_selected: 2,
+                level_n_not_selected: 1,
+                level_n_plus_1_selected: 4,
+                level_n_plus_1_not_selected: 3,
+            }
+        );
+    }
 
-            assert_eq!(files.len(), 1);
-            assert_eq!(files[0].id.get(), 1);
-        }
+    #[test]
+    fn level_1_file_already_desired_size() {
+        let level_1 = vec![
+            ParquetFileBuilder::level_1()
+                .id(101)
+                .min_time(1)
+                .max_time(50)
+                .file_size_bytes(FILE_SIZE_BYTES)
+                .build(),
+            ParquetFileBuilder::level_1()
+                .id(102)
+                .min_time(199)
+                .max_time(201)
+                .file_size_bytes(FILE_SIZE_BYTES)
+                .build(),
+        ];
 
-        #[test]
-        fn one_level_0_file_with_level_1_overlaps() {
-            let parquet_files_for_compaction = ParquetFilesForCompaction {
-                level_0: vec![ParquetFileBuilder::level_0()
-                    .id(1)
-                    .min_time(200)
-                    .max_time(300)
-                    .build()],
-                level_1: vec![
-                    // Too early
-                    ParquetFileBuilder::level_1()
-                        .id(101)
-                        .min_time(1)
-                        .max_time(50)
-                        .build(),
-                    // Completely contains the level 0 times
-                    ParquetFileBuilder::level_1()
-                        .id(102)
-                        .min_time(150)
-                        .max_time(350)
-                        .build(),
-                    // Too late
-                    ParquetFileBuilder::level_1()
-                        .id(103)
-                        .min_time(400)
-                        .max_time(500)
-                        .build(),
-                ],
-            };
-            let (files_metric, bytes_metric) = metrics();
+        let (files_metric, bytes_metric) = metrics();
+        let filter_result = filter_parquet_files_inner(
+            level_1,
+            vec![],
+            // enough to not limit based on this criteria
+            (ESTIMATED_STREAM_BYTES * 4) + (FILE_SIZE_BYTES as u64 * 3 * 2) + 1,
+            FILE_NUM_LIMIT,
+            // Limit to only 1 of the 2 files based on file size
+            FILE_SIZE_BYTES as u64 + 1,
+            &files_metric,
+            &bytes_metric,
+        );
 
-            let files = filter_cold_parquet_files(
-                parquet_files_for_compaction,
-                DEFAULT_MAX_FILE_SIZE,
-                DEFAULT_INPUT_FILE_COUNT,
-                &files_metric,
-                &bytes_metric,
-            );
+        assert!(
+            matches!(
+                &filter_result,
+                FilterResult::Proceed { files, budget_bytes: _ }
+                    if files.len() == 1
+                        && files
+                                .iter()
+                                .map(|f| f.id().get())
+                                .collect::<Vec<_>>() == [101]
+            ),
+            "Match failed, got: {filter_result:#?}"
+        );
+    }
 
-            assert_eq!(files.len(), 2);
-            assert_eq!(files[0].id.get(), 102);
-            assert_eq!(files[1].id.get(), 1);
-        }
+    #[test]
+    fn level_1_file_already_over_desired_size() {
+        let level_1 = vec![
+            ParquetFileBuilder::level_1()
+                .id(101)
+                .min_time(1)
+                .max_time(50)
+                .file_size_bytes(FILE_SIZE_BYTES)
+                .build(),
+            ParquetFileBuilder::level_1()
+                .id(102)
+                .min_time(199)
+                .max_time(201)
+                .file_size_bytes(FILE_SIZE_BYTES)
+                .build(),
+        ];
 
-        #[test]
-        fn multiple_level_0_files_no_level_1_overlaps() {
-            let parquet_files_for_compaction = ParquetFilesForCompaction {
-                level_0: vec![
-                    // Level 0 files, some of which overlap in time slightly.
-                    ParquetFileBuilder::level_0()
-                        .id(1)
-                        .min_time(200)
-                        .max_time(300)
-                        .file_size_bytes(10)
-                        .build(),
-                    ParquetFileBuilder::level_0()
-                        .id(2)
-                        .min_time(280)
-                        .max_time(310)
-                        .file_size_bytes(10)
-                        .build(),
-                    ParquetFileBuilder::level_0()
-                        .id(3)
-                        .min_time(320)
-                        .max_time(350)
-                        .file_size_bytes(10)
-                        .build(),
-                ],
-                // Level 1 files can be assumed not to overlap each other.
-                level_1: vec![
-                    // too early
-                    ParquetFileBuilder::level_1()
-                        .id(101)
-                        .min_time(1)
-                        .max_time(50)
-                        .file_size_bytes(10)
-                        .build(),
-                    // between 2 and 3 (there can't be one between 1 and 2 because they overlap)
-                    ParquetFileBuilder::level_1()
-                        .id(103)
-                        .min_time(315)
-                        .max_time(316)
-                        .file_size_bytes(10)
-                        .build(),
-                    // too late
-                    ParquetFileBuilder::level_1()
-                        .id(107)
-                        .min_time(390)
-                        .max_time(399)
-                        .file_size_bytes(10)
-                        .build(),
-                ],
-            };
+        let (files_metric, bytes_metric) = metrics();
+        let filter_result = filter_parquet_files_inner(
+            level_1,
+            vec![],
+            // enough to not limit based on this criteria
+            (ESTIMATED_STREAM_BYTES * 4) + (FILE_SIZE_BYTES as u64 * 3 * 2) + 1,
+            FILE_NUM_LIMIT,
+            // Limit such that the first file is already over the limit
+            FILE_SIZE_BYTES as u64 - 1,
+            &files_metric,
+            &bytes_metric,
+        );
 
-            // all level 0 files & no level 1 files get returned
-            let (files_metric, bytes_metric) = metrics();
-            let files = filter_cold_parquet_files(
-                parquet_files_for_compaction,
-                DEFAULT_MAX_FILE_SIZE,
-                DEFAULT_INPUT_FILE_COUNT,
-                &files_metric,
-                &bytes_metric,
-            );
-            let ids: Vec<_> = files.iter().map(|f| f.id.get()).collect();
-            assert_eq!(ids, [1, 2, 3]);
-            assert_eq!(
-                extract_file_metrics(&files_metric),
-                ExtractedFileMetrics {
-                    level_0_selected: 3,
-                    level_0_not_selected: 0,
-                    level_1_selected: 0,
-                    level_1_not_selected: 3,
-                }
-            );
-            assert_eq!(
-                extract_byte_metrics(&bytes_metric),
-                ExtractedByteMetrics {
-                    level_0_sample_count: 3,
-                    level_0_buckets_with_counts: vec![(BUCKET_500_KB, 3)],
-                    level_1_sample_count: 0,
-                    level_1_buckets_with_counts: vec![],
-                }
-            );
-        }
+        assert!(
+            matches!(
+                &filter_result,
+                FilterResult::Proceed { files, budget_bytes: _ }
+                    if files.len() == 1
+                        && files
+                                .iter()
+                                .map(|f| f.id().get())
+                                .collect::<Vec<_>>() == [101]
+            ),
+            "Match failed, got: {filter_result:#?}"
+        );
+    }
 
-        #[test]
-        fn multiple_level_0_files_with_level_1_overlaps() {
-            let parquet_files_for_compaction = ParquetFilesForCompaction {
-                level_0: vec![
-                    // Level 0 files that overlap in time slightly.
-                    ParquetFileBuilder::level_0()
-                        .id(1)
-                        .min_time(200)
-                        .max_time(300)
-                        .file_size_bytes(10)
-                        .build(),
-                    ParquetFileBuilder::level_0()
-                        .id(2)
-                        .min_time(280)
-                        .max_time(310)
-                        .file_size_bytes(10)
-                        .build(),
-                    ParquetFileBuilder::level_0()
-                        .id(3)
-                        .min_time(309)
-                        .max_time(350)
-                        .file_size_bytes(10)
-                        .build(),
-                ],
-                // Level 1 files can be assumed not to overlap each other.
-                level_1: vec![
-                    // Does not overlap any level 0, times are too early
-                    ParquetFileBuilder::level_1()
-                        .id(101)
-                        .min_time(1)
-                        .max_time(50)
-                        .file_size_bytes(10)
-                        .build(),
-                    // Overlaps file 1
-                    ParquetFileBuilder::level_1()
-                        .id(102)
-                        .min_time(199)
-                        .max_time(201)
-                        .file_size_bytes(10)
-                        .build(),
-                    // Overlaps files 1 and 2
-                    ParquetFileBuilder::level_1()
-                        .id(103)
-                        .min_time(290)
-                        .max_time(300)
-                        .file_size_bytes(10)
-                        .build(),
-                    // Overlaps file 2
-                    ParquetFileBuilder::level_1()
-                        .id(104)
-                        .min_time(305)
-                        .max_time(305)
-                        .file_size_bytes(10)
-                        .build(),
-                    // Overlaps files 2 and 3
-                    ParquetFileBuilder::level_1()
-                        .id(105)
-                        .min_time(308)
-                        .max_time(311)
-                        .file_size_bytes(10)
-                        .build(),
-                    // Overlaps file 3
-                    ParquetFileBuilder::level_1()
-                        .id(106)
-                        .min_time(340)
-                        .max_time(360)
-                        .file_size_bytes(10)
-                        .build(),
-                    // Does not overlap any level 0, times are too late
-                    ParquetFileBuilder::level_1()
-                        .id(107)
-                        .min_time(390)
-                        .max_time(399)
-                        .file_size_bytes(10)
-                        .build(),
-                ],
-            };
+    #[test]
+    fn level_1_files_only_take_enough_to_get_to_desired_size() {
+        let level_1 = vec![
+            ParquetFileBuilder::level_1()
+                .id(101)
+                .min_time(1)
+                .max_time(50)
+                .file_size_bytes(FILE_SIZE_BYTES)
+                .build(),
+            ParquetFileBuilder::level_1()
+                .id(102)
+                .min_time(199)
+                .max_time(201)
+                .file_size_bytes(FILE_SIZE_BYTES)
+                .build(),
+            ParquetFileBuilder::level_1()
+                .id(103)
+                .min_time(400)
+                .max_time(500)
+                .file_size_bytes(FILE_SIZE_BYTES)
+                .build(),
+        ];
 
-            // Max size 0; only the first level 0 file and its overlapping level 1 files get
-            // returned
-            let max_size = 0;
-            let (files_metric, bytes_metric) = metrics();
-            let files = filter_cold_parquet_files(
-                parquet_files_for_compaction.clone(),
-                max_size,
-                DEFAULT_INPUT_FILE_COUNT,
-                &files_metric,
-                &bytes_metric,
-            );
-            let ids: Vec<_> = files.iter().map(|f| f.id.get()).collect();
-            assert_eq!(ids, [102, 103, 1]);
-            assert_eq!(
-                extract_file_metrics(&files_metric),
-                ExtractedFileMetrics {
-                    level_0_selected: 1,
-                    level_0_not_selected: 2,
-                    level_1_selected: 2,
-                    level_1_not_selected: 5,
-                }
-            );
-            assert_eq!(
-                extract_byte_metrics(&bytes_metric),
-                ExtractedByteMetrics {
-                    level_0_sample_count: 1,
-                    level_0_buckets_with_counts: vec![(BUCKET_500_KB, 1)],
-                    level_1_sample_count: 2,
-                    level_1_buckets_with_counts: vec![(BUCKET_500_KB, 2)],
-                }
-            );
+        let (files_metric, bytes_metric) = metrics();
+        let filter_result = filter_parquet_files_inner(
+            level_1,
+            vec![],
+            // Don't limit based on this criteria
+            u64::MAX,
+            FILE_NUM_LIMIT,
+            // Limit to only 2 of the 3 files based on file size
+            2 * FILE_SIZE_BYTES as u64 + 1,
+            &files_metric,
+            &bytes_metric,
+        );
 
-            // Increase max size; 1st two level 0 files & their overlapping level 1 files get
-            // returned
-            let max_size = 40;
-            let (files_metric, bytes_metric) = metrics();
-            let files = filter_cold_parquet_files(
-                parquet_files_for_compaction.clone(),
-                max_size,
-                DEFAULT_INPUT_FILE_COUNT,
-                &files_metric,
-                &bytes_metric,
-            );
-            let ids: Vec<_> = files.iter().map(|f| f.id.get()).collect();
-            assert_eq!(ids, [102, 103, 104, 105, 1, 2]);
-            assert_eq!(
-                extract_file_metrics(&files_metric),
-                ExtractedFileMetrics {
-                    level_0_selected: 2,
-                    level_0_not_selected: 1,
-                    level_1_selected: 4,
-                    level_1_not_selected: 3,
-                }
-            );
-            assert_eq!(
-                extract_byte_metrics(&bytes_metric),
-                ExtractedByteMetrics {
-                    level_0_sample_count: 2,
-                    level_0_buckets_with_counts: vec![(BUCKET_500_KB, 2)],
-                    level_1_sample_count: 4,
-                    level_1_buckets_with_counts: vec![(BUCKET_500_KB, 4)],
-                }
-            );
-
-            // Increase max size to be exactly equal to the size of the 1st two level 0 files &
-            // their overlapping level 1 files, which is all that should get returned
-            let max_size = 60;
-            let (files_metric, bytes_metric) = metrics();
-            let files = filter_cold_parquet_files(
-                parquet_files_for_compaction.clone(),
-                max_size,
-                DEFAULT_INPUT_FILE_COUNT,
-                &files_metric,
-                &bytes_metric,
-            );
-            let ids: Vec<_> = files.iter().map(|f| f.id.get()).collect();
-            assert_eq!(ids, [102, 103, 104, 105, 1, 2]);
-            assert_eq!(
-                extract_file_metrics(&files_metric),
-                ExtractedFileMetrics {
-                    level_0_selected: 2,
-                    level_0_not_selected: 1,
-                    level_1_selected: 4,
-                    level_1_not_selected: 3,
-                }
-            );
-            assert_eq!(
-                extract_byte_metrics(&bytes_metric),
-                ExtractedByteMetrics {
-                    level_0_sample_count: 2,
-                    level_0_buckets_with_counts: vec![(BUCKET_500_KB, 2)],
-                    level_1_sample_count: 4,
-                    level_1_buckets_with_counts: vec![(BUCKET_500_KB, 4)],
-                }
-            );
-
-            // Increase max size; all level 0 files & their overlapping level 1 files get returned
-            let (files_metric, bytes_metric) = metrics();
-            let files = filter_cold_parquet_files(
-                parquet_files_for_compaction,
-                DEFAULT_MAX_FILE_SIZE,
-                DEFAULT_INPUT_FILE_COUNT,
-                &files_metric,
-                &bytes_metric,
-            );
-            let ids: Vec<_> = files.iter().map(|f| f.id.get()).collect();
-            assert_eq!(ids, [102, 103, 104, 105, 106, 1, 2, 3]);
-            assert_eq!(
-                extract_file_metrics(&files_metric),
-                ExtractedFileMetrics {
-                    level_0_selected: 3,
-                    level_0_not_selected: 0,
-                    level_1_selected: 5,
-                    level_1_not_selected: 2,
-                }
-            );
-            assert_eq!(
-                extract_byte_metrics(&bytes_metric),
-                ExtractedByteMetrics {
-                    level_0_sample_count: 3,
-                    level_0_buckets_with_counts: vec![(BUCKET_500_KB, 3)],
-                    level_1_sample_count: 5,
-                    level_1_buckets_with_counts: vec![(BUCKET_500_KB, 5)],
-                }
-            );
-        }
+        assert!(
+            matches!(
+                &filter_result,
+                FilterResult::Proceed { files, budget_bytes: _ }
+                    if files.len() == 2
+                        && files
+                                .iter()
+                                .map(|f| f.id().get())
+                                .collect::<Vec<_>>() == [101, 102]
+            ),
+            "Match failed, got: {filter_result:#?}"
+        );
     }
 
     /// Create ParquetFile instances for testing. Only sets fields relevant to the filtering; other
@@ -1367,7 +1499,7 @@ mod tests {
                 id: 1,
                 min_time: 8,
                 max_time: 9,
-                file_size_bytes: 10,
+                file_size_bytes: FILE_SIZE_BYTES,
             }
         }
 
@@ -1375,6 +1507,17 @@ mod tests {
         fn level_1() -> Self {
             Self {
                 compaction_level: CompactionLevel::FileNonOverlapped,
+                id: 1,
+                min_time: 8,
+                max_time: 9,
+                file_size_bytes: 10,
+            }
+        }
+
+        // Start building a level 2 file
+        fn level_2() -> Self {
+            Self {
+                compaction_level: CompactionLevel::Final,
                 id: 1,
                 min_time: 8,
                 max_time: 9,
@@ -1402,7 +1545,7 @@ mod tests {
             self
         }
 
-        fn build(self) -> ParquetFile {
+        fn build(self) -> CompactorParquetFile {
             let Self {
                 compaction_level,
                 id,
@@ -1411,7 +1554,7 @@ mod tests {
                 file_size_bytes,
             } = self;
 
-            ParquetFile {
+            let f = ParquetFile {
                 id: ParquetFileId::new(id),
                 shard_id: ShardId::new(2),
                 namespace_id: NamespaceId::new(3),
@@ -1427,145 +1570,62 @@ mod tests {
                 compaction_level,
                 created_at: Timestamp::new(12),
                 column_set: ColumnSet::new(std::iter::empty()),
-            }
-        }
-
-        fn build_partition_with_extra_info(self) -> PartitionCompactionCandidateWithInfo {
-            // build the parquet file
-            let p = self.build();
-
-            // build the partition for the parquet file
-            PartitionCompactionCandidateWithInfo {
-                candidate: PartitionParam {
-                    partition_id: p.partition_id,
-                    shard_id: p.shard_id,
-                    namespace_id: p.namespace_id,
-                    table_id: p.table_id,
-                },
-                table: Arc::new(Table {
-                    id: p.table_id,
-                    namespace_id: p.namespace_id,
-                    name: "table_name".to_string(),
-                }),
-                namespace: Arc::new(Namespace {
-                    id: p.namespace_id,
-                    name: "namespace_name".to_string(),
-                    retention_duration: Some("1 day".to_string()),
-                    topic_id: TopicId::new(1),
-                    query_pool_id: QueryPoolId::new(1),
-                    max_tables: 100,
-                    max_columns_per_table: 100,
-                }),
-                table_schema: Arc::new(TableSchema {
-                    id: p.table_id,
-                    columns: BTreeMap::new(),
-                }),
-                sort_key: None,
-                partition_key: "partition_key".into(),
-            }
+            };
+            // Estimated arrow bytes for one file with a tag, a time and 11 rows = 1176
+            CompactorParquetFile::new(f, ESTIMATED_STREAM_BYTES, (file_size_bytes * 2) as u64)
         }
     }
 
     #[derive(Debug, PartialEq)]
     struct ExtractedFileMetrics {
-        level_0_selected: u64,
-        level_0_not_selected: u64,
-        level_1_selected: u64,
-        level_1_not_selected: u64,
+        level_n_selected: u64,
+        level_n_not_selected: u64,
+        level_n_plus_1_selected: u64,
+        level_n_plus_1_not_selected: u64,
     }
 
-    fn extract_file_metrics(metric: &Metric<U64Gauge>) -> ExtractedFileMetrics {
-        let level_0_selected = metric
-            .get_observer(&Attributes::from(&[
-                ("compaction_level", "0"),
-                ("status", "selected_for_compaction"),
+    fn extract_file_metrics(
+        metric: &Metric<U64Gauge>,
+        level_n: CompactionLevel,
+        level_n_plus_1: CompactionLevel,
+    ) -> ExtractedFileMetrics {
+        let level_n_string = Cow::from(format!("{}", level_n as i16));
+        let level_n_selected = metric
+            .get_observer(&Attributes::from([
+                ("compaction_level", level_n_string.clone()),
+                ("status", "selected_for_compaction".into()),
+            ]))
+            .unwrap()
+            .fetch();
+        let level_n_not_selected = metric
+            .get_observer(&Attributes::from([
+                ("compaction_level", level_n_string),
+                ("status", "not_selected_for_compaction".into()),
             ]))
             .unwrap()
             .fetch();
 
-        let level_0_not_selected = metric
-            .get_observer(&Attributes::from(&[
-                ("compaction_level", "0"),
-                ("status", "not_selected_for_compaction"),
+        let level_n_plus_1_string = Cow::from(format!("{}", level_n_plus_1 as i16));
+        let level_n_plus_1_selected = metric
+            .get_observer(&Attributes::from([
+                ("compaction_level", level_n_plus_1_string.clone()),
+                ("status", "selected_for_compaction".into()),
             ]))
             .unwrap()
             .fetch();
-
-        let level_1_selected = metric
-            .get_observer(&Attributes::from(&[
-                ("compaction_level", "1"),
-                ("status", "selected_for_compaction"),
-            ]))
-            .unwrap()
-            .fetch();
-
-        let level_1_not_selected = metric
-            .get_observer(&Attributes::from(&[
-                ("compaction_level", "1"),
-                ("status", "not_selected_for_compaction"),
+        let level_n_plus_1_not_selected = metric
+            .get_observer(&Attributes::from([
+                ("compaction_level", level_n_plus_1_string),
+                ("status", "not_selected_for_compaction".into()),
             ]))
             .unwrap()
             .fetch();
 
         ExtractedFileMetrics {
-            level_0_selected,
-            level_0_not_selected,
-            level_1_selected,
-            level_1_not_selected,
+            level_n_selected,
+            level_n_not_selected,
+            level_n_plus_1_selected,
+            level_n_plus_1_not_selected,
         }
-    }
-
-    #[derive(Debug, PartialEq)]
-    struct ExtractedByteMetrics {
-        level_0_sample_count: u64,
-        level_0_buckets_with_counts: Vec<(u64, u64)>,
-        level_1_sample_count: u64,
-        level_1_buckets_with_counts: Vec<(u64, u64)>,
-    }
-
-    fn extract_byte_metrics(metric: &Metric<U64Histogram>) -> ExtractedByteMetrics {
-        let bucket_filter = |o: &ObservationBucket<u64>| {
-            if o.count == 0 {
-                None
-            } else {
-                Some((o.le, o.count))
-            }
-        };
-
-        let level_0 = metric
-            .get_observer(&Attributes::from(&[("file_size_compaction_level", "0")]))
-            .unwrap()
-            .fetch();
-        let mut level_0_buckets_with_counts: Vec<_> =
-            level_0.buckets.iter().filter_map(bucket_filter).collect();
-        level_0_buckets_with_counts.sort();
-
-        let level_1 = metric
-            .get_observer(&Attributes::from(&[("file_size_compaction_level", "1")]))
-            .unwrap()
-            .fetch();
-        let mut level_1_buckets_with_counts: Vec<_> =
-            level_1.buckets.iter().filter_map(bucket_filter).collect();
-        level_1_buckets_with_counts.sort();
-
-        ExtractedByteMetrics {
-            level_0_sample_count: level_0.sample_count(),
-            level_0_buckets_with_counts,
-            level_1_sample_count: level_1.sample_count(),
-            level_1_buckets_with_counts,
-        }
-    }
-
-    fn one_tag_one_time_cols() -> Vec<ColumnTypeCount> {
-        vec![
-            ColumnTypeCount {
-                col_type: ColumnType::Tag as i16,
-                count: 1,
-            },
-            ColumnTypeCount {
-                col_type: ColumnType::Time as i16,
-                count: 1,
-            },
-        ]
     }
 }

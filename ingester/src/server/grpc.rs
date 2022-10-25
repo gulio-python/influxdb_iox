@@ -1,8 +1,8 @@
 //! gRPC service implementations for `ingester`.
 
 use crate::{
-    data::{FlatIngesterQueryResponse, FlatIngesterQueryResponseStream},
     handler::IngestHandler,
+    querier_handler::{FlatIngesterQueryResponse, FlatIngesterQueryResponseStream},
 };
 use arrow::error::ArrowError;
 use arrow_flight::{
@@ -16,7 +16,7 @@ use generated_types::influxdata::iox::ingester::v1::{
     self as proto,
     write_info_service_server::{WriteInfoService, WriteInfoServiceServer},
 };
-use observability_deps::tracing::{info, warn};
+use observability_deps::tracing::{debug, info, warn};
 use pin_project::pin_project;
 use prost::Message;
 use snafu::{ResultExt, Snafu};
@@ -29,11 +29,10 @@ use std::{
     task::Poll,
 };
 use tonic::{Request, Response, Streaming};
-use trace::ctx::SpanContext;
+use trace::{ctx::SpanContext, span::SpanExt};
 use write_summary::WriteSummary;
 
-/// This type is responsible for managing all gRPC services exposed by
-/// `ingester`.
+/// This type is responsible for managing all gRPC services exposed by `ingester`.
 #[derive(Debug, Default)]
 pub struct GrpcDelegate<I: IngestHandler> {
     ingest_handler: Arc<I>,
@@ -45,8 +44,7 @@ pub struct GrpcDelegate<I: IngestHandler> {
 }
 
 impl<I: IngestHandler + Send + Sync + 'static> GrpcDelegate<I> {
-    /// Initialise a new [`GrpcDelegate`] passing valid requests to the
-    /// specified `ingest_handler`.
+    /// Initialise a new [`GrpcDelegate`] passing valid requests to the specified `ingest_handler`.
     pub fn new(ingest_handler: Arc<I>, test_flight_do_get_panic: Arc<AtomicU64>) -> Self {
         Self {
             ingest_handler,
@@ -101,9 +99,12 @@ impl WriteInfoService for WriteInfoServiceImpl {
                     .write_status(shard_index, &progress)
                     .map_err(|e| tonic::Status::invalid_argument(e.to_string()))?;
 
+                let shard_index = shard_index.get();
+                let status = proto::ShardStatus::from(status);
+                debug!(shard_index, ?status, "write info status",);
                 Ok(proto::ShardInfo {
-                    shard_index: shard_index.get(),
-                    status: proto::ShardStatus::from(status).into(),
+                    shard_index,
+                    status: status.into(),
                 })
             })
             .collect::<Result<Vec<_>, tonic::Status>>()?;
@@ -170,10 +171,10 @@ impl From<Error> for tonic::Status {
             | Error::TableNotFound { .. } => {
                 // TODO(edd): this should be `debug`. Keeping at info whilst IOx still in early
                 // development
-                info!(?err, msg)
+                info!(e=%err, msg)
             }
             Error::QueryStream { .. } | Error::Serialization { .. } => {
-                warn!(?err, msg)
+                warn!(e=%err, msg)
             }
         }
         err.to_status()
@@ -255,7 +256,7 @@ impl<I: IngestHandler + Send + Sync + 'static> Flight for FlightService<I> {
         &self,
         request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, tonic::Status> {
-        let _span_ctx: Option<SpanContext> = request.extensions().get().cloned();
+        let span_ctx: Option<SpanContext> = request.extensions().get().cloned();
         let ticket = request.into_inner();
 
         let proto_query_request =
@@ -267,25 +268,25 @@ impl<I: IngestHandler + Send + Sync + 'static> Flight for FlightService<I> {
 
         self.maybe_panic_in_flight_do_get();
 
-        let query_response =
-            self.ingest_handler
-                .query(query_request)
-                .await
-                .map_err(|e| match e {
-                    crate::querier_handler::Error::NamespaceNotFound { namespace_name } => {
-                        Error::NamespaceNotFound { namespace_name }
-                    }
-                    crate::querier_handler::Error::TableNotFound {
-                        namespace_name,
-                        table_name,
-                    } => Error::TableNotFound {
-                        namespace_name,
-                        table_name,
-                    },
-                    _ => Error::Query {
-                        source: Box::new(e),
-                    },
-                })?;
+        let query_response = self
+            .ingest_handler
+            .query(query_request, span_ctx.child_span("ingest handler query"))
+            .await
+            .map_err(|e| match e {
+                crate::querier_handler::Error::NamespaceNotFound { namespace_name } => {
+                    Error::NamespaceNotFound { namespace_name }
+                }
+                crate::querier_handler::Error::TableNotFound {
+                    namespace_name,
+                    table_name,
+                } => Error::TableNotFound {
+                    namespace_name,
+                    table_name,
+                },
+                _ => Error::Query {
+                    source: Box::new(e),
+                },
+            })?;
 
         let output = GetStream::new(query_response.flatten());
 
@@ -405,9 +406,6 @@ impl Stream for GetStream {
                             parquet_max_sequence_number: status
                                 .parquet_max_sequence_number
                                 .map(|x| x.get()),
-                            tombstone_max_sequence_number: status
-                                .tombstone_max_sequence_number
-                                .map(|x| x.get()),
                         }),
                     };
                     prost::Message::encode(&app_metadata, &mut bytes)
@@ -462,7 +460,7 @@ mod tests {
     use mutable_batch_lp::test_helpers::lp_to_mutable_batch;
     use schema::selection::Selection;
 
-    use crate::data::PartitionStatus;
+    use crate::querier_handler::PartitionStatus;
 
     use super::*;
 
@@ -485,7 +483,6 @@ mod tests {
                     partition_id: PartitionId::new(1),
                     status: PartitionStatus {
                         parquet_max_sequence_number: None,
-                        tombstone_max_sequence_number: None,
                     },
                 }),
                 Ok(FlatIngesterQueryResponse::StartSnapshot { schema }),
@@ -498,7 +495,6 @@ mod tests {
                         partition_id: 1,
                         status: Some(proto::PartitionStatus {
                             parquet_max_sequence_number: None,
-                            tombstone_max_sequence_number: None,
                         }),
                     },
                 }),
@@ -523,7 +519,6 @@ mod tests {
                     partition_id: PartitionId::new(1),
                     status: PartitionStatus {
                         parquet_max_sequence_number: None,
-                        tombstone_max_sequence_number: None,
                     },
                 }),
                 Err(ArrowError::IoError("foo".into())),
@@ -531,7 +526,6 @@ mod tests {
                     partition_id: PartitionId::new(1),
                     status: PartitionStatus {
                         parquet_max_sequence_number: None,
-                        tombstone_max_sequence_number: None,
                     },
                 }),
             ],
@@ -542,7 +536,6 @@ mod tests {
                         partition_id: 1,
                         status: Some(proto::PartitionStatus {
                             parquet_max_sequence_number: None,
-                            tombstone_max_sequence_number: None,
                         }),
                     },
                 }),

@@ -5,29 +5,36 @@
 //! some absolute number and individual Parquet files that get persisted below some number. It
 //! is expected that they may be above or below the absolute thresholds.
 
+pub mod mock_handle;
+
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
+
+use data_types::{NamespaceId, PartitionId, SequenceNumber, ShardId, TableId};
+use iox_time::{Time, TimeProvider};
+use metric::{Metric, U64Counter};
+use observability_deps::tracing::{error, info, trace, warn};
+use parking_lot::Mutex;
+use tokio_util::sync::CancellationToken;
+use tracker::TrackedFutureExt;
+
 use crate::{
     data::Persister,
     job::{Job, JobRegistry},
     poison::{PoisonCabinet, PoisonPill},
 };
-use data_types::{PartitionId, SequenceNumber, ShardId};
-use iox_time::{Time, TimeProvider};
-use metric::{Metric, U64Counter};
-use observability_deps::tracing::{error, info};
-use parking_lot::Mutex;
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
-use tokio_util::sync::CancellationToken;
-use tracker::TrackedFutureExt;
 
-/// API suitable for ingester tasks to query and update the [`LifecycleManager`] state.
+/// API suitable for ingester tasks to query and update the server lifecycle state.
 pub trait LifecycleHandle: Send + Sync + 'static {
     /// Logs bytes written into a partition so that it can be tracked for the manager to
     /// trigger persistence. Returns true if the ingester should pause consuming from the
     /// write buffer so that persistence can catch up and free up memory.
+    #[allow(clippy::too_many_arguments)]
     fn log_write(
         &self,
         partition_id: PartitionId,
         shard_id: ShardId,
+        namespace_id: NamespaceId,
+        table_id: TableId,
         sequence_number: SequenceNumber,
         bytes_written: usize,
         rows_written: usize,
@@ -44,7 +51,7 @@ pub trait LifecycleHandle: Send + Sync + 'static {
 /// This handle presents an API suitable for ingester tasks to query and update
 /// the [`LifecycleManager`] state.
 #[derive(Debug, Clone)]
-pub struct LifecycleHandleImpl {
+pub(crate) struct LifecycleHandleImpl {
     time_provider: Arc<dyn TimeProvider>,
 
     config: Arc<LifecycleConfig>,
@@ -58,6 +65,8 @@ impl LifecycleHandle for LifecycleHandleImpl {
         &self,
         partition_id: PartitionId,
         shard_id: ShardId,
+        namespace_id: NamespaceId,
+        table_id: TableId,
         sequence_number: SequenceNumber,
         bytes_written: usize,
         rows_written: usize,
@@ -71,6 +80,8 @@ impl LifecycleHandle for LifecycleHandleImpl {
                 .or_insert_with(|| PartitionLifecycleStats {
                     shard_id,
                     partition_id,
+                    namespace_id,
+                    table_id,
                     first_write: now,
                     last_write: now,
                     bytes_written: 0,
@@ -78,9 +89,25 @@ impl LifecycleHandle for LifecycleHandleImpl {
                     first_sequence_number: sequence_number,
                 });
 
+        assert_eq!(stats.shard_id, shard_id);
+        assert_eq!(stats.namespace_id, namespace_id);
+        assert_eq!(stats.table_id, table_id);
+
         stats.bytes_written += bytes_written;
         stats.last_write = now;
         stats.rows_written += rows_written;
+
+        trace!(
+            shard_id=%stats.shard_id,
+            partition_id=%stats.partition_id,
+            namespace_id=%stats.namespace_id,
+            table_id=%stats.table_id,
+            first_write=%stats.first_write,
+            last_write=%stats.last_write,
+            bytes_written=%stats.bytes_written,
+            first_sequence_number=?stats.first_sequence_number,
+            "logged write"
+        );
 
         s.total_bytes += bytes_written;
 
@@ -111,7 +138,7 @@ impl LifecycleHandle for LifecycleHandleImpl {
 /// A [`LifecycleManager`] MUST be driven by an external actor periodically
 /// calling [`LifecycleManager::maybe_persist()`].
 #[derive(Debug)]
-pub struct LifecycleManager {
+pub(crate) struct LifecycleManager {
     config: Arc<LifecycleConfig>,
     time_provider: Arc<dyn TimeProvider>,
     job_registry: Arc<JobRegistry>,
@@ -174,7 +201,7 @@ pub struct LifecycleConfig {
 impl LifecycleConfig {
     /// Initialize a new LifecycleConfig. panics if the passed `pause_ingest_size` is less than the
     /// `persist_memory_threshold`.
-    pub fn new(
+    pub const fn new(
         pause_ingest_size: usize,
         persist_memory_threshold: usize,
         partition_size_threshold: usize,
@@ -219,10 +246,14 @@ struct LifecycleStats {
 }
 
 /// The stats for a partition
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct PartitionLifecycleStats {
     /// The shard this partition is under
     shard_id: ShardId,
+    /// The namespace identifier
+    namespace_id: NamespaceId,
+    /// The table identifier
+    table_id: TableId,
     /// The partition identifier
     partition_id: PartitionId,
     /// Time that the partition received its first write. This is reset anytime
@@ -278,7 +309,7 @@ impl LifecycleManager {
     }
 
     /// Acquire a shareable [`LifecycleHandle`] for this manager instance.
-    pub fn handle(&self) -> LifecycleHandleImpl {
+    pub(super) fn handle(&self) -> LifecycleHandleImpl {
         LifecycleHandleImpl {
             time_provider: Arc::clone(&self.time_provider),
             config: Arc::clone(&self.config),
@@ -303,35 +334,102 @@ impl LifecycleManager {
             Vec<PartitionLifecycleStats>,
             Vec<PartitionLifecycleStats>,
         ) = partition_stats.into_iter().partition(|s| {
-            let aged_out = now
-                .checked_duration_since(s.first_write)
-                .map(|age| age > self.config.partition_age_threshold)
-                .unwrap_or(false);
-            if aged_out {
-                self.persist_age_counter.inc(1);
-            }
+            //
+            // Log the partitions that are marked for persistence using
+            // consistent fields across all trigger types.
+            //
 
-            let is_cold = now
-                .checked_duration_since(s.last_write)
-                .map(|age| age > self.config.partition_cold_threshold)
-                .unwrap_or(false);
-            if is_cold {
-                self.persist_cold_counter.inc(1);
-            }
+            // Check if this partition's first write occurred long enough ago
+            // that the data is considered "old" and can be flushed.
+            let aged_out = match now.checked_duration_since(s.first_write) {
+                Some(age) if age > self.config.partition_age_threshold => {
+                    info!(
+                        shard_id=%s.shard_id,
+                        partition_id=%s.partition_id,
+                        first_write=%s.first_write,
+                        last_write=%s.last_write,
+                        bytes_written=s.bytes_written,
+                        rows_written=s.rows_written,
+                        first_sequence_number=?s.first_sequence_number,
+                        age=?age,
+                        "partition is over age threshold, persisting"
+                    );
+                    self.persist_age_counter.inc(1);
+                    true
+                }
+                None => {
+                    warn!(
+                        shard_id=%s.shard_id,
+                        partition_id=%s.partition_id,
+                        "unable to calculate partition age"
+                    );
+                    false
+                }
+                _ => false,
+            };
 
+            // Check if this partition's most recent write was long enough ago
+            // that the partition is considered "cold" and is unlikely to see
+            // new writes imminently.
+            let is_cold = match now.checked_duration_since(s.last_write) {
+                Some(age) if age > self.config.partition_cold_threshold => {
+                    info!(
+                        shard_id=%s.shard_id,
+                        partition_id=%s.partition_id,
+                        first_write=%s.first_write,
+                        last_write=%s.last_write,
+                        bytes_written=s.bytes_written,
+                        rows_written=s.rows_written,
+                        first_sequence_number=?s.first_sequence_number,
+                        no_writes_for=?age,
+                        "partition is cold, persisting"
+                    );
+                    self.persist_cold_counter.inc(1);
+                    true
+                }
+                None => {
+                    warn!(
+                        shard_id=%s.shard_id,
+                        partition_id=%s.partition_id,
+                        "unable to calculate partition cold duration"
+                    );
+                    false
+                }
+                _ => false,
+            };
+
+            // If this partition contains more rows than it is permitted, flush
+            // it.
             let exceeded_max_rows = s.rows_written >= self.config.partition_row_max;
             if exceeded_max_rows {
+                info!(
+                    shard_id=%s.shard_id,
+                    partition_id=%s.partition_id,
+                    first_write=%s.first_write,
+                    last_write=%s.last_write,
+                    bytes_written=s.bytes_written,
+                    rows_written=s.rows_written,
+                    first_sequence_number=?s.first_sequence_number,
+                    "partition is over max row, persisting"
+                );
                 self.persist_rows_counter.inc(1);
             }
 
+            // If the partition's in-memory buffer is larger than the configured
+            // maximum byte size, flush it.
             let sized_out = s.bytes_written > self.config.partition_size_threshold;
             if sized_out {
+                info!(
+                    shard_id=%s.shard_id,
+                    partition_id=%s.partition_id,
+                    first_write=%s.first_write,
+                    last_write=%s.last_write,
+                    bytes_written=s.bytes_written,
+                    rows_written=s.rows_written,
+                    first_sequence_number=?s.first_sequence_number,
+                    "partition exceeded byte size threshold, persisting"
+                );
                 self.persist_size_counter.inc(1);
-                info!(shard_id=%s.shard_id,
-                      partition_id=%s.partition_id,
-                      bytes_written=s.bytes_written,
-                      partition_size_threshold=self.config.partition_size_threshold,
-                      "Partition is over size threshold, persisting");
             }
 
             aged_out || sized_out || is_cold || exceeded_max_rows
@@ -383,6 +481,18 @@ impl LifecycleManager {
         let persist_tasks: Vec<_> = to_persist
             .into_iter()
             .map(|s| {
+                // BUG: TOCTOU: memory usage released may be incorrect.
+                //
+                // Here the amount of memory to be reduced is acquired, but this
+                // code does not prevent continued writes adding more data to
+                // the partition in another thread.
+                //
+                // This may lead to more actual data being persisted than the
+                // call below returns to the server pool - this would slowly
+                // starve the ingester of memory it thinks it has.
+                //
+                // See https://github.com/influxdata/influxdb_iox/issues/5777
+
                 // Mark this partition as being persisted, and remember the
                 // memory allocation it had accumulated.
                 let partition_memory_usage = self
@@ -397,7 +507,9 @@ impl LifecycleManager {
 
                 let state = Arc::clone(&self.state);
                 tokio::task::spawn(async move {
-                    persister.persist(s.partition_id).await;
+                    persister
+                        .persist(s.shard_id, s.namespace_id, s.table_id, s.partition_id)
+                        .await;
                     // Now the data has been uploaded and the memory it was
                     // using has been freed, released the memory capacity back
                     // the ingester.
@@ -438,6 +550,12 @@ impl LifecycleManager {
                     .map(|s| s.first_sequence_number)
                     .min()
                     .unwrap_or(sequence_number);
+                trace!(
+                    min_unpersisted_sequence_number=?min,
+                    shard_id=%shard_id,
+                    sequence_number=?sequence_number,
+                    "updated min_unpersisted_sequence_number for persisted shard"
+                );
                 persister
                     .update_min_unpersisted_sequence_number(shard_id, min)
                     .await;
@@ -499,12 +617,14 @@ pub(crate) async fn run_lifecycle_manager<P: Persister>(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::collections::BTreeSet;
+
     use async_trait::async_trait;
     use iox_time::MockProvider;
     use metric::{Attributes, Registry};
-    use std::collections::BTreeSet;
     use tokio::sync::Barrier;
+
+    use super::*;
 
     #[derive(Default)]
     struct TestPersister {
@@ -514,7 +634,13 @@ mod tests {
 
     #[async_trait]
     impl Persister for TestPersister {
-        async fn persist(&self, partition_id: PartitionId) {
+        async fn persist(
+            &self,
+            _shard_id: ShardId,
+            _namespace_id: NamespaceId,
+            _table_id: TableId,
+            partition_id: PartitionId,
+        ) {
             let mut p = self.persist_called.lock();
             p.insert(partition_id);
         }
@@ -574,8 +700,16 @@ mod tests {
 
     #[async_trait]
     impl Persister for PausablePersister {
-        async fn persist(&self, partition_id: PartitionId) {
-            self.inner.persist(partition_id).await;
+        async fn persist(
+            &self,
+            shard_id: ShardId,
+            namespace_id: NamespaceId,
+            table_id: TableId,
+            partition_id: PartitionId,
+        ) {
+            self.inner
+                .persist(shard_id, namespace_id, table_id, partition_id)
+                .await;
             if let Some(event) = self.event(partition_id) {
                 event.before.wait().await;
                 event.after.wait().await;
@@ -643,14 +777,36 @@ mod tests {
         let h = m.handle();
 
         // log first two writes at different times
-        assert!(!h.log_write(PartitionId::new(1), shard_id, SequenceNumber::new(1), 1, 1));
+        assert!(!h.log_write(
+            PartitionId::new(1),
+            shard_id,
+            NamespaceId::new(91),
+            TableId::new(92),
+            SequenceNumber::new(1),
+            1,
+            1
+        ));
         time_provider.inc(Duration::from_nanos(10));
-        assert!(!h.log_write(PartitionId::new(1), shard_id, SequenceNumber::new(2), 1, 1));
+        assert!(!h.log_write(
+            PartitionId::new(1),
+            shard_id,
+            NamespaceId::new(91),
+            TableId::new(92),
+            SequenceNumber::new(2),
+            1,
+            1
+        ));
 
         // log another write for different partition using a different handle
-        assert!(!m
-            .handle()
-            .log_write(PartitionId::new(2), shard_id, SequenceNumber::new(3), 3, 3));
+        assert!(!m.handle().log_write(
+            PartitionId::new(2),
+            shard_id,
+            NamespaceId::new(91),
+            TableId::new(92),
+            SequenceNumber::new(3),
+            3,
+            3
+        ));
 
         let stats = m.stats();
         assert_eq!(stats.total_bytes, 5);
@@ -684,11 +840,27 @@ mod tests {
         let h = m.handle();
 
         // write more than the limit (10)
-        assert!(h.log_write(partition_id, shard_id, SequenceNumber::new(1), 15, 1));
+        assert!(h.log_write(
+            partition_id,
+            shard_id,
+            NamespaceId::new(91),
+            TableId::new(92),
+            SequenceNumber::new(1),
+            15,
+            1
+        ));
         assert!(!h.can_resume_ingest());
 
         // all subsequent writes should also indicate a pause
-        assert!(h.log_write(partition_id, shard_id, SequenceNumber::new(2), 1, 1));
+        assert!(h.log_write(
+            partition_id,
+            shard_id,
+            NamespaceId::new(91),
+            TableId::new(92),
+            SequenceNumber::new(2),
+            1,
+            1
+        ));
         assert!(!h.can_resume_ingest());
 
         // persist the partition
@@ -697,7 +869,15 @@ mod tests {
 
         // ingest can resume
         assert!(h.can_resume_ingest());
-        assert!(!h.log_write(partition_id, shard_id, SequenceNumber::new(3), 3, 1));
+        assert!(!h.log_write(
+            partition_id,
+            shard_id,
+            NamespaceId::new(91),
+            TableId::new(92),
+            SequenceNumber::new(3),
+            3,
+            1
+        ));
     }
 
     #[tokio::test]
@@ -723,7 +903,15 @@ mod tests {
 
         // write more than the limit (10) and don't get stopped, because the
         // per-partition limit does not pause the server from ingesting.
-        assert!(!h.log_write(partition_id, shard_id, SequenceNumber::new(1), 1, 50));
+        assert!(!h.log_write(
+            partition_id,
+            shard_id,
+            NamespaceId::new(91),
+            TableId::new(92),
+            SequenceNumber::new(1),
+            1,
+            50
+        ));
         assert!(h.can_resume_ingest());
 
         // Rows were counted
@@ -737,7 +925,15 @@ mod tests {
         }
 
         // all subsequent writes should also be allowed
-        assert!(!h.log_write(partition_id, shard_id, SequenceNumber::new(2), 1, 1));
+        assert!(!h.log_write(
+            partition_id,
+            shard_id,
+            NamespaceId::new(91),
+            TableId::new(92),
+            SequenceNumber::new(2),
+            1,
+            1
+        ));
         assert!(h.can_resume_ingest());
 
         // persist the partition
@@ -752,7 +948,15 @@ mod tests {
 
         // ingest can continue
         assert!(h.can_resume_ingest());
-        assert!(!h.log_write(partition_id, shard_id, SequenceNumber::new(3), 1, 1));
+        assert!(!h.log_write(
+            partition_id,
+            shard_id,
+            NamespaceId::new(91),
+            TableId::new(92),
+            SequenceNumber::new(3),
+            1,
+            1
+        ));
     }
 
     #[tokio::test]
@@ -771,7 +975,15 @@ mod tests {
         let h = m.handle();
 
         // write more than the limit (20)
-        h.log_write(partition_id, shard_id, SequenceNumber::new(1), 25, 1);
+        h.log_write(
+            partition_id,
+            shard_id,
+            NamespaceId::new(91),
+            TableId::new(92),
+            SequenceNumber::new(1),
+            25,
+            1,
+        );
 
         // can not resume ingest as we are overall the pause ingest limit
         assert!(!h.can_resume_ingest());
@@ -799,7 +1011,15 @@ mod tests {
 
         // ingest can resume
         assert!(h.can_resume_ingest());
-        assert!(!h.log_write(partition_id, shard_id, SequenceNumber::new(2), 3, 1));
+        assert!(!h.log_write(
+            partition_id,
+            shard_id,
+            NamespaceId::new(91),
+            TableId::new(92),
+            SequenceNumber::new(2),
+            3,
+            1
+        ));
     }
 
     #[tokio::test]
@@ -822,7 +1042,15 @@ mod tests {
         let shard_id = ShardId::new(1);
         let h = m.handle();
 
-        h.log_write(partition_id, shard_id, SequenceNumber::new(1), 10, 1);
+        h.log_write(
+            partition_id,
+            shard_id,
+            NamespaceId::new(91),
+            TableId::new(92),
+            SequenceNumber::new(1),
+            10,
+            1,
+        );
 
         m.maybe_persist(&persister).await;
         let stats = m.stats();
@@ -837,7 +1065,15 @@ mod tests {
 
         // write in data for a new partition so we can be sure it isn't persisted, but the older
         // one is
-        h.log_write(PartitionId::new(2), shard_id, SequenceNumber::new(2), 6, 1);
+        h.log_write(
+            PartitionId::new(2),
+            shard_id,
+            NamespaceId::new(91),
+            TableId::new(92),
+            SequenceNumber::new(2),
+            6,
+            1,
+        );
 
         m.maybe_persist(&persister).await;
 
@@ -877,7 +1113,15 @@ mod tests {
         let shard_id = ShardId::new(1);
         let h = m.handle();
 
-        h.log_write(partition_id, shard_id, SequenceNumber::new(1), 10, 1);
+        h.log_write(
+            partition_id,
+            shard_id,
+            NamespaceId::new(91),
+            TableId::new(92),
+            SequenceNumber::new(1),
+            10,
+            1,
+        );
 
         m.maybe_persist(&persister).await;
         let stats = m.stats();
@@ -892,8 +1136,24 @@ mod tests {
 
         // write in data for a new partition so we can be sure it isn't persisted, but the older
         // one is
-        h.log_write(PartitionId::new(2), shard_id, SequenceNumber::new(2), 6, 1);
-        h.log_write(PartitionId::new(3), shard_id, SequenceNumber::new(3), 7, 1);
+        h.log_write(
+            PartitionId::new(2),
+            shard_id,
+            NamespaceId::new(91),
+            TableId::new(92),
+            SequenceNumber::new(2),
+            6,
+            1,
+        );
+        h.log_write(
+            PartitionId::new(3),
+            shard_id,
+            NamespaceId::new(91),
+            TableId::new(92),
+            SequenceNumber::new(3),
+            7,
+            1,
+        );
 
         m.maybe_persist(&persister).await;
 
@@ -934,7 +1194,15 @@ mod tests {
 
         let partition_id = PartitionId::new(1);
         let persister = Arc::new(TestPersister::default());
-        h.log_write(partition_id, shard_id, SequenceNumber::new(1), 4, 1);
+        h.log_write(
+            partition_id,
+            shard_id,
+            NamespaceId::new(91),
+            TableId::new(92),
+            SequenceNumber::new(1),
+            4,
+            1,
+        );
 
         m.maybe_persist(&persister).await;
 
@@ -944,8 +1212,24 @@ mod tests {
         assert!(!persister.persist_called_for(partition_id));
 
         // introduce a new partition under the limit to verify it doesn't get taken with the other
-        h.log_write(PartitionId::new(2), shard_id, SequenceNumber::new(2), 3, 1);
-        h.log_write(partition_id, shard_id, SequenceNumber::new(3), 5, 1);
+        h.log_write(
+            PartitionId::new(2),
+            shard_id,
+            NamespaceId::new(91),
+            TableId::new(92),
+            SequenceNumber::new(2),
+            3,
+            1,
+        );
+        h.log_write(
+            partition_id,
+            shard_id,
+            NamespaceId::new(91),
+            TableId::new(92),
+            SequenceNumber::new(3),
+            5,
+            1,
+        );
 
         m.maybe_persist(&persister).await;
 
@@ -984,8 +1268,24 @@ mod tests {
         let h = m.handle();
         let partition_id = PartitionId::new(1);
         let persister = Arc::new(TestPersister::default());
-        h.log_write(partition_id, shard_id, SequenceNumber::new(1), 8, 1);
-        h.log_write(PartitionId::new(2), shard_id, SequenceNumber::new(2), 13, 1);
+        h.log_write(
+            partition_id,
+            shard_id,
+            NamespaceId::new(91),
+            TableId::new(92),
+            SequenceNumber::new(1),
+            8,
+            1,
+        );
+        h.log_write(
+            PartitionId::new(2),
+            shard_id,
+            NamespaceId::new(91),
+            TableId::new(92),
+            SequenceNumber::new(2),
+            13,
+            1,
+        );
 
         m.maybe_persist(&persister).await;
 
@@ -1001,8 +1301,24 @@ mod tests {
         );
 
         // add that partition back in over size
-        h.log_write(partition_id, shard_id, SequenceNumber::new(3), 20, 1);
-        h.log_write(PartitionId::new(2), shard_id, SequenceNumber::new(4), 21, 1);
+        h.log_write(
+            partition_id,
+            shard_id,
+            NamespaceId::new(91),
+            TableId::new(92),
+            SequenceNumber::new(3),
+            20,
+            1,
+        );
+        h.log_write(
+            PartitionId::new(2),
+            shard_id,
+            NamespaceId::new(91),
+            TableId::new(92),
+            SequenceNumber::new(4),
+            21,
+            1,
+        );
 
         // both partitions should now need to be persisted to bring us below the mem threshold of
         // 20.
@@ -1047,11 +1363,35 @@ mod tests {
         } = TestLifecycleManger::new(config);
         let h = m.handle();
         let persister = Arc::new(TestPersister::default());
-        h.log_write(PartitionId::new(1), shard_id, SequenceNumber::new(1), 4, 1);
+        h.log_write(
+            PartitionId::new(1),
+            shard_id,
+            NamespaceId::new(91),
+            TableId::new(92),
+            SequenceNumber::new(1),
+            4,
+            1,
+        );
         time_provider.inc(Duration::from_nanos(1));
-        h.log_write(PartitionId::new(2), shard_id, SequenceNumber::new(2), 6, 1);
+        h.log_write(
+            PartitionId::new(2),
+            shard_id,
+            NamespaceId::new(91),
+            TableId::new(92),
+            SequenceNumber::new(2),
+            6,
+            1,
+        );
         time_provider.inc(Duration::from_nanos(1));
-        h.log_write(PartitionId::new(3), shard_id, SequenceNumber::new(3), 3, 1);
+        h.log_write(
+            PartitionId::new(3),
+            shard_id,
+            NamespaceId::new(91),
+            TableId::new(92),
+            SequenceNumber::new(3),
+            3,
+            1,
+        );
 
         m.maybe_persist(&persister).await;
 
@@ -1091,7 +1431,15 @@ mod tests {
         let persister = Arc::new(TestPersister::default());
         let shard_id = ShardId::new(1);
 
-        h.log_write(partition_id, shard_id, SequenceNumber::new(1), 10, 1);
+        h.log_write(
+            partition_id,
+            shard_id,
+            NamespaceId::new(91),
+            TableId::new(92),
+            SequenceNumber::new(1),
+            10,
+            1,
+        );
 
         m.maybe_persist(&persister).await;
         let stats = m.stats();
@@ -1105,7 +1453,15 @@ mod tests {
         assert!(!persister.persist_called_for(partition_id));
 
         // write in data for a new partition so we can be sure it isn't persisted, but the older one is
-        h.log_write(PartitionId::new(2), shard_id, SequenceNumber::new(2), 6, 1);
+        h.log_write(
+            PartitionId::new(2),
+            shard_id,
+            NamespaceId::new(91),
+            TableId::new(92),
+            SequenceNumber::new(2),
+            6,
+            1,
+        );
 
         m.maybe_persist(&persister).await;
 

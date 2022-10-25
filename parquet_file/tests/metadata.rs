@@ -8,12 +8,13 @@ use data_types::{
     ColumnId, CompactionLevel, NamespaceId, PartitionId, SequenceNumber, ShardId, TableId,
     Timestamp,
 };
+use datafusion_util::MemoryStream;
 use iox_time::Time;
 use object_store::DynObjectStore;
 use parquet_file::{
     metadata::IoxMetadata,
     serialize::CodecError,
-    storage::{ParquetStorage, UploadError},
+    storage::{ParquetStorage, StorageId, UploadError},
 };
 use schema::{builder::SchemaBuilder, sort::SortKey, InfluxFieldType, TIME_COLUMN_NAME};
 
@@ -56,10 +57,10 @@ async fn test_decoded_iox_metadata() {
     };
 
     let batch = RecordBatch::try_from_iter(data).unwrap();
-    let stream = futures::stream::iter([Ok(batch.clone())]);
+    let stream = Box::pin(MemoryStream::new(vec![batch.clone()]));
 
     let object_store: Arc<DynObjectStore> = Arc::new(object_store::memory::InMemory::default());
-    let storage = ParquetStorage::new(object_store);
+    let storage = ParquetStorage::new(object_store, StorageId::from("iox"));
 
     let (iox_parquet_meta, file_size) = storage
         .upload(stream, &meta)
@@ -185,10 +186,10 @@ async fn test_empty_parquet_file_panic() {
     };
 
     let batch = RecordBatch::try_from_iter(data).unwrap();
-    let stream = futures::stream::iter([Ok(batch.clone())]);
+    let stream = Box::pin(MemoryStream::new(vec![batch.clone()]));
 
     let object_store: Arc<DynObjectStore> = Arc::new(object_store::memory::InMemory::default());
-    let storage = ParquetStorage::new(object_store);
+    let storage = ParquetStorage::new(object_store, StorageId::from("iox"));
 
     // Serialising empty data should cause a panic for human investigation.
     let err = storage
@@ -267,10 +268,10 @@ async fn test_decoded_many_columns_with_null_cols_iox_metadata() {
     };
 
     let batch = RecordBatch::try_from_iter(data).unwrap();
-    let stream = futures::stream::iter([Ok(batch.clone())]);
+    let stream = Box::pin(MemoryStream::new(vec![batch.clone()]));
 
     let object_store: Arc<DynObjectStore> = Arc::new(object_store::memory::InMemory::default());
-    let storage = ParquetStorage::new(object_store);
+    let storage = ParquetStorage::new(object_store, StorageId::from("iox"));
 
     let (iox_parquet_meta, file_size) = storage
         .upload(stream, &meta)
@@ -352,10 +353,10 @@ async fn test_derive_parquet_file_params() {
         .as_arrow();
 
     let batch = RecordBatch::try_new(schema, data).unwrap();
-    let stream = futures::stream::iter([Ok(batch.clone())]);
+    let stream = Box::pin(MemoryStream::new(vec![batch.clone()]));
 
     let object_store: Arc<DynObjectStore> = Arc::new(object_store::memory::InMemory::default());
-    let storage = ParquetStorage::new(object_store);
+    let storage = ParquetStorage::new(object_store, StorageId::from("iox"));
 
     let (iox_parquet_meta, file_size) = storage
         .upload(stream, &meta)

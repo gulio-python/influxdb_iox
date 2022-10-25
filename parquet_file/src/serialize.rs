@@ -1,10 +1,13 @@
 //! Streaming [`RecordBatch`] / Parquet file encoder routines.
+//!
+//! [`RecordBatch`]: arrow::record_batch::RecordBatch
 
 use std::{io::Write, sync::Arc};
 
-use arrow::{error::ArrowError, record_batch::RecordBatch};
-use futures::{pin_mut, Stream, StreamExt};
-use observability_deps::tracing::{debug, warn};
+use arrow::error::ArrowError;
+use datafusion::physical_plan::SendableRecordBatchStream;
+use futures::{pin_mut, TryStreamExt};
+use observability_deps::tracing::{debug, trace, warn};
 use parquet::{
     arrow::ArrowWriter,
     basic::Compression,
@@ -19,6 +22,8 @@ use crate::metadata::{IoxMetadata, METADATA_KEY};
 pub const ROW_GROUP_WRITE_SIZE: usize = 1024 * 1024;
 
 /// [`RecordBatch`] to Parquet serialisation errors.
+///
+/// [`RecordBatch`]: arrow::record_batch::RecordBatch
 #[derive(Debug, Error)]
 pub enum CodecError {
     /// The result stream contained no batches.
@@ -29,13 +34,10 @@ pub enum CodecError {
     /// instances yielded by the stream contained 0 rows.
     ///
     /// This would result in an empty file being uploaded to object store.
+    ///
+    /// [`RecordBatch`]: arrow::record_batch::RecordBatch
     #[error("no rows to serialise")]
     NoRows,
-
-    /// The codec could not infer the schema for the stream as the first stream
-    /// item contained an [`ArrowError`].
-    #[error("failed to peek record stream schema")]
-    SchemaPeek,
 
     /// An arrow error during the plan execution.
     #[error(transparent)]
@@ -70,9 +72,6 @@ pub enum CodecError {
 ///
 /// # Errors
 ///
-/// If the stream never yields any [`RecordBatch`], a
-/// [`CodecError::NoRecordBatches`] is returned.
-///
 /// If the stream yields a [`RecordBatch`] containing no rows, a warning is
 /// logged and serialisation continues.
 ///
@@ -81,75 +80,63 @@ pub enum CodecError {
 /// data was serialised.
 ///
 /// [`proto::IoxMetadata`]: generated_types::influxdata::iox::ingester::v1
-/// [`FileMetaData`]: parquet_format::FileMetaData
+/// [`FileMetaData`]: parquet::format::FileMetaData
 /// [`IoxParquetMetaData`]: crate::metadata::IoxParquetMetaData
-pub async fn to_parquet<S, W>(
-    batches: S,
+/// [`RecordBatch`]: arrow::record_batch::RecordBatch
+pub async fn to_parquet<W>(
+    batches: SendableRecordBatchStream,
     meta: &IoxMetadata,
     sink: W,
-) -> Result<parquet_format::FileMetaData, CodecError>
+) -> Result<parquet::format::FileMetaData, CodecError>
 where
-    S: Stream<Item = Result<RecordBatch, ArrowError>> + Send,
     W: Write + Send,
 {
-    let stream = batches.peekable();
-    pin_mut!(stream);
-
-    // Peek into the stream and extract the schema from the first record batch.
-    //
     // The ArrowWriter::write() call will return an error if any subsequent
     // batch does not match this schema, enforcing schema uniformity.
-    let schema = stream
-        .as_mut()
-        .peek()
-        .await
-        .ok_or(CodecError::NoRecordBatches)?
-        .as_ref()
-        .ok()
-        .map(|v| v.schema())
-        .ok_or(CodecError::SchemaPeek)?;
+    let schema = batches.schema();
+
+    let stream = batches;
+    pin_mut!(stream);
 
     // Serialize the IoxMetadata to the protobuf bytes.
     let props = writer_props(meta)?;
+    let write_batch_size = props.write_batch_size();
+    let max_row_group_size = props.max_row_group_size();
 
     // Construct the arrow serializer with the metadata as part of the parquet
     // file properties.
     let mut writer = ArrowWriter::try_new(sink, Arc::clone(&schema), Some(props))?;
 
-    while let Some(maybe_batch) = stream.next().await {
-        let batch = maybe_batch?;
-        if batch.num_rows() == 0 {
-            // It is likely this is a logical error, where the execution plan is
-            // producing no output, and therefore we're wasting CPU time by
-            // running it.
-            //
-            // Unfortunately it is not always possible to identify this before
-            // executing the plan, so this code MUST tolerate empty RecordBatch
-            // and even entire files.
-            warn!("parquet serialisation stream yielded empty record batch");
-        } else {
-            writer.write(&batch)?;
-        }
+    let mut num_batches = 0;
+    while let Some(batch) = stream.try_next().await? {
+        writer.write(&batch)?;
+        num_batches += 1;
     }
 
-    let meta = writer.close().map_err(CodecError::from)?;
-    if meta.num_rows == 0 {
+    let writer_meta = writer.close().map_err(CodecError::from)?;
+    if writer_meta.num_rows == 0 {
+        // throw warning if all input batches are empty
         warn!("parquet serialisation encoded 0 rows");
         return Err(CodecError::NoRows);
     }
 
-    Ok(meta)
+    debug!(num_batches,
+           num_rows=writer_meta.num_rows,
+           object_store_id=?meta.object_store_id,
+           partition_id=?meta.partition_id,
+           write_batch_size,
+           max_row_group_size,
+           "Created parquet file");
+
+    Ok(writer_meta)
 }
 
 /// A helper function that calls [`to_parquet()`], serialising the parquet file
 /// into an in-memory buffer and returning the resulting bytes.
-pub async fn to_parquet_bytes<S>(
-    batches: S,
+pub async fn to_parquet_bytes(
+    batches: SendableRecordBatchStream,
     meta: &IoxMetadata,
-) -> Result<(Vec<u8>, parquet_format::FileMetaData), CodecError>
-where
-    S: Stream<Item = Result<RecordBatch, ArrowError>> + Send,
-{
+) -> Result<(Vec<u8>, parquet::format::FileMetaData), CodecError> {
     let mut bytes = vec![];
 
     let partition_id = meta.partition_id;
@@ -163,7 +150,7 @@ where
     let meta = to_parquet(batches, meta, &mut bytes).await?;
     bytes.shrink_to_fit();
 
-    debug!(?partition_id, ?meta, "generated parquet file metadata");
+    trace!(?partition_id, ?meta, "generated parquet file metadata");
 
     Ok((bytes, meta))
 }
@@ -172,12 +159,10 @@ where
 /// serialising the given [`IoxMetadata`] and embedding it as a key=value
 /// property keyed by [`METADATA_KEY`].
 fn writer_props(meta: &IoxMetadata) -> Result<WriterProperties, prost::EncodeError> {
-    let bytes = meta.to_protobuf()?;
-
     let builder = WriterProperties::builder()
         .set_key_value_metadata(Some(vec![KeyValue {
             key: METADATA_KEY.to_string(),
-            value: Some(base64::encode(&bytes)),
+            value: Some(meta.to_base64()?),
         }]))
         .set_compression(Compression::ZSTD)
         .set_max_row_group_size(ROW_GROUP_WRITE_SIZE);
@@ -189,10 +174,14 @@ fn writer_props(meta: &IoxMetadata) -> Result<WriterProperties, prost::EncodeErr
 mod tests {
     use super::*;
     use crate::metadata::IoxParquetMetaData;
-    use arrow::array::{ArrayRef, StringArray};
+    use arrow::{
+        array::{ArrayRef, StringArray},
+        record_batch::RecordBatch,
+    };
     use bytes::Bytes;
     use data_types::{CompactionLevel, NamespaceId, PartitionId, SequenceNumber, ShardId, TableId};
     use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use datafusion_util::MemoryStream;
     use iox_time::Time;
     use std::sync::Arc;
 
@@ -214,7 +203,7 @@ mod tests {
         };
 
         let batch = RecordBatch::try_from_iter([("a", to_string_array(&["value"]))]).unwrap();
-        let stream = futures::stream::iter([Ok(batch.clone())]);
+        let stream = Box::pin(MemoryStream::new(vec![batch.clone()]));
 
         let (bytes, _file_meta) = to_parquet_bytes(stream, &meta)
             .await

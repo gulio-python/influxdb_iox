@@ -9,20 +9,20 @@ use arrow_flight::{
 use arrow_util::optimize::{optimize_record_batch, optimize_schema};
 use bytes::{Bytes, BytesMut};
 use data_types::{DatabaseName, DatabaseNameError};
-use datafusion::physical_plan::ExecutionPlan;
+use datafusion::{error::DataFusionError, physical_plan::ExecutionPlan};
 use futures::{SinkExt, Stream, StreamExt};
 use generated_types::influxdata::iox::querier::v1 as proto;
 use iox_query::{
     exec::{ExecutionContextProvider, IOxSessionContext},
     QueryCompletedToken, QueryDatabase,
 };
-use observability_deps::tracing::{info, warn};
+use observability_deps::tracing::{debug, info, warn};
 use pin_project::{pin_project, pinned_drop};
 use prost::Message;
 use serde::Deserialize;
-use service_common::{planner::Planner, QueryDatabaseProvider};
+use service_common::{datafusion_error_to_tonic_code, planner::Planner, QueryDatabaseProvider};
 use snafu::{ResultExt, Snafu};
-use std::{fmt::Debug, pin::Pin, sync::Arc, task::Poll};
+use std::{fmt::Debug, pin::Pin, sync::Arc, task::Poll, time::Instant};
 use tokio::task::JoinHandle;
 use tonic::{Request, Response, Streaming};
 use trace::{ctx::SpanContext, span::SpanExt};
@@ -54,7 +54,7 @@ pub enum Error {
     ))]
     Query {
         database_name: String,
-        source: Box<dyn std::error::Error + Send + Sync>,
+        source: DataFusionError,
     },
 
     #[snafu(display("Invalid database name: {}", source))]
@@ -86,34 +86,34 @@ impl From<Error> for tonic::Status {
             | Error::InvalidTicketLegacy { .. }
             | Error::InvalidQuery { .. }
             // TODO(edd): this should be `debug`. Keeping at info whilst IOx still in early development
-            | Error::InvalidDatabaseName { .. } => info!(?err, msg),
-            Error::Query { .. } => info!(?err, msg),
+            | Error::InvalidDatabaseName { .. } => info!(e=%err, msg),
+            Error::Query { .. } => info!(e=%err, msg),
             Error::Optimize { .. }
-            | Error::Planning { .. } | Error::Serialization { .. } => warn!(?err, msg),
+            | Error::Planning { .. } | Error::Serialization { .. } => warn!(e=%err, msg),
         }
-        err.to_status()
+        err.into_status()
     }
 }
 
 impl Error {
-    /// Converts a result from the business logic into the appropriate tonic
-    /// status
-    fn to_status(&self) -> tonic::Status {
-        use tonic::Status;
-        match &self {
-            Self::InvalidTicket { .. } => Status::invalid_argument(self.to_string()),
-            Self::InvalidTicketLegacy { .. } => Status::invalid_argument(self.to_string()),
-            Self::InvalidQuery { .. } => Status::invalid_argument(self.to_string()),
-            Self::DatabaseNotFound { .. } => Status::not_found(self.to_string()),
-            Self::Query { .. } => Status::internal(self.to_string()),
-            Self::InvalidDatabaseName { .. } => Status::invalid_argument(self.to_string()),
-            Self::Planning {
-                source: service_common::planner::Error::External(_),
-            } => Status::internal(self.to_string()),
-            Self::Planning { .. } => Status::invalid_argument(self.to_string()),
-            Self::Optimize { .. } => Status::internal(self.to_string()),
-            Self::Serialization { .. } => Status::internal(self.to_string()),
-        }
+    /// Converts a result from the business logic into the appropriate tonic (gRPC)
+    /// status message to send back to users
+    fn into_status(self) -> tonic::Status {
+        let msg = self.to_string();
+
+        let code = match self {
+            Self::DatabaseNotFound { .. } => tonic::Code::NotFound,
+            Self::InvalidTicket { .. }
+            | Self::InvalidTicketLegacy { .. }
+            | Self::InvalidQuery { .. }
+            | Self::InvalidDatabaseName { .. } => tonic::Code::InvalidArgument,
+            Self::Planning { source, .. } | Self::Query { source, .. } => {
+                datafusion_error_to_tonic_code(&source)
+            }
+            Self::Optimize { .. } | Self::Serialization { .. } => tonic::Code::Internal,
+        };
+
+        tonic::Status::new(code, msg)
     }
 }
 
@@ -163,6 +163,46 @@ where
     FlightServer::new(FlightService { server })
 }
 
+impl<S> FlightService<S>
+where
+    S: QueryDatabaseProvider,
+{
+    async fn run_query(
+        &self,
+        span_ctx: Option<SpanContext>,
+        permit: InstrumentedAsyncOwnedSemaphorePermit,
+        sql_query: String,
+        database_name: String,
+    ) -> Result<Response<TonicStream<FlightData>>, tonic::Status> {
+        let database = DatabaseName::new(&database_name).context(InvalidDatabaseNameSnafu)?;
+
+        let db = self
+            .server
+            .db(&database, span_ctx.child_span("get namespace"))
+            .await
+            .ok_or_else(|| tonic::Status::not_found(format!("Unknown namespace: {database}")))?;
+
+        let ctx = db.new_query_context(span_ctx);
+        let query_completed_token = db.record_query(&ctx, "sql", Box::new(sql_query.clone()));
+
+        let physical_plan = Planner::new(&ctx)
+            .sql(sql_query)
+            .await
+            .context(PlanningSnafu)?;
+
+        let output = GetStream::new(
+            ctx,
+            physical_plan,
+            database_name,
+            query_completed_token,
+            permit,
+        )
+        .await?;
+
+        Ok(Response::new(Box::pin(output) as TonicStream<FlightData>))
+    }
+}
+
 #[tonic::async_trait]
 impl<S> Flight for FlightService<S>
 where
@@ -188,57 +228,44 @@ where
         request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, tonic::Status> {
         let external_span_ctx: Option<RequestLogContext> = request.extensions().get().cloned();
+        let trace = external_span_ctx.format_jaeger();
         let span_ctx: Option<SpanContext> = request.extensions().get().cloned();
         let ticket = request.into_inner();
 
         // decode ticket
-        let read_info = match ReadInfo::decode_protobuf(&ticket.ticket) {
-            Ok(read_info) => read_info,
-            Err(_) => {
-                // try legacy json
-                ReadInfo::decode_json(&ticket.ticket)?
-            }
+        let read_info = ReadInfo::decode_protobuf(&ticket.ticket).or_else(|_e| {
+            // try legacy json
+            ReadInfo::decode_json(&ticket.ticket)
+        });
+
+        if let Err(e) = &read_info {
+            info!(%e, "Error decoding database and SQL query name from flight ticket");
         };
+        let ReadInfo {
+            database_name,
+            sql_query,
+        } = read_info?;
 
         let permit = self
             .server
             .acquire_semaphore(span_ctx.child_span("query rate limit semaphore"))
             .await;
-        info!(
-            db_name=%read_info.database_name,
-            sql_query=%read_info.sql_query,
-            trace=%external_span_ctx.format_jaeger(),
-            "flight do_get",
-        );
 
-        let database =
-            DatabaseName::new(&read_info.database_name).context(InvalidDatabaseNameSnafu)?;
+        // Log after we acquire the permit and are about to start execution
+        let start = Instant::now();
+        info!(db_name=%database_name, %sql_query, %trace, "Running SQL via flight do_get");
 
-        let db = self
-            .server
-            .db(&database, span_ctx.child_span("get namespace"))
-            .await
-            .ok_or_else(|| tonic::Status::not_found(format!("Unknown namespace: {database}")))?;
+        let response = self
+            .run_query(span_ctx, permit, sql_query.clone(), database_name.clone())
+            .await;
 
-        let ctx = db.new_query_context(span_ctx);
-        let query_completed_token =
-            db.record_query(&ctx, "sql", Box::new(read_info.sql_query.clone()));
-
-        let physical_plan = Planner::new(&ctx)
-            .sql(&read_info.sql_query)
-            .await
-            .context(PlanningSnafu)?;
-
-        let output = GetStream::new(
-            ctx,
-            physical_plan,
-            read_info.database_name,
-            query_completed_token,
-            permit,
-        )
-        .await?;
-
-        Ok(Response::new(Box::pin(output) as Self::DoGetStream))
+        if let Err(e) = &response {
+            info!(db_name=%database_name, %sql_query, %trace, %e, "Error running SQL query");
+        } else {
+            let elapsed = Instant::now() - start;
+            debug!(db_name=%database_name,%sql_query,%trace, ?elapsed, "Completed SQL query successfully");
+        }
+        response
     }
 
     async fn handshake(
@@ -334,7 +361,6 @@ impl GetStream {
         let mut stream_record_batches = ctx
             .execute_stream(Arc::clone(&physical_plan))
             .await
-            .map_err(|e| Box::new(e) as _)
             .context(QuerySnafu {
                 database_name: &database_name,
             })?;
@@ -382,7 +408,7 @@ impl GetStream {
                         // failure sending here is OK because we're cutting the stream anyways
                         tx.send(Err(Error::Query {
                             database_name: database_name.clone(),
-                            source: Box::new(e),
+                            source: DataFusionError::ArrowError(e),
                         }
                         .into()))
                             .await

@@ -314,6 +314,32 @@ impl Schema {
         })
     }
 
+    /// Return names of the columns of given indexes with all PK columns (tags and time)
+    /// If the columns are not provided, return all columns
+    pub fn select_given_and_pk_columns(&self, cols: &Option<Vec<usize>>) -> Vec<String> {
+        match cols {
+            Some(cols) => {
+                let mut columns = cols
+                    .iter()
+                    .map(|i| self.field(*i).1.name().to_string())
+                    .collect::<HashSet<_>>();
+
+                // Add missing PK columnns (tags and time) as they are needed for deduplication
+                let pk = self.primary_key();
+                for col in pk {
+                    columns.insert(col.to_string());
+                }
+                let mut columns = columns.into_iter().collect::<Vec<String>>();
+                columns.sort();
+                columns
+            }
+            None => {
+                // Use all table columns
+                self.iter().map(|(_, f)| f.name().to_string()).collect()
+            }
+        }
+    }
+
     /// Returns a DataFusion style "projection" when the selection is
     /// applied to this schema.
     ///
@@ -527,7 +553,7 @@ pub enum InfluxColumnType {
 
     /// Timestamp
     ///
-    /// 64 bit timestamp "UNIX timestamps" representing nanosecods
+    /// 64 bit timestamp "UNIX timestamps" representing nanoseconds
     /// since the UNIX epoch (00:00:00 UTC on 1 January 1970).
     Timestamp,
 }
@@ -1000,8 +1026,11 @@ mod test {
     fn test_sort_fields_by_name_already_sorted() {
         let schema = SchemaBuilder::new()
             .field("field_a", ArrowDataType::Int64)
+            .unwrap()
             .field("field_b", ArrowDataType::Int64)
+            .unwrap()
             .field("field_c", ArrowDataType::Int64)
+            .unwrap()
             .build()
             .unwrap();
 
@@ -1018,8 +1047,11 @@ mod test {
     fn test_sort_fields_by_name() {
         let schema = SchemaBuilder::new()
             .field("field_b", ArrowDataType::Int64)
+            .unwrap()
             .field("field_a", ArrowDataType::Int64)
+            .unwrap()
             .field("field_c", ArrowDataType::Int64)
+            .unwrap()
             .build()
             .unwrap();
 
@@ -1027,8 +1059,11 @@ mod test {
 
         let expected_schema = SchemaBuilder::new()
             .field("field_a", ArrowDataType::Int64)
+            .unwrap()
             .field("field_b", ArrowDataType::Int64)
+            .unwrap()
             .field("field_c", ArrowDataType::Int64)
+            .unwrap()
             .build()
             .unwrap();
 

@@ -1,13 +1,17 @@
 //! Instrumentation for [`DmlSink`] implementations.
 
-use super::DmlSink;
+use std::fmt::Debug;
+
 use async_trait::async_trait;
 use data_types::ShardIndex;
 use dml::DmlOperation;
 use iox_time::{SystemProvider, TimeProvider};
 use metric::{Attributes, DurationHistogram, U64Counter, U64Gauge};
-use std::fmt::Debug;
 use trace::span::{SpanExt, SpanRecorder};
+
+use crate::data::DmlApplyAction;
+
+use super::DmlSink;
 
 /// A [`WatermarkFetcher`] abstracts a source of the write buffer high watermark
 /// (max known offset).
@@ -15,7 +19,7 @@ use trace::span::{SpanExt, SpanRecorder};
 /// # Caching
 ///
 /// Implementations may cache the watermark and return inaccurate values.
-pub trait WatermarkFetcher: Debug + Send + Sync {
+pub(crate) trait WatermarkFetcher: Debug + Send + Sync {
     /// Return a watermark if available.
     fn watermark(&self) -> Option<i64>;
 }
@@ -35,7 +39,7 @@ pub trait WatermarkFetcher: Debug + Send + Sync {
 /// instance is running on, and the routers. If either of these clocks are
 /// incorrect/skewed/drifting the metrics emitted may be incorrect.
 #[derive(Debug)]
-pub struct SinkInstrumentation<F, T, P = SystemProvider> {
+pub(crate) struct SinkInstrumentation<F, T, P = SystemProvider> {
     /// The [`DmlSink`] impl this layer decorates.
     ///
     /// All ops this impl is called with are passed into `inner` for processing.
@@ -76,7 +80,7 @@ where
     /// The current high watermark is read from `watermark_fetcher` and used to
     /// derive some metric values (such as lag). This impl is tolerant of
     /// cached/stale watermark values being returned by `watermark_fetcher`.
-    pub fn new(
+    pub(crate) fn new(
         inner: T,
         watermark_fetcher: F,
         topic_name: String,
@@ -100,10 +104,13 @@ where
                 "Last consumed sequence number (e.g. Kafka offset)",
             )
             .recorder(attr.clone());
-        let write_buffer_sequence_number_lag = metrics.register_metric::<U64Gauge>(
-            "ingester_write_buffer_sequence_number_lag",
-            "The difference between the the last sequence number available (e.g. Kafka offset) and (= minus) last consumed sequence number",
-        ).recorder(attr.clone());
+        let write_buffer_sequence_number_lag = metrics
+            .register_metric::<U64Gauge>(
+                "ingester_write_buffer_sequence_number_lag",
+                "The difference between the the last sequence number available (e.g. Kafka \
+                 offset) and (= minus) last consumed sequence number",
+            )
+            .recorder(attr.clone());
         let write_buffer_last_ingest_ts = metrics
             .register_metric::<U64Gauge>(
                 "ingester_write_buffer_last_ingest_ts",
@@ -150,7 +157,7 @@ where
     T: DmlSink,
     P: TimeProvider,
 {
-    async fn apply(&self, op: DmlOperation) -> Result<bool, crate::data::Error> {
+    async fn apply(&self, op: DmlOperation) -> Result<DmlApplyAction, crate::data::Error> {
         let meta = op.meta();
 
         // Immediately increment the "bytes read" metric as it records the
@@ -240,11 +247,10 @@ mod tests {
     use once_cell::sync::Lazy;
     use trace::{ctx::SpanContext, span::SpanStatus, RingBufferTraceCollector, TraceCollector};
 
+    use super::*;
     use crate::stream_handler::{
         mock_sink::MockDmlSink, mock_watermark_fetcher::MockWatermarkFetcher,
     };
-
-    use super::*;
 
     /// The shard index the [`SinkInstrumentation`] under test is configured to
     /// be observing for.
@@ -288,9 +294,9 @@ mod tests {
     async fn test(
         op: impl Into<DmlOperation> + Send,
         metrics: &metric::Registry,
-        with_sink_return: Result<bool, crate::data::Error>,
+        with_sink_return: Result<DmlApplyAction, crate::data::Error>,
         with_fetcher_return: Option<i64>,
-    ) -> Result<bool, crate::data::Error> {
+    ) -> Result<DmlApplyAction, crate::data::Error> {
         let op = op.into();
         let inner = MockDmlSink::default().with_apply_return([with_sink_return]);
         let instrumentation = SinkInstrumentation::new(
@@ -338,8 +344,8 @@ mod tests {
         );
         let op = make_write(meta);
 
-        let got = test(op, &metrics, Ok(true), Some(12345)).await;
-        assert_matches!(got, Ok(true));
+        let got = test(op, &metrics, Ok(DmlApplyAction::Applied(true)), Some(12345)).await;
+        assert_matches!(got, Ok(DmlApplyAction::Applied(true)));
 
         // Validate the various write buffer metrics
         assert_matches!(
@@ -410,11 +416,13 @@ mod tests {
         let got = test(
             op,
             &metrics,
-            Err(crate::data::Error::TableNotPresent),
+            Err(crate::data::Error::NamespaceNotFound {
+                namespace: "bananas".to_string(),
+            }),
             Some(12345),
         )
         .await;
-        assert_matches!(got, Err(crate::data::Error::TableNotPresent));
+        assert_matches!(got, Err(crate::data::Error::NamespaceNotFound { .. }));
 
         // Validate the various write buffer metrics
         assert_matches!(
@@ -481,8 +489,8 @@ mod tests {
         );
         let op = make_write(meta);
 
-        let got = test(op, &metrics, Ok(true), None).await;
-        assert_matches!(got, Ok(true));
+        let got = test(op, &metrics, Ok(DmlApplyAction::Applied(true)), None).await;
+        assert_matches!(got, Ok(DmlApplyAction::Applied(true)));
 
         // Validate the various write buffer metrics
         assert_matches!(
@@ -550,8 +558,8 @@ mod tests {
         );
         let op = make_write(meta);
 
-        let got = test(op, &metrics, Ok(true), Some(1)).await;
-        assert_matches!(got, Ok(true));
+        let got = test(op, &metrics, Ok(DmlApplyAction::Applied(true)), Some(1)).await;
+        assert_matches!(got, Ok(DmlApplyAction::Applied(true)));
 
         // Validate the various write buffer metrics
         assert_matches!(
@@ -611,7 +619,7 @@ mod tests {
         let meta = DmlMeta::unsequenced(None);
         let op = make_write(meta);
 
-        let _ = test(op, &metrics, Ok(true), Some(12345)).await;
+        let _ = test(op, &metrics, Ok(DmlApplyAction::Applied(true)), Some(12345)).await;
     }
 
     // The instrumentation emits per-shard metrics, so upon observing an op
@@ -633,6 +641,6 @@ mod tests {
         );
         let op = make_write(meta);
 
-        let _ = test(op, &metrics, Ok(true), Some(12345)).await;
+        let _ = test(op, &metrics, Ok(DmlApplyAction::Applied(true)), Some(12345)).await;
     }
 }

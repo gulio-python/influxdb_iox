@@ -12,7 +12,7 @@ use clap_blocks::{
     write_buffer::WriteBufferConfig,
 };
 use data_types::{IngesterMapping, ShardIndex};
-use iox_query::exec::Executor;
+use iox_query::exec::{Executor, ExecutorConfig};
 use iox_time::{SystemProvider, TimeProvider};
 use ioxd_common::{
     server_type::{CommonServerState, CommonServerStateError},
@@ -24,7 +24,8 @@ use ioxd_querier::{create_querier_server_type, QuerierServerTypeArgs};
 use ioxd_router::create_router_server_type;
 use object_store::DynObjectStore;
 use observability_deps::tracing::*;
-use std::{path::PathBuf, sync::Arc};
+use parquet_file::storage::{ParquetStorage, StorageId};
+use std::{collections::HashMap, sync::Arc};
 use thiserror::Error;
 use trace_exporters::TracingConfig;
 use trogging::cli::LoggingConfig;
@@ -148,6 +149,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
     name = "all-in-one",
     about = "Runs in IOx All in One mode, containing router, ingester, compactor and querier."
 )]
+#[group(skip)]
 pub struct Config {
     /// logging options
     #[clap(flatten)]
@@ -159,37 +161,25 @@ pub struct Config {
 
     /// Maximum size of HTTP requests.
     #[clap(
-        long = "--max-http-request-size",
+        long = "max-http-request-size",
         env = "INFLUXDB_IOX_MAX_HTTP_REQUEST_SIZE",
         default_value = "10485760", // 10 MiB
         action,
     )]
     pub max_http_request_size: usize,
 
-    /// The location InfluxDB IOx will use to store files locally. If not specified, will run in
-    /// ephemeral mode.
-    #[clap(long = "--data-dir", env = "INFLUXDB_IOX_DB_DIR", action)]
-    pub database_directory: Option<PathBuf>,
+    #[clap(flatten)]
+    object_store_config: ObjectStoreConfig,
 
-    /// Postgres connection string. If not specified, will use an in-memory catalog.
-    #[clap(long = "--catalog-dsn", env = "INFLUXDB_IOX_CATALOG_DSN", action)]
-    pub dsn: Option<String>,
-
-    /// Schema name for PostgreSQL-based catalogs.
-    #[clap(
-        long = "--catalog-postgres-schema-name",
-        env = "INFLUXDB_IOX_CATALOG_POSTGRES_SCHEMA_NAME",
-        default_value = iox_catalog::postgres::PostgresConnectionOptions::DEFAULT_SCHEMA_NAME,
-        action,
-    )]
-    pub postgres_schema_name: String,
+    #[clap(flatten)]
+    catalog_dsn: CatalogDsnConfig,
 
     /// The ingester will continue to pull data and buffer it from the write buffer
     /// as long as it is below this size. If it hits this size it will pause
     /// ingest from the write buffer until persistence goes below this threshold.
     /// The default value is 100 GB (in bytes).
     #[clap(
-        long = "--pause-ingest-size-bytes",
+        long = "pause-ingest-size-bytes",
         env = "INFLUXDB_IOX_PAUSE_INGEST_SIZE_BYTES",
         default_value = "107374182400",
         action
@@ -202,7 +192,7 @@ pub struct Config {
     /// a steady state is expected to take up this much memory.
     /// The default value is 1 GB (in bytes).
     #[clap(
-        long = "--persist-memory-threshold-bytes",
+        long = "persist-memory-threshold-bytes",
         env = "INFLUXDB_IOX_PERSIST_MEMORY_THRESHOLD_BYTES",
         default_value = "1073741824",
         action
@@ -216,7 +206,7 @@ pub struct Config {
     /// NOTE: This number is related, but *NOT* the same as the size
     /// of the memory used to keep the partition buffered.
     #[clap(
-        long = "--persist-partition-size-threshold-bytes",
+        long = "persist-partition-size-threshold-bytes",
         env = "INFLUXDB_IOX_PERSIST_PARTITION_SIZE_THRESHOLD_BYTES",
         default_value = "314572800",
         action
@@ -228,7 +218,7 @@ pub struct Config {
     /// ingester may need to read in the write buffer on restart or recovery. The default value
     /// is 30 minutes (in seconds).
     #[clap(
-        long = "--persist-partition-age-threshold-seconds",
+        long = "persist-partition-age-threshold-seconds",
         env = "INFLUXDB_IOX_PERSIST_PARTITION_AGE_THRESHOLD_SECONDS",
         default_value = "1800",
         action
@@ -238,7 +228,7 @@ pub struct Config {
     /// If a partition has had data buffered and hasn't received a write for this
     /// period of time, it will be persisted. The default value is 300 seconds (5 minutes).
     #[clap(
-        long = "--persist-partition-cold-threshold-seconds",
+        long = "persist-partition-cold-threshold-seconds",
         env = "INFLUXDB_IOX_PERSIST_PARTITION_COLD_THRESHOLD_SECONDS",
         default_value = "300",
         action
@@ -247,7 +237,7 @@ pub struct Config {
 
     /// The address on which IOx will serve Router HTTP API requests
     #[clap(
-        long = "--router-http-bind",
+        long = "router-http-bind",
         // by default, write API requests go to router
         alias = "api-bind",
         env = "INFLUXDB_IOX_ROUTER_HTTP_BIND_ADDR",
@@ -258,7 +248,7 @@ pub struct Config {
 
     /// The address on which IOx will serve Router gRPC API requests
     #[clap(
-        long = "--router-grpc-bind",
+        long = "router-grpc-bind",
         env = "INFLUXDB_IOX_ROUTER_GRPC_BIND_ADDR",
         default_value = DEFAULT_ROUTER_GRPC_BIND_ADDR,
         action,
@@ -267,7 +257,7 @@ pub struct Config {
 
     /// The address on which IOx will serve Querier gRPC API requests
     #[clap(
-        long = "--querier-grpc-bind",
+        long = "querier-grpc-bind",
         // by default, grpc requests go to querier
         alias = "grpc-bind",
         env = "INFLUXDB_IOX_QUERIER_GRPC_BIND_ADDR",
@@ -278,7 +268,7 @@ pub struct Config {
 
     /// The address on which IOx will serve Router Ingester API requests
     #[clap(
-        long = "--ingester-grpc-bind",
+        long = "ingester-grpc-bind",
         env = "INFLUXDB_IOX_INGESTER_GRPC_BIND_ADDR",
         default_value = DEFAULT_INGESTER_GRPC_BIND_ADDR,
         action,
@@ -287,7 +277,7 @@ pub struct Config {
 
     /// The address on which IOx will serve Router Compactor API requests
     #[clap(
-        long = "--compactor-grpc-bind",
+        long = "compactor-grpc-bind",
         env = "INFLUXDB_IOX_COMPACTOR_GRPC_BIND_ADDR",
         default_value = DEFAULT_COMPACTOR_GRPC_BIND_ADDR,
         action,
@@ -296,7 +286,7 @@ pub struct Config {
 
     /// Size of the querier RAM cache used to store catalog metadata information in bytes.
     #[clap(
-        long = "--querier-ram-pool-metadata-bytes",
+        long = "querier-ram-pool-metadata-bytes",
         env = "INFLUXDB_IOX_QUERIER_RAM_POOL_METADATA_BYTES",
         default_value = "134217728",  // 128MB
         action
@@ -305,7 +295,7 @@ pub struct Config {
 
     /// Size of the querier RAM cache used to store data in bytes.
     #[clap(
-        long = "--querier-ram-pool-data-bytes",
+        long = "querier-ram-pool-data-bytes",
         env = "INFLUXDB_IOX_QUERIER_RAM_POOL_DATA_BYTES",
         default_value = "1073741824",  // 1GB
         action
@@ -314,7 +304,7 @@ pub struct Config {
 
     /// Limit the number of concurrent queries.
     #[clap(
-        long = "--querier-max-concurrent-queries",
+        long = "querier-max-concurrent-queries",
         env = "INFLUXDB_IOX_QUERIER_MAX_CONCURRENT_QUERIES",
         default_value = "10",
         action
@@ -327,7 +317,7 @@ pub struct Config {
     /// in a query, the query will error. This protects against potentially unbounded
     /// memory growth leading to OOMs in certain pathological queries.
     #[clap(
-        long = "--querier-max-table-query-bytes",
+        long = "querier-max-table-query-bytes",
         env = "INFLUXDB_IOX_QUERIER_MAX_TABLE_QUERY_BYTES",
         default_value = "1073741824",  // 1 GB
         action
@@ -342,9 +332,8 @@ impl Config {
             logging_config,
             tracing_config,
             max_http_request_size,
-            database_directory,
-            dsn,
-            postgres_schema_name,
+            object_store_config,
+            catalog_dsn,
             pause_ingest_size_bytes,
             persist_memory_threshold_bytes,
             persist_partition_size_threshold_bytes,
@@ -361,11 +350,22 @@ impl Config {
             querier_max_table_query_bytes,
         } = self;
 
-        let object_store_config = ObjectStoreConfig::new(database_directory.clone());
+        let database_directory = object_store_config.database_directory.clone();
+        // If dir location is provided and no object store type is provided, use it also as file object store.
+        let object_store_config = {
+            if object_store_config.object_store.is_none() && database_directory.is_some() {
+                ObjectStoreConfig::new(database_directory.clone())
+            } else {
+                object_store_config
+            }
+        };
+
         let write_buffer_config = WriteBufferConfig::new(QUERY_POOL_NAME, database_directory);
-        let catalog_dsn = dsn
-            .map(|postgres_url| CatalogDsnConfig::new_postgres(postgres_url, postgres_schema_name))
-            .unwrap_or_else(CatalogDsnConfig::new_memory);
+        let catalog_dsn = if catalog_dsn.dsn.is_none() {
+            CatalogDsnConfig::new_memory()
+        } else {
+            catalog_dsn
+        };
 
         let router_run_config = RunConfig::new(
             logging_config,
@@ -420,13 +420,12 @@ impl Config {
             max_desired_file_size_bytes: 30_000,
             percentage_max_file_size: 30,
             split_percentage: 80,
-            max_cold_concurrent_size_bytes: 90_000,
             max_number_partitions_per_shard: 1,
             min_number_recent_ingested_files_per_partition: 1,
-            cold_input_size_threshold_bytes: 629_145_600,
-            cold_input_file_count_threshold: 100,
             hot_multiple: 4,
             memory_budget_bytes: 300_000,
+            min_num_rows_allocated_per_record_batch_to_datafusion_plan: 100,
+            max_num_compacting_files: 20,
         };
 
         let querier_config = QuerierConfig {
@@ -515,7 +514,16 @@ pub async fn command(config: Config) -> Result<()> {
     // configured by a command line)
     let num_threads = num_cpus::get();
     info!(%num_threads, "Creating shared query executor");
-    let exec = Arc::new(Executor::new(num_threads));
+
+    let parquet_store = ParquetStorage::new(Arc::clone(&object_store), StorageId::from("iox"));
+    let exec = Arc::new(Executor::new_with_config(ExecutorConfig {
+        num_threads,
+        target_query_partitions: num_threads,
+        object_stores: HashMap::from([(
+            parquet_store.id(),
+            Arc::clone(parquet_store.object_store()),
+        )]),
+    }));
 
     info!("starting router");
     let router = create_router_server_type(
@@ -546,7 +554,7 @@ pub async fn command(config: Config) -> Result<()> {
         &common_state,
         Arc::clone(&metrics),
         Arc::clone(&catalog),
-        Arc::clone(&object_store),
+        parquet_store,
         Arc::clone(&exec),
         Arc::clone(&time_provider),
         compactor_config,

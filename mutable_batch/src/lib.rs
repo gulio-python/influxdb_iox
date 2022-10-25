@@ -6,7 +6,9 @@
     clippy::explicit_iter_loop,
     clippy::future_not_send,
     clippy::use_self,
-    clippy::clone_on_ref_ptr
+    clippy::clone_on_ref_ptr,
+    clippy::todo,
+    clippy::dbg_macro
 )]
 
 //! A mutable data structure for a collection of writes.
@@ -23,7 +25,7 @@ use iox_time::Time;
 use schema::selection::Selection;
 use schema::{builder::SchemaBuilder, Schema, TIME_COLUMN_NAME};
 use snafu::{OptionExt, ResultExt, Snafu};
-use std::ops::Range;
+use std::{collections::BTreeSet, ops::Range};
 
 pub mod column;
 pub mod payload;
@@ -133,6 +135,12 @@ impl MutableBatch {
         self.column_names
             .iter()
             .map(move |(name, idx)| (name, &self.columns[*idx]))
+    }
+
+    /// Return the set of column names for this table. Used in combination with a write operation's
+    /// column names to determine whether a write would exceed the max allowed columns.
+    pub fn column_names(&self) -> BTreeSet<&str> {
+        self.column_names.keys().map(|name| name.as_str()).collect()
     }
 
     /// Return the number of rows in this chunk

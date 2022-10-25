@@ -1,7 +1,7 @@
 use crate::scenarios::*;
 use arrow::datatypes::DataType;
 use data_types::{MAX_NANO_TIME, MIN_NANO_TIME};
-use datafusion::logical_plan::{col, lit};
+use datafusion::prelude::{col, lit};
 use iox_query::{
     exec::fieldlist::{Field, FieldList},
     frontend::influxrpc::InfluxRpcPlanner,
@@ -32,7 +32,7 @@ async fn run_field_columns_test_case<D>(
         let planner = InfluxRpcPlanner::new(ctx.child_ctx("planner"));
 
         let plan = planner
-            .field_columns(db.as_query_database(), predicate.clone())
+            .field_columns(db.as_query_database_arc(), predicate.clone())
             .await
             .expect("built plan successfully");
         let fields = ctx
@@ -55,8 +55,6 @@ async fn test_field_columns_no_predicate() {
     let expected_fields = FieldList::default();
     run_field_columns_test_case(TwoMeasurementsManyFields {}, predicate, expected_fields).await;
 }
-
-// NGA todo: add delete tests when the TwoMeasurementsManyFieldsWithDelete available
 
 #[tokio::test]
 async fn test_field_columns_with_pred() {
@@ -202,86 +200,6 @@ async fn test_field_name_plan() {
 }
 
 #[tokio::test]
-async fn test_field_name_plan_with_delete() {
-    test_helpers::maybe_start_logging();
-
-    let predicate = Predicate::default().with_range(0, 2000);
-    let predicate = InfluxRpcPredicate::new(None, predicate);
-
-    let expected_fields = FieldList {
-        fields: vec![
-            Field {
-                name: "field1".into(),
-                data_type: DataType::Float64,
-                last_timestamp: 100,
-            },
-            Field {
-                name: "field2".into(),
-                data_type: DataType::Utf8,
-                last_timestamp: 100,
-            },
-            Field {
-                name: "field3".into(),
-                data_type: DataType::Float64,
-                last_timestamp: 100,
-            },
-        ],
-    };
-
-    run_field_columns_test_case(
-        OneMeasurementManyFieldsWithDelete {},
-        predicate,
-        expected_fields,
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn test_field_name_plan_with_delete_all_time() {
-    test_helpers::maybe_start_logging();
-
-    let predicate = Predicate::default();
-    let predicate = InfluxRpcPredicate::new(None, predicate);
-
-    let expected_fields = FieldList {
-        fields: vec![
-            Field {
-                name: "field1".into(),
-                data_type: DataType::Float64,
-                last_timestamp: 0, // all time queries are optimized but do not return timestamps
-            },
-            Field {
-                name: "field2".into(),
-                data_type: DataType::Utf8,
-                last_timestamp: 0,
-            },
-            Field {
-                name: "field3".into(),
-                data_type: DataType::Float64,
-                last_timestamp: 0,
-            },
-            Field {
-                name: "field4".into(),
-                data_type: DataType::Boolean,
-                last_timestamp: 0,
-            },
-            Field {
-                name: "field5".into(),
-                data_type: DataType::Boolean,
-                last_timestamp: 0,
-            },
-        ],
-    };
-
-    run_field_columns_test_case(
-        OneMeasurementManyFieldsWithDelete {},
-        predicate,
-        expected_fields,
-    )
-    .await;
-}
-
-#[tokio::test]
 async fn list_field_columns_all_time() {
     let predicate = Predicate::default().with_range(MIN_NANO_TIME, MAX_NANO_TIME);
     let predicate = InfluxRpcPredicate::new(None, predicate);
@@ -326,4 +244,27 @@ async fn list_field_columns_max_time_excluded() {
     let expected_fields = FieldList { fields: vec![] };
 
     run_field_columns_test_case(MeasurementWithMaxTime {}, predicate, expected_fields).await;
+}
+
+#[tokio::test]
+async fn list_field_columns_with_periods() {
+    let predicate = Predicate::default().with_range(0, 1700000001000000000);
+    let predicate = InfluxRpcPredicate::new(None, predicate);
+
+    let expected_fields = FieldList {
+        fields: vec![
+            Field {
+                name: "field.one".into(),
+                data_type: DataType::Float64,
+                last_timestamp: 1609459201000000002,
+            },
+            Field {
+                name: "field.two".into(),
+                data_type: DataType::Boolean,
+                last_timestamp: 1609459201000000002,
+            },
+        ],
+    };
+
+    run_field_columns_test_case(PeriodsInNames {}, predicate, expected_fields).await;
 }

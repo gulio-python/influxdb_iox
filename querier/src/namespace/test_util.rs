@@ -4,8 +4,8 @@ use crate::{
 };
 use data_types::{ShardIndex, TableId};
 use iox_catalog::interface::get_schema_by_name;
+use iox_query::exec::ExecutorType;
 use iox_tests::util::TestNamespace;
-use parquet_file::storage::ParquetStorage;
 use sharder::JumpHash;
 use std::sync::Arc;
 use tokio::runtime::Handle;
@@ -24,7 +24,7 @@ pub async fn querier_namespace_with_limit(
     let schema = get_schema_by_name(&ns.namespace.name, repos.as_mut())
         .await
         .unwrap();
-    let cached_ns = Arc::new(CachedNamespace::from(&schema));
+    let cached_ns = Arc::new(CachedNamespace::from(schema));
 
     let catalog_cache = Arc::new(QuerierCatalogCache::new_testing(
         ns.catalog.catalog(),
@@ -34,18 +34,29 @@ pub async fn querier_namespace_with_limit(
         &Handle::current(),
     ));
 
+    // add cached store
+    let parquet_store = catalog_cache.parquet_store();
+    ns.catalog
+        .exec()
+        .new_context(ExecutorType::Query)
+        .inner()
+        .runtime_env()
+        .register_object_store(
+            "iox",
+            parquet_store.id(),
+            Arc::clone(parquet_store.object_store()),
+        );
+
     let sharder = Arc::new(JumpHash::new((0..1).map(ShardIndex::new).map(Arc::new)));
 
     QuerierNamespace::new_testing(
         catalog_cache,
-        ParquetStorage::new(ns.catalog.object_store()),
         ns.catalog.metric_registry(),
         ns.namespace.name.clone().into(),
         cached_ns,
         ns.catalog.exec(),
         Some(create_ingester_connection_for_testing()),
         sharder,
-        Default::default(),
         max_table_query_bytes,
     )
 }

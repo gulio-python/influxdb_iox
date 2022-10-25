@@ -1,14 +1,21 @@
-use super::DmlSink;
-use crate::lifecycle::{LifecycleHandle, LifecycleHandleImpl};
-use data_types::{SequenceNumber, ShardIndex};
+//! A handler of streamed ops from a write buffer.
+
+use std::{fmt::Debug, time::Duration};
+
+use data_types::{SequenceNumber, ShardId, ShardIndex};
 use dml::DmlOperation;
 use futures::{pin_mut, FutureExt, StreamExt};
 use iox_time::{SystemProvider, TimeProvider};
 use metric::{Attributes, DurationCounter, DurationGauge, U64Counter};
 use observability_deps::tracing::*;
-use std::{fmt::Debug, time::Duration};
 use tokio_util::sync::CancellationToken;
 use write_buffer::core::{WriteBufferErrorKind, WriteBufferStreamHandler};
+
+use super::DmlSink;
+use crate::{
+    data::DmlApplyAction,
+    lifecycle::{LifecycleHandle, LifecycleHandleImpl},
+};
 
 /// When the [`LifecycleManager`] indicates that ingest should be paused because
 /// of memory pressure, the shard will loop, sleeping this long between
@@ -30,7 +37,7 @@ const INGEST_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// [`LifecycleManager`]: crate::lifecycle::LifecycleManager
 /// [`LifecycleHandle::can_resume_ingest()`]: crate::lifecycle::LifecycleHandle::can_resume_ingest()
 #[derive(Debug)]
-pub struct SequencedStreamHandler<I, O, T = SystemProvider> {
+pub(crate) struct SequencedStreamHandler<I, O, T = SystemProvider> {
     /// Creator/manager of the stream of DML ops
     write_buffer_stream_handler: I,
 
@@ -66,6 +73,7 @@ pub struct SequencedStreamHandler<I, O, T = SystemProvider> {
     /// Log context fields - otherwise unused.
     topic_name: String,
     shard_index: ShardIndex,
+    shard_id: ShardId,
 
     skip_to_oldest_available: bool,
 }
@@ -78,21 +86,25 @@ impl<I, O> SequencedStreamHandler<I, O> {
     /// `stream` once [`SequencedStreamHandler::run()`] is called, and
     /// gracefully stops when `shutdown` is cancelled.
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    pub(crate) fn new(
         write_buffer_stream_handler: I,
         current_sequence_number: SequenceNumber,
         sink: O,
         lifecycle_handle: LifecycleHandleImpl,
         topic_name: String,
         shard_index: ShardIndex,
+        shard_id: ShardId,
         metrics: &metric::Registry,
         skip_to_oldest_available: bool,
     ) -> Self {
         // TTBR
-        let time_to_be_readable = metrics.register_metric::<DurationGauge>(
-            "ingester_ttbr",
-            "duration of time between producer writing to consumer putting into queryable cache",
-        ).recorder(metric_attrs(shard_index, &topic_name, None, false));
+        let time_to_be_readable = metrics
+            .register_metric::<DurationGauge>(
+                "ingester_ttbr",
+                "Time To Become Readable (TTBR), the time between \
+                a write to a router and becoming readable for query in the ingester",
+            )
+            .recorder(metric_attrs(shard_index, &topic_name, None, false));
 
         // Lifecycle-driven ingest pause duration
         let pause_duration = metrics
@@ -162,6 +174,7 @@ impl<I, O> SequencedStreamHandler<I, O> {
             shard_reset_count,
             topic_name,
             shard_index,
+            shard_id,
             skip_to_oldest_available,
         }
     }
@@ -185,6 +198,7 @@ impl<I, O> SequencedStreamHandler<I, O> {
             shard_reset_count: self.shard_reset_count,
             topic_name: self.topic_name,
             shard_index: self.shard_index,
+            shard_id: self.shard_id,
             skip_to_oldest_available: self.skip_to_oldest_available,
         }
     }
@@ -222,6 +236,7 @@ where
                     info!(
                         kafka_topic=%self.topic_name,
                         shard_index=%self.shard_index,
+                        shard_id=%self.shard_id,
                         "stream handler shutdown",
                     );
                     return;
@@ -262,8 +277,10 @@ where
                             error=%e,
                             kafka_topic=%self.topic_name,
                             shard_index=%self.shard_index,
+                            shard_id=%self.shard_id,
                             potential_data_loss=true,
-                            "reset stream"
+                            "unable to read from desired sequence number offset \
+                                - reset stream to oldest available data"
                         );
                         self.shard_reset_count.inc(1);
                         sequence_number_before_reset = Some(self.current_sequence_number);
@@ -275,8 +292,10 @@ where
                             error=%e,
                             kafka_topic=%self.topic_name,
                             shard_index=%self.shard_index,
+                            shard_id=%self.shard_id,
                             potential_data_loss=true,
-                            "unable to read from desired sequence number offset"
+                            "unable to read from desired sequence number offset \
+                                - aborting ingest due to configuration"
                         );
                         self.shard_unknown_sequence_number_count.inc(1);
                         None
@@ -287,6 +306,7 @@ where
                         error=%e,
                         kafka_topic=%self.topic_name,
                         shard_index=%self.shard_index,
+                        shard_id=%self.shard_id,
                         "I/O error reading from shard"
                     );
                     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -302,6 +322,7 @@ where
                         error=%e,
                         kafka_topic=%self.topic_name,
                         shard_index=%self.shard_index,
+                        shard_id=%self.shard_id,
                         potential_data_loss=true,
                         "unable to deserialize dml operation"
                     );
@@ -324,6 +345,7 @@ something clever.",
                         error=%e,
                         kafka_topic=%self.topic_name,
                         shard_index=%self.shard_index,
+                        shard_id=%self.shard_id,
                         potential_data_loss=true,
                         "unhandled error converting write buffer data to DmlOperation",
                     );
@@ -347,13 +369,16 @@ something clever.",
 
     async fn maybe_apply_op(&mut self, op: Option<DmlOperation>) {
         if let Some(op) = op {
+            let op_sequence_number = op.meta().sequence().map(|s| s.sequence_number);
+
             // Emit per-op debug info.
             trace!(
                 kafka_topic=%self.topic_name,
                 shard_index=%self.shard_index,
+                shard_id=%self.shard_id,
                 op_size=op.size(),
                 op_namespace=op.namespace(),
-                op_sequence_number=?op.meta().sequence().map(|s| s.sequence_number),
+                ?op_sequence_number,
                 "decoded dml operation"
             );
 
@@ -364,20 +389,47 @@ something clever.",
                 op.meta().duration_since_production(&self.time_provider);
 
             let should_pause = match self.sink.apply(op).await {
-                Ok(should_pause) => {
+                Ok(DmlApplyAction::Applied(should_pause)) => {
                     trace!(
                         kafka_topic=%self.topic_name,
                         shard_index=%self.shard_index,
+                        shard_id=%self.shard_id,
                         %should_pause,
+                        ?op_sequence_number,
                         "successfully applied dml operation"
                     );
+                    // we only want to report the TTBR if anything was applied
+                    if let Some(delta) = duration_since_production {
+                        // Update the TTBR metric before potentially sleeping.
+                        self.time_to_be_readable.set(delta);
+                        trace!(
+                            kafka_topic=%self.topic_name,
+                            shard_index=%self.shard_index,
+                            shard_id=%self.shard_id,
+                            delta=%delta.as_millis(),
+                            "reporting TTBR for shard (ms)"
+                        );
+                    }
                     should_pause
+                }
+                Ok(DmlApplyAction::Skipped) => {
+                    trace!(
+                        kafka_topic=%self.topic_name,
+                        shard_index=%self.shard_index,
+                        shard_id=%self.shard_id,
+                        false,
+                        ?op_sequence_number,
+                        "did not apply dml operation (op was already persisted previously)"
+                    );
+                    false
                 }
                 Err(e) => {
                     error!(
                         error=%e,
                         kafka_topic=%self.topic_name,
                         shard_index=%self.shard_index,
+                        shard_id=%self.shard_id,
+                        ?op_sequence_number,
                         potential_data_loss=true,
                         "failed to apply dml operation"
                     );
@@ -385,11 +437,6 @@ something clever.",
                     return;
                 }
             };
-
-            if let Some(delta) = duration_since_production {
-                // Update the TTBR metric before potentially sleeping.
-                self.time_to_be_readable.set(delta);
-            }
 
             if should_pause {
                 // The lifecycle manager may temporarily pause ingest - wait for
@@ -406,6 +453,7 @@ something clever.",
         warn!(
             kafka_topic=%self.topic_name,
             shard_index=%self.shard_index,
+            shard_id=%self.shard_id,
             "pausing ingest until persistence has run"
         );
         while !self.lifecycle_handle.can_resume_ingest() {
@@ -431,6 +479,7 @@ something clever.",
         info!(
             kafka_topic=%self.topic_name,
             shard_index=%self.shard_index,
+            shard_id=%self.shard_id,
             pause_duration=%duration_str,
             "resuming ingest"
         );
@@ -461,11 +510,8 @@ fn metric_attrs(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::{
-        lifecycle::{LifecycleConfig, LifecycleManager},
-        stream_handler::mock_sink::MockDmlSink,
-    };
+    use std::sync::Arc;
+
     use assert_matches::assert_matches;
     use async_trait::async_trait;
     use data_types::{DeletePredicate, Sequence, TimestampRange};
@@ -475,11 +521,16 @@ mod tests {
     use metric::Metric;
     use mutable_batch_lp::lines_to_batches;
     use once_cell::sync::Lazy;
-    use std::sync::Arc;
     use test_helpers::timeout::FutureTimeout;
     use tokio::sync::{mpsc, oneshot};
     use tokio_stream::wrappers::ReceiverStream;
     use write_buffer::core::WriteBufferError;
+
+    use super::*;
+    use crate::{
+        lifecycle::{LifecycleConfig, LifecycleManager},
+        stream_handler::mock_sink::MockDmlSink,
+    };
 
     static TEST_TIME: Lazy<Time> = Lazy::new(|| SystemProvider::default().now());
     static TEST_SHARD_INDEX: ShardIndex = ShardIndex::new(42);
@@ -635,6 +686,7 @@ mod tests {
                         lifecycle.handle(),
                         TEST_TOPIC_NAME.to_string(),
                         TEST_SHARD_INDEX,
+                        ShardId::new(42),
                         &*metrics,
                         $skip_to_oldest_available,
                     ).with_time_provider(iox_time::MockProvider::new(*TEST_TIME));
@@ -736,7 +788,7 @@ mod tests {
         stream_ops = vec![
             vec![Ok(DmlOperation::Write(make_write("bananas", 42)))]
         ],
-        sink_rets = [Ok(true)],
+        sink_rets = [Ok(DmlApplyAction::Applied(true))],
         want_ttbr = 42,
         want_reset = 0,
         want_err_metrics = [],
@@ -752,7 +804,7 @@ mod tests {
         stream_ops = vec![
             vec![Ok(DmlOperation::Delete(make_delete("platanos", 24)))]
         ],
-        sink_rets = [Ok(true)],
+        sink_rets = [Ok(DmlApplyAction::Applied(true))],
         want_ttbr = 24,
         want_reset = 0,
         want_err_metrics = [],
@@ -770,7 +822,7 @@ mod tests {
             Err(WriteBufferError::new(WriteBufferErrorKind::IO, "explosions")),
             Ok(DmlOperation::Write(make_write("bananas", 13)))
         ]],
-        sink_rets = [Ok(true)],
+        sink_rets = [Ok(DmlApplyAction::Applied(true))],
         want_ttbr = 13,
         want_reset = 0,
         want_err_metrics = [
@@ -785,6 +837,7 @@ mod tests {
             assert_eq!(op.namespace(), "bananas");
         }
     );
+
     test_stream_handler!(
         non_fatal_stream_offset_error,
         skip_to_oldest_available = false,
@@ -792,7 +845,7 @@ mod tests {
             Err(WriteBufferError::new(WriteBufferErrorKind::SequenceNumberNoLongerExists, "explosions")),
             Ok(DmlOperation::Write(make_write("bananas", 31)))
         ]],
-        sink_rets = [Ok(true)],
+        sink_rets = [Ok(DmlApplyAction::Applied(true))],
         want_ttbr = 31,
         want_reset = 0,
         want_err_metrics = [
@@ -806,6 +859,7 @@ mod tests {
             assert_eq!(op.namespace(), "bananas");
         }
     );
+
     test_stream_handler!(
         skip_to_oldest_on_unknown_sequence_number,
         skip_to_oldest_available = true,
@@ -820,7 +874,7 @@ mod tests {
             ],
             vec![Ok(DmlOperation::Write(make_write("bananas", 31)))],
         ],
-        sink_rets = [Ok(true)],
+        sink_rets = [Ok(DmlApplyAction::Applied(true))],
         want_ttbr = 31,
         want_reset = 1,
         want_err_metrics = [
@@ -834,6 +888,7 @@ mod tests {
             assert_eq!(op.namespace(), "bananas");
         }
     );
+
     test_stream_handler!(
         non_fatal_stream_invalid_data,
         skip_to_oldest_available = false,
@@ -841,7 +896,7 @@ mod tests {
             Err(WriteBufferError::new(WriteBufferErrorKind::InvalidData, "explosions")),
             Ok(DmlOperation::Write(make_write("bananas", 50)))
         ]],
-        sink_rets = [Ok(true)],
+        sink_rets = [Ok(DmlApplyAction::Applied(true))],
         want_ttbr = 50,
         want_reset = 0,
         want_err_metrics = [
@@ -855,6 +910,7 @@ mod tests {
             assert_eq!(op.namespace(), "bananas");
         }
     );
+
     test_stream_handler!(
         non_fatal_stream_unknown_error,
         skip_to_oldest_available = false,
@@ -862,7 +918,7 @@ mod tests {
             Err(WriteBufferError::new(WriteBufferErrorKind::Unknown, "explosions")),
             Ok(DmlOperation::Write(make_write("bananas", 60)))
         ]],
-        sink_rets = [Ok(true)],
+        sink_rets = [Ok(DmlApplyAction::Applied(true))],
         want_ttbr = 60,
         want_reset = 0,
         want_err_metrics = [
@@ -892,7 +948,7 @@ mod tests {
         want_sink = []
     );
 
-    // Asserts the TTBR is uses the last value in the stream.
+    // Asserts the TTBR used is the last value in the stream.
     test_stream_handler!(
         reports_last_ttbr,
         skip_to_oldest_available = false,
@@ -902,7 +958,7 @@ mod tests {
             Ok(DmlOperation::Write(make_write("bananas", 3))),
             Ok(DmlOperation::Write(make_write("bananas", 42))),
         ]],
-        sink_rets = [Ok(true), Ok(false), Ok(true), Ok(false),],
+        sink_rets = [Ok(DmlApplyAction::Applied(true)), Ok(DmlApplyAction::Applied(false)), Ok(DmlApplyAction::Applied(true)), Ok(DmlApplyAction::Applied(false)),],
         want_ttbr = 42,
         want_reset = 0,
         want_err_metrics = [
@@ -926,8 +982,8 @@ mod tests {
             Ok(DmlOperation::Write(make_write("good_op", 2)))
         ]],
         sink_rets = [
-            Err(crate::data::Error::TableNotPresent),
-            Ok(true),
+            Err(crate::data::Error::NamespaceNotFound{namespace: "bananas".to_string() }),
+            Ok(DmlApplyAction::Applied(true)),
         ],
         want_ttbr = 2,
         want_reset = 0,
@@ -943,6 +999,21 @@ mod tests {
             DmlOperation::Write(op), // Second call succeeds
         ] => {
             assert_eq!(op.namespace(), "good_op");
+        }
+    );
+
+    test_stream_handler!(
+        skipped_op_no_ttbr,
+        skip_to_oldest_available = false,
+        stream_ops = vec![vec![Ok(DmlOperation::Write(make_write("some_op", 1)))]],
+        sink_rets = [Ok(DmlApplyAction::Skipped)],
+        want_ttbr = 0,
+        want_reset = 0,
+        want_err_metrics = [],
+        want_sink = [
+            DmlOperation::Write(op),
+        ] => {
+            assert_eq!(op.namespace(), "some_op");
         }
     );
 
@@ -967,8 +1038,8 @@ mod tests {
     // An abnormal end to the steam causes a panic, rather than a silent stream reader exit.
     #[tokio::test]
     #[should_panic(
-        expected = "shard index ShardIndex(42) stream for topic topic_name ended without \
-                    graceful shutdown"
+        expected = "shard index ShardIndex(42) stream for topic topic_name ended without graceful \
+                    shutdown"
     )]
     async fn test_early_stream_end_panic() {
         let metrics = Arc::new(metric::Registry::default());
@@ -997,6 +1068,7 @@ mod tests {
             lifecycle.handle(),
             "topic_name".to_string(),
             ShardIndex::new(42),
+            ShardId::new(24),
             &*metrics,
             false,
         );
@@ -1044,6 +1116,7 @@ mod tests {
             lifecycle.handle(),
             "topic_name".to_string(),
             ShardIndex::new(42),
+            ShardId::new(24),
             &*metrics,
             false,
         );

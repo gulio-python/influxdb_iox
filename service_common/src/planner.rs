@@ -58,9 +58,9 @@ impl Planner {
         self.ctx
             .run(async move {
                 planner
-                    .table_names(database.as_ref(), predicate)
+                    .table_names(database, predicate)
                     .await
-                    .map_err(|e| Error::Plan(format!("table_names error: {}", e)))
+                    .map_err(|e| e.to_df_error("table_names"))
             })
             .await
     }
@@ -80,9 +80,9 @@ impl Planner {
         self.ctx
             .run(async move {
                 planner
-                    .tag_keys(database.as_ref(), predicate)
+                    .tag_keys(database, predicate)
                     .await
-                    .map_err(|e| Error::Plan(format!("tag_keys error: {}", e)))
+                    .map_err(|e| e.to_df_error("tag_keys"))
             })
             .await
     }
@@ -104,9 +104,9 @@ impl Planner {
         self.ctx
             .run(async move {
                 planner
-                    .tag_values(database.as_ref(), &tag_name, predicate)
+                    .tag_values(database, &tag_name, predicate)
                     .await
-                    .map_err(|e| Error::Plan(format!("tag_values error: {}", e)))
+                    .map_err(|e| e.to_df_error("tag_values"))
             })
             .await
     }
@@ -126,9 +126,9 @@ impl Planner {
         self.ctx
             .run(async move {
                 planner
-                    .field_columns(database.as_ref(), predicate)
+                    .field_columns(database, predicate)
                     .await
-                    .map_err(|e| Error::Plan(format!("field_columns error: {}", e)))
+                    .map_err(|e| e.to_df_error("field_columns"))
             })
             .await
     }
@@ -148,9 +148,9 @@ impl Planner {
         self.ctx
             .run(async move {
                 planner
-                    .read_filter(database.as_ref(), predicate)
+                    .read_filter(database, predicate)
                     .await
-                    .map_err(|e| Error::Plan(format!("read_filter error: {}", e)))
+                    .map_err(|e| e.to_df_error("read_filter"))
             })
             .await
     }
@@ -172,9 +172,9 @@ impl Planner {
         self.ctx
             .run(async move {
                 planner
-                    .read_group(database.as_ref(), predicate, agg, &group_columns)
+                    .read_group(database, predicate, agg, &group_columns)
                     .await
-                    .map_err(|e| Error::Plan(format!("read_group error: {}", e)))
+                    .map_err(|e| e.to_df_error("read_group"))
             })
             .await
     }
@@ -197,9 +197,9 @@ impl Planner {
         self.ctx
             .run(async move {
                 planner
-                    .read_window_aggregate(database.as_ref(), predicate, agg, every, offset)
+                    .read_window_aggregate(database, predicate, agg, every, offset)
                     .await
-                    .map_err(|e| Error::Plan(format!("read_window_aggregate error: {}", e)))
+                    .map_err(|e| e.to_df_error("read_window_aggregate"))
             })
             .await
     }

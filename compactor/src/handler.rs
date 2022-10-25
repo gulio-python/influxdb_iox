@@ -1,16 +1,15 @@
 //! Compactor handler
 
+use crate::{cold, compact::Compactor, hot};
 use async_trait::async_trait;
-use backoff::Backoff;
+use data_types::{PartitionId, SkippedCompaction};
 use futures::{
     future::{BoxFuture, Shared},
-    FutureExt, StreamExt, TryFutureExt,
+    FutureExt, TryFutureExt,
 };
 use iox_query::exec::Executor;
-use metric::Attributes;
 use observability_deps::tracing::*;
 use std::sync::Arc;
-
 use thiserror::Error;
 use tokio::{
     task::{JoinError, JoinHandle},
@@ -18,15 +17,24 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::{compact::Compactor, compact_hot_partitions};
-
 #[derive(Debug, Error)]
 #[allow(missing_copy_implementations, missing_docs)]
 pub enum Error {}
 
-/// The [`CompactorHandler`] does nothing at this point
+/// The [`CompactorHandler`] runs the compactor as a service and handles skipped compactions.
 #[async_trait]
 pub trait CompactorHandler: Send + Sync {
+    /// Return skipped compactions from the catalog
+    async fn skipped_compactions(
+        &self,
+    ) -> Result<Vec<SkippedCompaction>, ListSkippedCompactionsError>;
+
+    /// Delete skipped compactions from the catalog
+    async fn delete_skipped_compactions(
+        &self,
+        partition_id: PartitionId,
+    ) -> Result<Option<SkippedCompaction>, DeleteSkippedCompactionsError>;
+
     /// Wait until the handler finished  to shutdown.
     ///
     /// Use [`shutdown`](Self::shutdown) to trigger a shutdown.
@@ -44,12 +52,11 @@ fn shared_handle(handle: JoinHandle<()>) -> SharedJoinHandle {
     handle.map_err(Arc::new).boxed().shared()
 }
 
-/// Implementation of the `CompactorHandler` trait (that currently does nothing)
+/// Implementation of the `CompactorHandler` trait
 #[derive(Debug)]
 pub struct CompactorHandlerImpl {
-    /// Data to compact
-    #[allow(dead_code)]
-    compactor_data: Arc<Compactor>,
+    /// Management of all data relevant to compaction
+    compactor: Arc<Compactor>,
 
     /// A token that is used to trigger shutdown of the background worker
     shutdown: CancellationToken,
@@ -63,21 +70,19 @@ pub struct CompactorHandlerImpl {
 
 impl CompactorHandlerImpl {
     /// Initialize the Compactor
-    pub fn new(compactor: Compactor) -> Self {
-        let compactor_data = Arc::new(compactor);
-
+    pub fn new(compactor: Arc<Compactor>) -> Self {
         let shutdown = CancellationToken::new();
         let runner_handle = tokio::task::spawn(run_compactor(
-            Arc::clone(&compactor_data),
+            Arc::clone(&compactor),
             shutdown.child_token(),
         ));
         let runner_handle = shared_handle(runner_handle);
-        info!("compactor started with config {:?}", compactor_data.config);
+        info!("compactor started with config {:?}", compactor.config);
 
-        let exec = Arc::clone(&compactor_data.exec);
+        let exec = Arc::clone(&compactor.exec);
 
         Self {
-            compactor_data,
+            compactor,
             shutdown,
             runner_handle,
             exec,
@@ -90,14 +95,14 @@ impl CompactorHandlerImpl {
 pub struct CompactorConfig {
     /// Desired max size of compacted parquet files
     /// It is a target desired value than a guarantee
-    max_desired_file_size_bytes: u64,
+    pub max_desired_file_size_bytes: u64,
 
     /// Percentage of desired max file size.
     /// If the estimated compacted result is too small, no need to split it.
     /// This percentage is to determine how small it is:
     ///    < percentage_max_file_size * max_desired_file_size_bytes:
     /// This value must be between (0, 100)
-    percentage_max_file_size: u16,
+    pub percentage_max_file_size: u16,
 
     /// Split file percentage
     /// If the estimated compacted result is neither too small nor too large, it will be split
@@ -106,126 +111,51 @@ pub struct CompactorConfig {
     ///    . Too large means: > max_desired_file_size_bytes
     ///    . Any size in the middle will be considered neither too small nor too large
     /// This value must be between (0, 100)
-    split_percentage: u16,
-
-    /// The compactor will limit the number of simultaneous cold partition compaction jobs based on
-    /// the size of the input files to be compacted. This number should be less than 1/10th of the
-    /// available memory to ensure compactions have enough space to run.
-    max_cold_concurrent_size_bytes: u64,
+    pub split_percentage: u16,
 
     /// Max number of partitions per shard we want to compact per cycle
-    max_number_partitions_per_shard: usize,
+    pub max_number_partitions_per_shard: usize,
 
     /// Min number of recent ingested files a partition needs to be considered for compacting
-    min_number_recent_ingested_files_per_partition: usize,
-
-    /// A compaction operation for cold partitions will gather as many L0 files with their
-    /// overlapping L1 files to compact together until the total size of input files crosses this
-    /// threshold. Later compactions will pick up the remaining L0 files.
-    cold_input_size_threshold_bytes: u64,
-
-    /// A compaction operation or cold partitions  will gather as many L0 files with their
-    /// overlapping L1 files to compact together until the total number of L0 + L1 files crosses this
-    /// threshold. Later compactions will pick up the remaining L0 files.
-    ///
-    /// A compaction operation will be limited by this or by the input size threshold, whichever is
-    /// hit first.
-    cold_input_file_count_threshold: usize,
+    pub min_number_recent_ingested_files_per_partition: usize,
 
     /// The multiple of times that compacting hot partitions should run for every one time that
     /// compacting cold partitions runs. Set to 1 to compact hot partitions and cold partitions
     /// equally.
-    hot_multiple: usize,
+    pub hot_multiple: usize,
 
-    /// The memory budget asigned to this compactor.
-    /// For each partition candidate, we will esimate the memory needed to compact each file
+    /// The memory budget assigned to this compactor.
+    ///
+    /// For each partition candidate, we will estimate the memory needed to compact each file
     /// and only add more files if their needed estimated memory is below this memory budget.
     /// Since we must compact L1 files that overlapped with L0 files, if their total estimated
-    /// memory do not allow us to compact a part of a partition at all, we will not compact
+    /// memory does not allow us to compact a part of a partition at all, we will not compact
     /// it and will log the partition and its related information in a table in our catalog for
     /// further diagnosis of the issue.
-    /// How many candidates compacted concurrently are also decided using this estimation and
-    /// budget.
-    memory_budget_bytes: u64,
-}
-
-impl CompactorConfig {
-    /// Initialize a valid config
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        max_desired_file_size_bytes: u64,
-        percentage_max_file_size: u16,
-        split_percentage: u16,
-        max_cold_concurrent_size_bytes: u64,
-        max_number_partitions_per_shard: usize,
-        min_number_recent_ingested_files_per_partition: usize,
-        cold_input_size_threshold_bytes: u64,
-        cold_input_file_count_threshold: usize,
-        hot_multiple: usize,
-        memory_budget_bytes: u64,
-    ) -> Self {
-        assert!(split_percentage > 0 && split_percentage <= 100);
-
-        Self {
-            max_desired_file_size_bytes,
-            percentage_max_file_size,
-            split_percentage,
-            max_cold_concurrent_size_bytes,
-            max_number_partitions_per_shard,
-            min_number_recent_ingested_files_per_partition,
-            cold_input_size_threshold_bytes,
-            cold_input_file_count_threshold,
-            memory_budget_bytes,
-            hot_multiple,
-        }
-    }
-
-    /// Desired max file of a compacted file
-    pub fn max_desired_file_size_bytes(&self) -> u64 {
-        self.max_desired_file_size_bytes
-    }
-
-    /// Percentage of desired max file size to determine a size is too small
-    pub fn percentage_max_file_size(&self) -> u16 {
-        self.percentage_max_file_size
-    }
-
-    /// Percentage of least recent data we want to split to reduce compacting non-overlapped data
-    pub fn split_percentage(&self) -> u16 {
-        self.split_percentage
-    }
-
-    /// Max number of partitions per shard we want to compact per cycle
-    pub fn max_number_partitions_per_shard(&self) -> usize {
-        self.max_number_partitions_per_shard
-    }
-
-    /// Min number of recent ingested files a partition needs to be considered for compacting
-    pub fn min_number_recent_ingested_files_per_partition(&self) -> usize {
-        self.min_number_recent_ingested_files_per_partition
-    }
-
-    /// A compaction operation for cold partitions will gather as many L0 files with their
-    /// overlapping L1 files to compact together until the total size of input files crosses this
-    /// threshold. Later compactions will pick up the remaining L0 files.
-    pub fn cold_input_size_threshold_bytes(&self) -> u64 {
-        self.cold_input_size_threshold_bytes
-    }
-
-    /// A compaction operation for cold partitions will gather as many L0 files with their overlapping L1 files to
-    /// compact together until the total number of L0 + L1 files crosses this threshold. Later
-    /// compactions will pick up the remaining L0 files.
     ///
-    /// A compaction operation will be limited by this or by the input size threshold, whichever is
-    /// hit first.
-    pub fn cold_input_file_count_threshold(&self) -> usize {
-        self.cold_input_file_count_threshold
-    }
+    /// The number of candidates compacted concurrently is also decided using this estimation and
+    /// budget.
+    pub memory_budget_bytes: u64,
 
-    /// Memory budget this compactor should not exceed
-    pub fn memory_budget_bytes(&self) -> u64 {
-        self.memory_budget_bytes
-    }
+    /// Minimum number of rows allocated for each record batch fed into DataFusion plan
+    ///
+    /// We will use:
+    ///
+    /// ```text
+    /// max(
+    ///     parquet_file's row_count,
+    ///     min_num_rows_allocated_per_record_batch_to_datafusion_plan
+    /// )
+    /// ```
+    ///
+    /// to estimate number of rows allocated for each record batch fed into DataFusion plan.
+    pub min_num_rows_allocated_per_record_batch_to_datafusion_plan: u64,
+
+    /// Max number of files to compact per partition
+    ///
+    /// Due to limit in fan-in of datafusion plan, we need to limit the number of files to compact
+    /// per partition.
+    pub max_num_compacting_files: usize,
 }
 
 /// How long to pause before checking for more work again if there was
@@ -255,15 +185,15 @@ pub async fn run_compactor_once(compactor: Arc<Compactor>) {
     let mut compacted_partitions = 0;
     for i in 0..num_hot_cycles {
         debug!(?i, "start hot cycle");
-        compacted_partitions +=
-            compact_hot_partitions::compact_hot_partitions(Arc::clone(&compactor)).await;
+        compacted_partitions += hot::compact(Arc::clone(&compactor)).await;
         if compacted_partitions == 0 {
-            // Not found hot candidates, should move to compact cold partitions
+            // No hot candidates, should move to compact cold partitions
             break;
         }
     }
+
     debug!("start cold cycle");
-    compacted_partitions += compact_cold_partitions(Arc::clone(&compactor)).await;
+    compacted_partitions += cold::compact(Arc::clone(&compactor), true).await;
 
     if compacted_partitions == 0 {
         // sleep for a second to avoid a busy loop when the catalog is polled
@@ -276,121 +206,49 @@ pub async fn run_compactor_once(compactor: Arc<Compactor>) {
     );
 }
 
-async fn compact_cold_partitions(compactor: Arc<Compactor>) -> usize {
-    let cold_attributes = Attributes::from(&[("partition_type", "cold")]);
-    // Select cold partition candidates
-    let start_time = compactor.time_provider.now();
-    let candidates = Backoff::new(&compactor.backoff_config)
-        .retry_all_errors("cold_partitions_to_compact", || async {
-            compactor
-                .cold_partitions_to_compact(compactor.config.max_number_partitions_per_shard())
-                .await
-        })
-        .await
-        .expect("retry forever");
-    if let Some(delta) = compactor
-        .time_provider
-        .now()
-        .checked_duration_since(start_time)
-    {
-        let duration = compactor
-            .candidate_selection_duration
-            .recorder(cold_attributes.clone());
-        duration.record(delta);
-    }
+#[derive(Debug, Error)]
+#[allow(missing_copy_implementations, missing_docs)]
+pub enum ListSkippedCompactionsError {
+    #[error(transparent)]
+    SkippedCompactionLookup(iox_catalog::interface::Error),
+}
 
-    // Add other compaction-needed info into selected partitions
-    let start_time = compactor.time_provider.now();
-    let candidates = Backoff::new(&compactor.backoff_config)
-        .retry_all_errors("add_info_to_partitions", || async {
-            compactor.add_info_to_partitions(&candidates).await
-        })
-        .await
-        .expect("retry forever");
-    if let Some(delta) = compactor
-        .time_provider
-        .now()
-        .checked_duration_since(start_time)
-    {
-        let duration = compactor
-            .partitions_extra_info_reading_duration
-            .recorder(cold_attributes.clone());
-        duration.record(delta);
-    }
-
-    let n_candidates = candidates.len();
-    if n_candidates == 0 {
-        debug!("no cold compaction candidates found");
-        return 0;
-    } else {
-        debug!(n_candidates, "found cold compaction candidates");
-    }
-
-    let start_time = compactor.time_provider.now();
-
-    // Repeat compacting n cold partitions in parallel until all candidates are compacted.
-    // Concurrency level calculation (this is estimated from previous experiments. The actual
-    // resource management will be more complicated and a future feature):
-    //
-    //   . Each `compact partititon` takes max of this much memory cold_input_size_threshold_bytes
-    //   . We have this memory budget: max_cold_concurrent_size_bytes
-    // --> num_parallel_partitions = max_cold_concurrent_size_bytes/
-    //     cold_input_size_threshold_bytes
-    let num_parallel_partitions = (compactor.config.max_cold_concurrent_size_bytes
-        / compactor.config.cold_input_size_threshold_bytes)
-        as usize;
-
-    futures::stream::iter(candidates)
-        .map(|p| {
-            // run compaction in its own task
-            let comp = Arc::clone(&compactor);
-            tokio::task::spawn(async move {
-                let partition_id = p.candidate.partition_id;
-                let compaction_result = crate::compact_cold_partition(&comp, p).await;
-
-                match compaction_result {
-                    Err(e) => {
-                        warn!(?e, ?partition_id, "cold compaction failed");
-                    }
-                    Ok(_) => {
-                        debug!(?partition_id, "cold compaction complete");
-                    }
-                };
-            })
-        })
-        // Assume we have enough resources to run
-        // num_parallel_partitions compactions in parallel
-        .buffer_unordered(num_parallel_partitions)
-        // report any JoinErrors (aka task panics)
-        .map(|join_result| {
-            if let Err(e) = join_result {
-                warn!(?e, "cold compaction task failed");
-            }
-            Ok(())
-        })
-        // Errors are reported during execution, so ignore results here
-        // https://stackoverflow.com/questions/64443085/how-to-run-stream-to-completion-in-rust-using-combinators-other-than-for-each
-        .forward(futures::sink::drain())
-        .await
-        .ok();
-
-    // Done compacting all candidates in the cycle, record its time
-    if let Some(delta) = compactor
-        .time_provider
-        .now()
-        .checked_duration_since(start_time)
-    {
-        let duration = compactor
-            .compaction_cycle_duration
-            .recorder(cold_attributes);
-        duration.record(delta);
-    }
-
-    n_candidates
+#[derive(Debug, Error)]
+#[allow(missing_copy_implementations, missing_docs)]
+pub enum DeleteSkippedCompactionsError {
+    #[error(transparent)]
+    SkippedCompactionDelete(iox_catalog::interface::Error),
 }
 
 #[async_trait]
 impl CompactorHandler for CompactorHandlerImpl {
+    async fn skipped_compactions(
+        &self,
+    ) -> Result<Vec<SkippedCompaction>, ListSkippedCompactionsError> {
+        self.compactor
+            .catalog
+            .repositories()
+            .await
+            .partitions()
+            .list_skipped_compactions()
+            .await
+            .map_err(ListSkippedCompactionsError::SkippedCompactionLookup)
+    }
+
+    async fn delete_skipped_compactions(
+        &self,
+        partition_id: PartitionId,
+    ) -> Result<Option<SkippedCompaction>, DeleteSkippedCompactionsError> {
+        self.compactor
+            .catalog
+            .repositories()
+            .await
+            .partitions()
+            .delete_skipped_compactions(partition_id)
+            .await
+            .map_err(DeleteSkippedCompactionsError::SkippedCompactionDelete)
+    }
+
     async fn join(&self) {
         self.runner_handle
             .clone()
@@ -411,5 +269,88 @@ impl Drop for CompactorHandlerImpl {
             warn!("CompactorHandlerImpl dropped without calling shutdown()");
             self.shutdown.cancel();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tests::{test_setup_with_default_budget, TestSetup};
+
+    #[tokio::test]
+    async fn list_skipped_compactions() {
+        let TestSetup {
+            compactor,
+            table,
+            shard,
+            ..
+        } = test_setup_with_default_budget().await;
+
+        let compactor_handler = CompactorHandlerImpl::new(Arc::clone(&compactor));
+
+        // no skipped compactions
+        let skipped_compactions = compactor_handler.skipped_compactions().await.unwrap();
+        assert!(
+            skipped_compactions.is_empty(),
+            "Expected no compactions, got {skipped_compactions:?}"
+        );
+
+        // insert a partition and a skipped compaction
+        let partition = table.with_shard(&shard).create_partition("one").await;
+        {
+            let mut repos = compactor.catalog.repositories().await;
+            repos
+                .partitions()
+                .record_skipped_compaction(partition.partition.id, "Not today", 3, 2, 100_000, 100)
+                .await
+                .unwrap()
+        }
+
+        let skipped_compactions = compactor_handler.skipped_compactions().await.unwrap();
+        assert_eq!(skipped_compactions.len(), 1);
+        assert_eq!(skipped_compactions[0].partition_id, partition.partition.id);
+    }
+
+    #[tokio::test]
+    async fn delete_skipped_compactions() {
+        let TestSetup {
+            compactor,
+            table,
+            shard,
+            ..
+        } = test_setup_with_default_budget().await;
+
+        let compactor_handler = CompactorHandlerImpl::new(Arc::clone(&compactor));
+
+        // no skipped compactions to delete
+        let partition_id_that_does_not_exist = PartitionId::new(0);
+        let deleted_skipped_compaction = compactor_handler
+            .delete_skipped_compactions(partition_id_that_does_not_exist)
+            .await
+            .unwrap();
+
+        assert!(deleted_skipped_compaction.is_none());
+
+        // insert a partition and a skipped compaction
+        let partition = table.with_shard(&shard).create_partition("one").await;
+        {
+            let mut repos = compactor.catalog.repositories().await;
+            repos
+                .partitions()
+                .record_skipped_compaction(partition.partition.id, "Not today", 3, 2, 100_000, 100)
+                .await
+                .unwrap();
+        }
+
+        let deleted_skipped_compaction = compactor_handler
+            .delete_skipped_compactions(partition.partition.id)
+            .await
+            .unwrap()
+            .expect("Should have deleted one skipped compaction");
+
+        assert_eq!(
+            deleted_skipped_compaction.partition_id,
+            partition.partition.id,
+        );
     }
 }

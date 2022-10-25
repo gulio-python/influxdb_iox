@@ -5,11 +5,13 @@ use self::{
 use crate::{cache::CatalogCache, chunk::util::create_basic_summary};
 use arrow::{datatypes::DataType, error::ArrowError, record_batch::RecordBatch};
 use async_trait::async_trait;
+use backoff::{Backoff, BackoffConfig, BackoffError};
 use client_util::connection;
 use data_types::{
     ChunkId, ChunkOrder, IngesterMapping, PartitionId, SequenceNumber, ShardId, ShardIndex,
     TableSummary, TimestampMinMax,
 };
+use datafusion::error::DataFusionError;
 use datafusion_util::MemoryStream;
 use futures::{stream::FuturesUnordered, TryStreamExt};
 use generated_types::{
@@ -23,11 +25,11 @@ use influxdb_iox_client::flight::{
 use iox_query::{
     exec::{stringset::StringSet, IOxSessionContext},
     util::compute_timenanosecond_min_max,
-    QueryChunk, QueryChunkError, QueryChunkMeta,
+    QueryChunk, QueryChunkMeta,
 };
 use iox_time::{Time, TimeProvider};
 use metric::{DurationHistogram, Metric};
-use observability_deps::tracing::{debug, info, trace, warn};
+use observability_deps::tracing::{debug, trace, warn};
 use predicate::Predicate;
 use schema::{selection::Selection, sort::SortKey, Schema};
 use snafu::{ensure, OptionExt, ResultExt, Snafu};
@@ -35,6 +37,7 @@ use std::{
     any::Any,
     collections::{HashMap, HashSet},
     sync::Arc,
+    time::Duration,
 };
 use trace::span::{Span, SpanRecorder};
 
@@ -143,6 +146,12 @@ pub fn create_ingester_connections_by_shard(
     Arc::new(IngesterConnectionImpl::by_shard(
         shard_to_ingesters,
         catalog_cache,
+        BackoffConfig {
+            init_backoff: Duration::from_millis(100),
+            max_backoff: Duration::from_secs(1),
+            base: 3.0,
+            deadline: Some(Duration::from_secs(10)),
+        },
     ))
 }
 
@@ -172,11 +181,11 @@ pub trait IngesterConnection: std::fmt::Debug + Send + Sync + 'static {
         span: Option<Span>,
     ) -> Result<Vec<IngesterPartition>>;
 
-    /// Returns the most recent partition sstatus info across all ingester(s) for the specified
+    /// Returns the most recent partition status info across all ingester(s) for the specified
     /// write token.
     async fn get_write_info(&self, write_token: &str) -> Result<GetWriteInfoResponse>;
 
-    /// Return backend as [`Any`] which can be used to downcast to a specifc implementation.
+    /// Return backend as [`Any`] which can be used to downcast to a specific implementation.
     fn as_any(&self) -> &dyn Any;
 }
 
@@ -211,12 +220,20 @@ impl IngesterConnectionMetrics {
     }
 }
 
+/// Information about an OK/success ingester request.
+#[derive(Debug, Default)]
+struct IngesterResponseOk {
+    n_partitions: usize,
+    n_chunks: usize,
+    n_rows: usize,
+}
+
 /// Helper to observe a single ingester request.
 ///
 /// Use [`set_ok`](Self::set_ok) or [`set_err`](Self::set_err) if an ingester result was observered. Otherwise the
 /// request will count as "cancelled".
 struct ObserveIngesterRequest<'a> {
-    res: Option<Result<(), ()>>,
+    res: Option<Result<IngesterResponseOk, ()>>,
     t_start: Time,
     time_provider: Arc<dyn TimeProvider>,
     metrics: Arc<IngesterConnectionMetrics>,
@@ -248,8 +265,8 @@ impl<'a> ObserveIngesterRequest<'a> {
         &self.span_recorder
     }
 
-    fn set_ok(mut self) {
-        self.res = Some(Ok(()));
+    fn set_ok(mut self, ok_status: IngesterResponseOk) {
+        self.res = Some(Ok(ok_status));
         self.span_recorder.ok("done");
     }
 
@@ -264,18 +281,25 @@ impl<'a> Drop for ObserveIngesterRequest<'a> {
         let t_end = self.time_provider.now();
 
         if let Some(ingester_duration) = t_end.checked_duration_since(self.t_start) {
-            let (metric, status) = match self.res {
-                None => (&self.metrics.ingester_duration_cancelled, "cancelled"),
-                Some(Ok(())) => (&self.metrics.ingester_duration_success, "success"),
-                Some(Err(())) => (&self.metrics.ingester_duration_error, "error"),
+            let (metric, status, ok_status) = match self.res {
+                None => (&self.metrics.ingester_duration_cancelled, "cancelled", None),
+                Some(Ok(ref ok_status)) => (
+                    &self.metrics.ingester_duration_success,
+                    "success",
+                    Some(ok_status),
+                ),
+                Some(Err(())) => (&self.metrics.ingester_duration_error, "error", None),
             };
 
             metric.record(ingester_duration);
 
-            info!(
+            debug!(
                 predicate=?self.request.predicate,
                 namespace=%self.request.namespace_name,
                 table_name=%self.request.table_name,
+                n_partitions=?ok_status.map(|s| s.n_partitions),
+                n_chunks=?ok_status.map(|s| s.n_chunks),
+                n_rows=?ok_status.map(|s| s.n_rows),
                 ?ingester_duration,
                 status,
                 "Time spent in ingester"
@@ -292,6 +316,7 @@ pub struct IngesterConnectionImpl {
     flight_client: Arc<dyn FlightClient>,
     catalog_cache: Arc<CatalogCache>,
     metrics: Arc<IngesterConnectionMetrics>,
+    backoff_config: BackoffConfig,
 }
 
 impl IngesterConnectionImpl {
@@ -313,11 +338,13 @@ impl IngesterConnectionImpl {
     pub fn by_shard(
         shard_to_ingesters: HashMap<ShardIndex, IngesterMapping>,
         catalog_cache: Arc<CatalogCache>,
+        backoff_config: BackoffConfig,
     ) -> Self {
         Self::by_shard_with_flight_client(
             shard_to_ingesters,
             Arc::new(FlightClientImpl::new()),
             catalog_cache,
+            backoff_config,
         )
     }
 
@@ -329,6 +356,7 @@ impl IngesterConnectionImpl {
         shard_to_ingesters: HashMap<ShardIndex, IngesterMapping>,
         flight_client: Arc<dyn FlightClient>,
         catalog_cache: Arc<CatalogCache>,
+        backoff_config: BackoffConfig,
     ) -> Self {
         let unique_ingester_addresses: HashSet<_> = shard_to_ingesters
             .values()
@@ -348,6 +376,7 @@ impl IngesterConnectionImpl {
             flight_client,
             catalog_cache,
             metrics,
+            backoff_config,
         }
     }
 }
@@ -389,7 +418,11 @@ async fn execute(
     };
 
     let query_res = flight_client
-        .query(Arc::clone(&ingester_address), ingester_query_request)
+        .query(
+            Arc::clone(&ingester_address),
+            ingester_query_request,
+            span_recorder.span().map(|span| span.ctx.clone()),
+        )
         .await;
 
     if let Err(FlightClientError::Flight {
@@ -584,9 +617,7 @@ impl IngesterStreamDecoder {
                     partition_id,
                     shard_id,
                     status.parquet_max_sequence_number.map(SequenceNumber::new),
-                    status
-                        .tombstone_max_sequence_number
-                        .map(SequenceNumber::new),
+                    None,
                     partition_sort_key,
                 );
                 self.current_partition = Some(partition);
@@ -683,28 +714,52 @@ impl IngesterConnection for IngesterConnectionImpl {
 
         let metrics = Arc::clone(&self.metrics);
 
-        let measured_ingester_request = |ingester_address| {
+        let measured_ingester_request = |ingester_address: Arc<str>| {
+            let metrics = Arc::clone(&metrics);
             let request = GetPartitionForIngester {
                 flight_client: Arc::clone(&self.flight_client),
                 catalog_cache: Arc::clone(&self.catalog_cache),
-                ingester_address,
+                ingester_address: Arc::clone(&ingester_address),
                 namespace_name: Arc::clone(&namespace_name),
                 table_name: Arc::clone(&table_name),
                 columns: columns.clone(),
                 predicate,
                 expected_schema: Arc::clone(&expected_schema),
             };
-            let metrics = Arc::clone(&metrics);
+
+            let backoff_config = self.backoff_config.clone();
 
             // wrap `execute` into an additional future so that we can measure the request time
             // INFO: create the measurement structure outside of the async block so cancellation is
             // always measured
             let measure_me = ObserveIngesterRequest::new(request.clone(), metrics, &span_recorder);
             async move {
-                let res = execute(request.clone(), measure_me.span_recorder()).await;
+                let span_recorder = measure_me
+                    .span_recorder()
+                    .child("ingester request (retry block)");
+
+                let res = Backoff::new(&backoff_config)
+                    .retry_all_errors("ingester request", move || {
+                        let request = request.clone();
+                        let span_recorder = span_recorder.child("ingester request (single try)");
+
+                        async move { execute(request, &span_recorder).await }
+                    })
+                    .await;
 
                 match &res {
-                    Ok(_) => measure_me.set_ok(),
+                    Ok(partitions) => {
+                        let mut status = IngesterResponseOk::default();
+                        for p in partitions {
+                            status.n_partitions += 1;
+                            for c in p.chunks() {
+                                status.n_chunks += 1;
+                                status.n_rows += c.rows();
+                            }
+                        }
+
+                        measure_me.set_ok(status);
+                    }
                     Err(_) => measure_me.set_err(),
                 }
 
@@ -748,7 +803,9 @@ impl IngesterConnection for IngesterConnectionImpl {
             .await
             .map_err(|e| {
                 span_recorder.error("failed");
-                e
+                match e {
+                    BackoffError::DeadlineExceeded { source, .. } => source,
+                }
             })?
             // We have a Vec<Vec<..>> flatten to Vec<_>
             .into_iter()
@@ -1006,8 +1063,8 @@ impl QueryChunkMeta for IngesterChunk {
         self.partition_sort_key.as_ref().as_ref()
     }
 
-    fn partition_id(&self) -> Option<PartitionId> {
-        Some(self.partition_id)
+    fn partition_id(&self) -> PartitionId {
+        self.partition_id
     }
 
     fn sort_key(&self) -> Option<&SortKey> {
@@ -1034,9 +1091,8 @@ impl QueryChunk for IngesterChunk {
     }
 
     fn may_contain_pk_duplicates(&self) -> bool {
-        // ingester runs dedup before creating the record batches so
-        // when the querier gets them they have no duplicates
-        false
+        // ingester just dumps data, may contain duplicates!
+        true
     }
 
     fn column_names(
@@ -1044,7 +1100,7 @@ impl QueryChunk for IngesterChunk {
         _ctx: IOxSessionContext,
         _predicate: &Predicate,
         _columns: Selection<'_>,
-    ) -> Result<Option<StringSet>, QueryChunkError> {
+    ) -> Result<Option<StringSet>, DataFusionError> {
         // TODO maybe some special handling?
         Ok(None)
     }
@@ -1054,7 +1110,7 @@ impl QueryChunk for IngesterChunk {
         _ctx: IOxSessionContext,
         _column_name: &str,
         _predicate: &Predicate,
-    ) -> Result<Option<StringSet>, QueryChunkError> {
+    ) -> Result<Option<StringSet>, DataFusionError> {
         // TODO maybe some special handling?
         Ok(None)
     }
@@ -1064,11 +1120,15 @@ impl QueryChunk for IngesterChunk {
         _ctx: IOxSessionContext,
         predicate: &Predicate,
         selection: Selection<'_>,
-    ) -> Result<datafusion::physical_plan::SendableRecordBatchStream, QueryChunkError> {
+    ) -> Result<datafusion::physical_plan::SendableRecordBatchStream, DataFusionError> {
         trace!(?predicate, ?selection, input_batches=?self.batches, "Reading data");
 
         // Apply selection to in-memory batch
-        let batches = match self.schema.df_projection(selection)? {
+        let batches = match self
+            .schema
+            .df_projection(selection)
+            .map_err(|e| DataFusionError::External(Box::new(e)))?
+        {
             None => self.batches.clone(),
             Some(projection) => self
                 .batches
@@ -1168,10 +1228,13 @@ mod tests {
     use metric::Attributes;
     use mutable_batch_lp::test_helpers::lp_to_mutable_batch;
     use schema::{builder::SchemaBuilder, InfluxFieldType};
-    use std::collections::{BTreeSet, HashMap};
+    use std::{
+        collections::{BTreeSet, HashMap},
+        time::Duration,
+    };
     use test_helpers::assert_error;
     use tokio::{runtime::Handle, sync::Mutex};
-    use trace::{span::SpanStatus, RingBufferTraceCollector};
+    use trace::{ctx::SpanContext, span::SpanStatus, RingBufferTraceCollector};
 
     #[tokio::test]
     async fn test_flight_handshake_error() {
@@ -1217,7 +1280,8 @@ mod tests {
             )])
             .await,
         );
-        let ingester_conn = mock_flight_client.ingester_conn().await;
+        let mut ingester_conn = mock_flight_client.ingester_conn().await;
+        ingester_conn.backoff_config = BackoffConfig::default();
         let partitions = get_partitions(&ingester_conn, &[1]).await.unwrap();
         assert!(partitions.is_empty());
     }
@@ -1276,7 +1340,6 @@ mod tests {
                             partition_id: 1,
                             status: Some(PartitionStatus {
                                 parquet_max_sequence_number: None,
-                                tombstone_max_sequence_number: None,
                             }),
                         },
                     ))],
@@ -1332,7 +1395,6 @@ mod tests {
                                 partition_id: 1,
                                 status: Some(PartitionStatus {
                                     parquet_max_sequence_number: None,
-                                    tombstone_max_sequence_number: None,
                                 }),
                             },
                         )),
@@ -1342,7 +1404,6 @@ mod tests {
                                 partition_id: 2,
                                 status: Some(PartitionStatus {
                                     parquet_max_sequence_number: None,
-                                    tombstone_max_sequence_number: None,
                                 }),
                             },
                         )),
@@ -1352,7 +1413,6 @@ mod tests {
                                 partition_id: 1,
                                 status: Some(PartitionStatus {
                                     parquet_max_sequence_number: None,
-                                    tombstone_max_sequence_number: None,
                                 }),
                             },
                         )),
@@ -1432,7 +1492,6 @@ mod tests {
                                     partition_id: 1,
                                     status: Some(PartitionStatus {
                                         parquet_max_sequence_number: Some(11),
-                                        tombstone_max_sequence_number: Some(12),
                                     }),
                                 },
                             )),
@@ -1462,7 +1521,6 @@ mod tests {
                                     partition_id: 2,
                                     status: Some(PartitionStatus {
                                         parquet_max_sequence_number: Some(21),
-                                        tombstone_max_sequence_number: Some(22),
                                     }),
                                 },
                             )),
@@ -1487,7 +1545,6 @@ mod tests {
                                     partition_id: 3,
                                     status: Some(PartitionStatus {
                                         parquet_max_sequence_number: Some(31),
-                                        tombstone_max_sequence_number: Some(32),
                                     }),
                                 },
                             )),
@@ -1517,10 +1574,7 @@ mod tests {
             p1.parquet_max_sequence_number,
             Some(SequenceNumber::new(11))
         );
-        assert_eq!(
-            p1.tombstone_max_sequence_number,
-            Some(SequenceNumber::new(12))
-        );
+        assert_eq!(p1.tombstone_max_sequence_number, None);
         assert_eq!(p1.chunks.len(), 2);
         assert_eq!(p1.chunks[0].schema().as_arrow(), schema_1_1);
         assert_eq!(p1.chunks[0].batches.len(), 2);
@@ -1537,10 +1591,7 @@ mod tests {
             p2.parquet_max_sequence_number,
             Some(SequenceNumber::new(21))
         );
-        assert_eq!(
-            p2.tombstone_max_sequence_number,
-            Some(SequenceNumber::new(22))
-        );
+        assert_eq!(p2.tombstone_max_sequence_number, None);
         assert_eq!(p2.chunks.len(), 1);
         assert_eq!(p2.chunks[0].schema().as_arrow(), schema_2_1);
         assert_eq!(p2.chunks[0].batches.len(), 1);
@@ -1553,10 +1604,7 @@ mod tests {
             p3.parquet_max_sequence_number,
             Some(SequenceNumber::new(31))
         );
-        assert_eq!(
-            p3.tombstone_max_sequence_number,
-            Some(SequenceNumber::new(32))
-        );
+        assert_eq!(p3.tombstone_max_sequence_number, None);
         assert_eq!(p3.chunks.len(), 1);
         assert_eq!(p3.chunks[0].schema().as_arrow(), schema_3_1);
         assert_eq!(p3.chunks[0].batches.len(), 1);
@@ -1676,7 +1724,6 @@ mod tests {
                                     partition_id: 1,
                                     status: Some(PartitionStatus {
                                         parquet_max_sequence_number: Some(11),
-                                        tombstone_max_sequence_number: Some(12),
                                     }),
                                 },
                             )),
@@ -1716,10 +1763,7 @@ mod tests {
             p1.parquet_max_sequence_number,
             Some(SequenceNumber::new(11))
         );
-        assert_eq!(
-            p1.tombstone_max_sequence_number,
-            Some(SequenceNumber::new(12))
-        );
+        assert_eq!(p1.tombstone_max_sequence_number, None);
         assert_eq!(p1.chunks.len(), 1);
     }
 
@@ -1846,6 +1890,12 @@ mod tests {
                     self.catalog.object_store(),
                     &Handle::current(),
                 )),
+                BackoffConfig {
+                    init_backoff: Duration::from_secs(1),
+                    max_backoff: Duration::from_secs(2),
+                    base: 1.1,
+                    deadline: Some(Duration::from_millis(500)),
+                },
             )
         }
     }
@@ -1856,6 +1906,7 @@ mod tests {
             &self,
             ingester_address: Arc<str>,
             _request: IngesterQueryRequest,
+            _span_context: Option<SpanContext>,
         ) -> Result<Box<dyn QueryData>, FlightClientError> {
             self.responses
                 .lock()
@@ -1904,6 +1955,7 @@ mod tests {
         let expected_schema = Arc::new(
             SchemaBuilder::new()
                 .field("b", DataType::Boolean)
+                .unwrap()
                 .timestamp()
                 .build()
                 .unwrap(),

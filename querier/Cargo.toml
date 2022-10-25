@@ -1,11 +1,13 @@
 [package]
 name = "querier"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
 
 [dependencies]
-arrow = "21.0.0"
-async-trait = "0.1.57"
+arrow = "25.0.0"
+async-trait = "0.1.58"
 backoff = { path = "../backoff" }
 bytes = "1.2"
 cache_system = { path = "../cache_system" }
@@ -18,7 +20,7 @@ generated_types = { path = "../generated_types" }
 influxdb_iox_client = { path = "../influxdb_iox_client" }
 iox_catalog = { path = "../iox_catalog" }
 metric = { path = "../metric" }
-object_store = "0.4.0"
+object_store = "0.5.1"
 observability_deps = { path = "../observability_deps" }
 parking_lot = "0.12"
 parquet_file = { path = "../parquet_file" }
@@ -26,7 +28,6 @@ pin-project = "1.0"
 predicate = { path = "../predicate" }
 iox_query = { path = "../iox_query" }
 rand = "0.8.3"
-read_buffer = { path = "../read_buffer" }
 service_common = { path = "../service_common" }
 service_grpc_schema = { path = "../service_grpc_schema" }
 schema = { path = "../schema" }
@@ -34,8 +35,8 @@ sharder = { path = "../sharder" }
 snafu = "0.7"
 thiserror = "1.0"
 iox_time = { path = "../iox_time" }
-tokio = { version = "1.20", features = ["macros", "parking_lot", "rt-multi-thread", "sync", "time"] }
-tokio-util = { version = "0.7.3" }
+tokio = { version = "1.21", features = ["macros", "parking_lot", "rt-multi-thread", "sync", "time"] }
+tokio-util = { version = "0.7.4" }
 tonic = { version = "0.8" }
 trace = { path = "../trace" }
 tracker = { path = "../tracker" }

@@ -139,7 +139,7 @@ macro_rules! lock_inner {
 ///     type K = &'static str;
 ///     type V = u64;
 ///
-///     fn set(&mut self, k: &'static str, v: u64, _now: Time) -> Vec<CR> {
+///     fn set(&mut self, k: &&'static str, v: &u64, _now: Time) -> Vec<CR> {
 ///       // When new key `k` is set to value `v` if `v` is odd,
 ///       // request a change to set `k` to `v+1`
 ///         if v % 2 == 1 {
@@ -422,7 +422,7 @@ fn perform_changes<K, V>(
             for subscriber in &mut inner.subscribers {
                 let requests = match &record {
                     Record::Get { k } => subscriber.get(k, now),
-                    Record::Set { k, v } => subscriber.set(k.clone(), v.clone(), now),
+                    Record::Set { k, v } => subscriber.set(k, v, now),
                     Record::Remove { k } => subscriber.remove(k, now),
                 };
 
@@ -459,8 +459,8 @@ pub trait Subscriber: Debug + Send + 'static {
     /// more consistent and performant.
     fn set(
         &mut self,
-        _k: Self::K,
-        _v: Self::V,
+        _k: &Self::K,
+        _v: &Self::V,
         _now: Time,
     ) -> Vec<ChangeRequest<'static, Self::K, Self::V>> {
         // do nothing by default
@@ -517,7 +517,7 @@ where
     /// locked during a single request, so "get + modify" patterns work out of the box without the need to fair interleaving modifications.
     pub fn from_fn<F>(f: F) -> Self
     where
-        F: for<'b> FnOnce(&'b mut dyn CacheBackend<K = K, V = V>) + 'a,
+        F: for<'b> FnOnce(&'b mut Recorder<K, V>) + 'a,
     {
         Self { fun: Box::new(f) }
     }
@@ -553,14 +553,13 @@ where
     }
 
     /// Execute this change request.
-    pub fn eval(self, backend: &mut dyn CacheBackend<K = K, V = V>) {
+    pub fn eval(self, backend: &mut Recorder<K, V>) {
         (self.fun)(backend)
     }
 }
 
 /// Function captured within [`ChangeRequest`].
-type ChangeRequestFn<'a, K, V> =
-    Box<dyn for<'b> FnOnce(&'b mut dyn CacheBackend<K = K, V = V>) + 'a>;
+type ChangeRequestFn<'a, K, V> = Box<dyn for<'b> FnOnce(&'b mut Recorder<K, V>) + 'a>;
 
 /// Records of interactions with the callback [`CacheBackend`].
 #[derive(Debug, PartialEq)]
@@ -590,13 +589,29 @@ enum Record<K, V> {
 /// Specialized [`CacheBackend`] that forwards changes and requests to the underlying backend of [`PolicyBackend`] but
 /// also records all changes into [`Record`]s.
 #[derive(Debug)]
-struct Recorder<K, V>
+pub struct Recorder<K, V>
 where
     K: Clone + Eq + Hash + Ord + Debug + Send + 'static,
     V: Clone + Debug + Send + 'static,
 {
     inner: Arc<Mutex<Box<dyn CacheBackend<K = K, V = V>>>>,
     records: Vec<Record<K, V>>,
+}
+
+impl<K, V> Recorder<K, V>
+where
+    K: Clone + Eq + Hash + Ord + Debug + Send + 'static,
+    V: Clone + Debug + Send + 'static,
+{
+    /// Perform a [`GET`](CacheBackend::get) request that is NOT seen by other policies.
+    ///
+    /// This is helpful if you just want to check the underlying data of a key without treating it as "used".
+    ///
+    /// Note that this functionality only exists for [`GET`](CacheBackend::get) requests, not for modifying requests
+    /// like [`SET`](CacheBackend::set) or [`REMOVE`](CacheBackend::remove) since they always require policies to be in-sync.
+    pub fn get_untracked(&mut self, k: &K) -> Option<V> {
+        self.inner.lock().get(k)
+    }
 }
 
 impl<K, V> CacheBackend for Recorder<K, V>
@@ -893,6 +908,28 @@ mod tests {
         }]));
 
         backend.remove(&String::from("a"));
+    }
+
+    #[test]
+    fn test_get_untracked() {
+        let time_provider = Arc::new(MockProvider::new(Time::MIN));
+        let mut backend = PolicyBackend::new(Box::new(HashMap::new()), time_provider);
+        backend.add_policy(create_test_policy(vec![
+            TestStep {
+                condition: TestBackendInteraction::Set {
+                    k: String::from("a"),
+                    v: 1,
+                },
+                action: TestAction::ChangeRequests(vec![SendableChangeRequest::from_fn(
+                    |backend| {
+                        assert_eq!(backend.get_untracked(&String::from("a")), Some(1));
+                    },
+                )]),
+            },
+            // NO `GET` interaction triggered here!
+        ]));
+
+        backend.set(String::from("a"), 1);
     }
 
     #[test]
@@ -1815,13 +1852,16 @@ mod tests {
 
         fn set(
             &mut self,
-            k: Self::K,
-            v: Self::V,
+            k: &Self::K,
+            v: &Self::V,
             _now: Time,
         ) -> Vec<ChangeRequest<'static, String, usize>> {
             let step = self.steps.pop_front().expect("step left for set operation");
 
-            let expected_condition = TestBackendInteraction::Set { k, v };
+            let expected_condition = TestBackendInteraction::Set {
+                k: k.clone(),
+                v: *v,
+            };
             assert_eq!(
                 step.condition, expected_condition,
                 "Condition mismatch\n\nActual:\n{:#?}\n\nExpected:\n{:#?}",
@@ -1854,7 +1894,7 @@ mod tests {
 
     /// Same as [`ChangeRequestFn`] but implements `Send`.
     type SendableChangeRequestFn =
-        Box<dyn for<'a> FnOnce(&'a mut dyn CacheBackend<K = String, V = usize>) + Send + 'static>;
+        Box<dyn for<'a> FnOnce(&'a mut Recorder<String, usize>) + Send + 'static>;
 
     /// Same as [`ChangeRequest`] but implements `Send`.
     struct SendableChangeRequest {
@@ -1871,7 +1911,7 @@ mod tests {
     impl SendableChangeRequest {
         fn from_fn<F>(f: F) -> Self
         where
-            F: for<'b> FnOnce(&'b mut dyn CacheBackend<K = String, V = usize>) + Send + 'static,
+            F: for<'b> FnOnce(&'b mut Recorder<String, usize>) + Send + 'static,
         {
             Self { fun: Box::new(f) }
         }

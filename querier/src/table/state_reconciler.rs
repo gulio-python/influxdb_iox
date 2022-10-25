@@ -23,6 +23,7 @@ use crate::{
 use self::interface::{IngesterPartitionInfo, ParquetFileInfo, TombstoneInfo};
 
 #[derive(Snafu, Debug)]
+#[allow(missing_copy_implementations)]
 pub enum ReconcileError {
     #[snafu(display("Compactor processed file that the querier would need to split apart which is not yet implemented"))]
     CompactorConflict,
@@ -220,7 +221,7 @@ impl Reconciler {
         // collect columns
         let chunk_schemas: Vec<_> = chunks
             .iter()
-            .filter_map(|c| c.partition_id().map(|id| (id, c.schema())))
+            .map(|c| (c.partition_id(), c.schema()))
             .collect();
         let mut all_columns: HashMap<PartitionId, Vec<&str>> = HashMap::new();
         for (partition_id, schema) in &chunk_schemas {
@@ -250,14 +251,11 @@ impl Reconciler {
         chunks
             .into_iter()
             .map(|chunk| {
-                if let Some(partition_id) = chunk.partition_id() {
-                    let sort_key = sort_keys
-                        .get(&partition_id)
-                        .expect("sort key for this partition should be fetched by now");
-                    chunk.update_partition_sort_key(Arc::clone(sort_key))
-                } else {
-                    chunk
-                }
+                let partition_id = chunk.partition_id();
+                let sort_key = sort_keys
+                    .get(&partition_id)
+                    .expect("sort key for this partition should be fetched by now");
+                chunk.update_partition_sort_key(Arc::clone(sort_key))
             })
             .collect()
     }
@@ -353,7 +351,7 @@ where
 
                 // This is the result of the compactor compacting files persisted by the ingester after persisted_max
                 // The compacted result may include data of before and after persisted_max which prevents
-                // this query to return correct result beacuse it only needs data before persist_max
+                // this query to return correct result because it only needs data before persist_max
                 if file.compaction_level() != CompactionLevel::Initial
                     && file.max_sequence_number() > persisted_max
                 {

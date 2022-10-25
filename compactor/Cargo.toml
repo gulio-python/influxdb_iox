@@ -1,20 +1,22 @@
 [package]
 name = "compactor"
-version = "0.1.0"
-authors = ["Luke Bond <luke.n.bond@gmail.com>"]
-edition = "2021"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
 
 [dependencies]
-arrow = { version = "21.0.0", features = ["prettyprint"] }
-async-trait = "0.1.57"
+arrow = { version = "25.0.0", features = ["prettyprint"] }
+async-trait = "0.1.58"
 backoff = { path = "../backoff" }
 bytes = "1.2"
 data_types = { path = "../data_types" }
 datafusion = { path = "../datafusion" }
 futures = "0.3"
+generated_types = { path = "../generated_types" }
 iox_catalog = { path = "../iox_catalog" }
 metric = { path = "../metric" }
-object_store = "0.4.0"
+object_store = "0.5.1"
 observability_deps = { path = "../observability_deps" }
 parquet_file = { path = "../parquet_file" }
 predicate = { path = "../predicate" }
@@ -23,8 +25,9 @@ schema = { path = "../schema" }
 snafu = "0.7"
 thiserror = "1.0"
 iox_time = { path = "../iox_time" }
-tokio = { version = "1.20", features = ["macros", "parking_lot", "rt-multi-thread", "sync", "time"] }
-tokio-util = { version = "0.7.3" }
+tokio = { version = "1.21", features = ["macros", "parking_lot", "rt-multi-thread", "sync", "time"] }
+tokio-util = { version = "0.7.4" }
+tonic = { version = "0.8" }
 uuid = { version = "1", features = ["v4"] }
 workspace-hack = { path = "../workspace-hack"}
 

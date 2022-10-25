@@ -2,30 +2,39 @@
 
 use crate::{
     interface::{
-        sealed::TransactionFinalize, Catalog, ColumnRepo, ColumnUpsertRequest, Error,
-        NamespaceRepo, ParquetFileRepo, PartitionRepo, ProcessedTombstoneRepo, QueryPoolRepo,
-        RepoCollection, Result, ShardRepo, TablePersistInfo, TableRepo, TombstoneRepo,
-        TopicMetadataRepo, Transaction,
+        self, sealed::TransactionFinalize, Catalog, ColumnRepo, ColumnTypeMismatchSnafu,
+        ColumnUpsertRequest, Error, NamespaceRepo, ParquetFileRepo, PartitionRepo,
+        ProcessedTombstoneRepo, QueryPoolRepo, RepoCollection, Result, ShardRepo, TableRepo,
+        TombstoneRepo, TopicMetadataRepo, Transaction,
     },
     metrics::MetricDecorator,
+    DEFAULT_MAX_COLUMNS_PER_TABLE, DEFAULT_MAX_TABLES,
 };
 use async_trait::async_trait;
 use data_types::{
     Column, ColumnType, ColumnTypeCount, CompactionLevel, Namespace, NamespaceId, ParquetFile,
-    ParquetFileId, ParquetFileParams, Partition, PartitionId, PartitionInfo, PartitionKey,
-    PartitionParam, ProcessedTombstone, QueryPool, QueryPoolId, SequenceNumber, Shard, ShardId,
-    ShardIndex, Table, TableId, TablePartition, Timestamp, Tombstone, TombstoneId, TopicId,
+    ParquetFileId, ParquetFileParams, Partition, PartitionId, PartitionKey, PartitionParam,
+    ProcessedTombstone, QueryPool, QueryPoolId, SequenceNumber, Shard, ShardId, ShardIndex,
+    SkippedCompaction, Table, TableId, TablePartition, Timestamp, Tombstone, TombstoneId, TopicId,
     TopicMetadata,
 };
 use iox_time::{SystemProvider, TimeProvider};
 use observability_deps::tracing::{debug, info, warn};
+use snafu::prelude::*;
 use sqlx::{
-    migrate::Migrator, postgres::PgPoolOptions, types::Uuid, Acquire, Executor, Postgres, Row,
+    migrate::Migrator,
+    postgres::{PgConnectOptions, PgPoolOptions},
+    types::Uuid,
+    Acquire, ConnectOptions, Executor, Postgres, Row,
 };
 use sqlx_hotswap_pool::HotSwapPool;
+use std::str::FromStr;
 use std::{sync::Arc, time::Duration};
 
 static MIGRATOR: Migrator = sqlx::migrate!();
+
+/// Maximum number of files deleted by [`ParquetFileRepo::delete_old_ids_only].
+const MAX_PARQUET_FILES_DELETED_ONCE: i64 = 1_000;
 
 /// Postgres connection options.
 #[derive(Debug, Clone)]
@@ -329,6 +338,11 @@ async fn new_raw_pool(
     options: &PostgresConnectionOptions,
     parsed_dsn: &str,
 ) -> Result<sqlx::Pool<Postgres>, sqlx::Error> {
+    // sqlx exposes some options as pool options, while other options are available as connection options.
+    let mut connect_options = PgConnectOptions::from_str(parsed_dsn)?;
+    // the default is INFO, which is frankly surprising.
+    connect_options.log_statements(log::LevelFilter::Trace);
+
     let app_name = options.app_name.clone();
     let app_name2 = options.app_name.clone(); // just to log below
     let schema_name = options.schema_name.clone();
@@ -343,9 +357,9 @@ async fn new_raw_pool(
             let schema_name = schema_name.to_owned();
             Box::pin(async move {
                 // Tag the connection with the provided application name, while allowing it to
-                // be overriden from the connection string (aka DSN).
+                // be override from the connection string (aka DSN).
                 // If current_application_name is empty here it means the application name wasn't
-                // set as part of the DSN, and we can set it explictly.
+                // set as part of the DSN, and we can set it explicitly.
                 // Recall that this block is running on connection, not when creating the pool!
                 let current_application_name: String =
                     sqlx::query_scalar("SELECT current_setting('application_name');")
@@ -362,7 +376,7 @@ async fn new_raw_pool(
                 Ok(())
             })
         })
-        .connect(parsed_dsn)
+        .connect_with(connect_options)
         .await?;
 
     // Log a connection was successfully established and include the application
@@ -421,7 +435,14 @@ async fn new_pool(
                         Ok(None)
                     } else {
                         let new_pool = new_raw_pool(options, &new_dsn).await?;
-                        pool.replace(new_pool);
+                        let old_pool = pool.replace(new_pool);
+                        info!("replaced hotswap pool");
+                        info!(?old_pool, "closing old DB connection pool");
+                        // The pool is not closed on drop. We need to call `close`.
+                        // It will close all idle connections, and wait until acquired connections
+                        // are returned to the pool or closed.
+                        old_pool.close().await;
+                        info!(?old_pool, "closed old DB connection pool");
                         Ok(Some(new_dsn))
                     }
                 }
@@ -429,7 +450,6 @@ async fn new_pool(
                 match try_update(&options, &current_dsn, &dsn_file, &pool).await {
                     Ok(None) => {}
                     Ok(Some(new_dsn)) => {
-                        info!("replaced hotswap pool");
                         current_dsn = new_dsn;
                     }
                     Err(e) => {
@@ -598,6 +618,10 @@ RETURNING *;
                 Error::SqlxError { source: e }
             }
         })?;
+
+        // Ensure the column default values match the code values.
+        debug_assert_eq!(rec.max_tables, DEFAULT_MAX_TABLES);
+        debug_assert_eq!(rec.max_columns_per_table, DEFAULT_MAX_COLUMNS_PER_TABLE);
 
         Ok(rec)
     }
@@ -825,42 +849,6 @@ WHERE namespace_id = $1;
 
         Ok(rec)
     }
-
-    async fn get_table_persist_info(
-        &mut self,
-        shard_id: ShardId,
-        namespace_id: NamespaceId,
-        table_name: &str,
-    ) -> Result<Option<TablePersistInfo>> {
-        let rec = sqlx::query_as::<_, TablePersistInfo>(
-            r#"
-WITH tid as (SELECT id FROM table_name WHERE name = $2 AND namespace_id = $3)
-SELECT $1 as shard_id, id as table_id,
-       tombstone.sequence_number as tombstone_max_sequence_number
-FROM tid
-LEFT JOIN (
-  SELECT tombstone.table_id, sequence_number
-  FROM tombstone
-  WHERE shard_id = $1 AND tombstone.table_id = (SELECT id FROM tid)
-  ORDER BY sequence_number DESC
-  LIMIT 1
-) tombstone ON tombstone.table_id = tid.id
-            "#,
-        )
-        .bind(&shard_id) // $1
-        .bind(&table_name) // $2
-        .bind(&namespace_id) // $3
-        .fetch_one(&mut self.inner)
-        .await;
-
-        if let Err(sqlx::Error::RowNotFound) = rec {
-            return Ok(None);
-        }
-
-        let info = rec.map_err(|e| Error::SqlxError { source: e })?;
-
-        Ok(Some(info))
-    }
 }
 
 #[async_trait]
@@ -871,7 +859,6 @@ impl ColumnRepo for PostgresTxn {
         table_id: TableId,
         column_type: ColumnType,
     ) -> Result<Column> {
-        let ct = column_type as i16;
         let rec = sqlx::query_as::<_, Column>(
             r#"
 INSERT INTO column_name ( name, table_id, column_type )
@@ -889,7 +876,7 @@ RETURNING *;
         )
         .bind(&name) // $1
         .bind(&table_id) // $2
-        .bind(&ct) // $3
+        .bind(&column_type) // $3
         .fetch_one(&mut self.inner)
         .await
         .map_err(|e| match e {
@@ -905,13 +892,14 @@ RETURNING *;
             }
         }})?;
 
-        if rec.column_type != ct {
-            return Err(Error::ColumnTypeMismatch {
-                name: name.to_string(),
-                existing: rec.name,
-                new: column_type.to_string(),
-            });
-        }
+        ensure!(
+            rec.column_type == column_type,
+            ColumnTypeMismatchSnafu {
+                name,
+                existing: rec.column_type,
+                new: column_type,
+            }
+        );
 
         Ok(rec)
     }
@@ -956,31 +944,30 @@ WHERE table_id = $1;
         Ok(rec)
     }
 
-    async fn create_or_get_many(
+    async fn create_or_get_many_unchecked(
         &mut self,
+        table_id: TableId,
         columns: &[ColumnUpsertRequest<'_>],
     ) -> Result<Vec<Column>> {
         let mut v_name = Vec::new();
-        let mut v_table_id = Vec::new();
         let mut v_column_type = Vec::new();
         for c in columns {
             v_name.push(c.name.to_string());
-            v_table_id.push(c.table_id.get());
             v_column_type.push(c.column_type as i16);
         }
 
         let out = sqlx::query_as::<_, Column>(
             r#"
 INSERT INTO column_name ( name, table_id, column_type )
-SELECT name, table_id, column_type FROM UNNEST($1, $2, $3) as a(name, table_id, column_type)
+SELECT name, $1, column_type FROM UNNEST($2, $3) as a(name, column_type)
 ON CONFLICT ON CONSTRAINT column_name_unique
 DO UPDATE SET name = column_name.name
 RETURNING *;
             "#,
         )
-        .bind(&v_name)
-        .bind(&v_table_id)
-        .bind(&v_column_type)
+        .bind(&table_id) // $1
+        .bind(&v_name) // $2
+        .bind(&v_column_type) // $3
         .fetch_all(&mut self.inner)
         .await
         .map_err(|e| {
@@ -996,15 +983,14 @@ RETURNING *;
         out.into_iter()
             .zip(v_column_type)
             .map(|(existing, want)| {
-                if existing.column_type != want {
-                    return Err(Error::ColumnTypeMismatch {
+                ensure!(
+                    existing.column_type as i16 == want,
+                    ColumnTypeMismatchSnafu {
                         name: existing.name,
-                        existing: ColumnType::try_from(existing.column_type)
-                            .unwrap()
-                            .to_string(),
-                        new: ColumnType::try_from(want).unwrap().to_string(),
-                    });
-                }
+                        existing: existing.column_type,
+                        new: ColumnType::try_from(want).unwrap(),
+                    }
+                );
                 Ok(existing)
             })
             .collect()
@@ -1221,41 +1207,6 @@ WHERE table_id = $1;
         .map_err(|e| Error::SqlxError { source: e })
     }
 
-    async fn partition_info_by_id(
-        &mut self,
-        partition_id: PartitionId,
-    ) -> Result<Option<PartitionInfo>> {
-        let info = sqlx::query(
-            r#"
-SELECT namespace.name as namespace_name, table_name.name as table_name, partition.*
-FROM partition
-INNER JOIN table_name on table_name.id = partition.table_id
-INNER JOIN namespace on namespace.id = table_name.namespace_id
-WHERE partition.id = $1;
-        "#,
-        )
-        .bind(&partition_id) // $1
-        .fetch_one(&mut self.inner)
-        .await
-        .map_err(|e| Error::SqlxError { source: e })?;
-
-        let namespace_name = info.get("namespace_name");
-        let table_name = info.get("table_name");
-        let partition = Partition {
-            id: info.get("id"),
-            shard_id: info.get("shard_id"),
-            table_id: info.get("table_id"),
-            partition_key: info.get("partition_key"),
-            sort_key: info.get("sort_key"),
-        };
-
-        Ok(Some(PartitionInfo {
-            namespace_name,
-            table_name,
-            partition,
-        }))
-    }
-
     async fn update_sort_key(
         &mut self,
         partition_id: PartitionId,
@@ -1287,6 +1238,104 @@ RETURNING *;
         );
 
         Ok(partition)
+    }
+
+    async fn record_skipped_compaction(
+        &mut self,
+        partition_id: PartitionId,
+        reason: &str,
+        num_files: usize,
+        limit_num_files: usize,
+        estimated_bytes: u64,
+        limit_bytes: u64,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+INSERT INTO skipped_compactions
+    ( partition_id, reason, num_files, limit_num_files, estimated_bytes, limit_bytes, skipped_at )
+VALUES
+    ( $1, $2, $3, $4, $5, $6, extract(epoch from NOW()) )
+ON CONFLICT ( partition_id )
+DO UPDATE
+SET
+reason = EXCLUDED.reason,
+num_files = EXCLUDED.num_files,
+limit_num_files = EXCLUDED.limit_num_files,
+estimated_bytes = EXCLUDED.estimated_bytes,
+limit_bytes = EXCLUDED.limit_bytes,
+skipped_at = EXCLUDED.skipped_at;
+        "#,
+        )
+        .bind(partition_id) // $1
+        .bind(reason)
+        .bind(num_files as i64)
+        .bind(limit_num_files as i64)
+        .bind(estimated_bytes as i64)
+        .bind(limit_bytes as i64)
+        .execute(&mut self.inner)
+        .await
+        .context(interface::CouldNotRecordSkippedCompactionSnafu { partition_id })?;
+        Ok(())
+    }
+
+    async fn list_skipped_compactions(&mut self) -> Result<Vec<SkippedCompaction>> {
+        sqlx::query_as::<_, SkippedCompaction>(
+            r#"
+SELECT * FROM skipped_compactions
+        "#,
+        )
+        .fetch_all(&mut self.inner)
+        .await
+        .context(interface::CouldNotListSkippedCompactionsSnafu)
+    }
+
+    async fn delete_skipped_compactions(
+        &mut self,
+        partition_id: PartitionId,
+    ) -> Result<Option<SkippedCompaction>> {
+        sqlx::query_as::<_, SkippedCompaction>(
+            r#"
+DELETE FROM skipped_compactions
+WHERE partition_id = $1
+RETURNING *
+        "#,
+        )
+        .bind(partition_id)
+        .fetch_optional(&mut self.inner)
+        .await
+        .context(interface::CouldNotDeleteSkippedCompactionsSnafu)
+    }
+
+    async fn update_persisted_sequence_number(
+        &mut self,
+        partition_id: PartitionId,
+        sequence_number: SequenceNumber,
+    ) -> Result<()> {
+        let _ = sqlx::query(
+            r#"
+UPDATE partition
+SET persisted_sequence_number = $1
+WHERE id = $2;
+                "#,
+        )
+        .bind(&sequence_number.get()) // $1
+        .bind(&partition_id) // $2
+        .execute(&mut self.inner)
+        .await
+        .map_err(|e| Error::SqlxError { source: e })?;
+
+        Ok(())
+    }
+
+    async fn most_recent_n(&mut self, n: usize, shards: &[ShardId]) -> Result<Vec<Partition>> {
+        sqlx::query_as(
+            r#"SELECT * FROM partition WHERE shard_id IN (SELECT UNNEST($1)) ORDER BY id DESC LIMIT $2;"#,
+        )
+        .bind(shards.iter().map(|v| v.get()).collect::<Vec<_>>())
+        .bind(n as i64)
+        .fetch_all(&mut self.inner)
+        .await
+        .map_err(|e| Error::SqlxError { source: e })
     }
 }
 
@@ -1550,7 +1599,7 @@ RETURNING *;
     }
 
     async fn flag_for_delete(&mut self, id: ParquetFileId) -> Result<()> {
-        let marked_at = Timestamp::new(self.time_provider.now().timestamp_nanos());
+        let marked_at = Timestamp::from(self.time_provider.now());
 
         let _ = sqlx::query(r#"UPDATE parquet_file SET to_delete = $1 WHERE id = $2;"#)
             .bind(&marked_at) // $1
@@ -1644,6 +1693,31 @@ RETURNING *;
         .map_err(|e| Error::SqlxError { source: e })
     }
 
+    async fn delete_old_ids_only(&mut self, older_than: Timestamp) -> Result<Vec<ParquetFileId>> {
+        // see https://www.crunchydata.com/blog/simulating-update-or-delete-with-limit-in-postgres-ctes-to-the-rescue
+        let deleted = sqlx::query(
+            r#"
+WITH parquet_file_ids as (
+    SELECT id
+    FROM parquet_file
+    WHERE to_delete < $1
+    LIMIT $2
+)
+DELETE FROM parquet_file
+WHERE id IN (SELECT id FROM parquet_file_ids)
+RETURNING id;
+             "#,
+        )
+        .bind(&older_than) // $1
+        .bind(&MAX_PARQUET_FILES_DELETED_ONCE) // $2
+        .fetch_all(&mut self.inner)
+        .await
+        .map_err(|e| Error::SqlxError { source: e })?;
+
+        let deleted = deleted.into_iter().map(|row| row.get("id")).collect();
+        Ok(deleted)
+    }
+
     async fn level_0(&mut self, shard_id: ShardId) -> Result<Vec<ParquetFile>> {
         // this intentionally limits the returned files to 10,000 as it is used to make
         // a decision on the highest priority partitions. If compaction has never been
@@ -1657,12 +1731,13 @@ SELECT id, shard_id, namespace_id, table_id, partition_id, object_store_id,
        row_count, compaction_level, created_at, column_set
 FROM parquet_file
 WHERE parquet_file.shard_id = $1
-  AND parquet_file.compaction_level = 0
+  AND parquet_file.compaction_level = $2
   AND parquet_file.to_delete IS NULL
   LIMIT 1000;
         "#,
         )
         .bind(&shard_id) // $1
+        .bind(CompactionLevel::Initial) // $2
         .fetch_all(&mut self.inner)
         .await
         .map_err(|e| Error::SqlxError { source: e })
@@ -1714,27 +1789,32 @@ WHERE parquet_file.shard_id = $1
 
         sqlx::query_as::<_, PartitionParam>(
             r#"
-SELECT partition_id, table_id, shard_id, namespace_id, count(id)
+SELECT parquet_file.partition_id, parquet_file.table_id, parquet_file.shard_id,
+       parquet_file.namespace_id, count(parquet_file.id)
 FROM parquet_file
-WHERE compaction_level = 0 and to_delete is null
-    and shard_id = $1
-    and created_at > $2 
-group by 1, 2, 3, 4
-having count(id) >= $3
-order by 5 DESC
-limit $4;
+LEFT OUTER JOIN skipped_compactions ON parquet_file.partition_id = skipped_compactions.partition_id
+WHERE compaction_level = $5
+AND   to_delete is null
+AND   shard_id = $1
+AND   created_at > $2
+AND   skipped_compactions.partition_id IS NULL
+GROUP BY 1, 2, 3, 4
+HAVING count(id) >= $3
+ORDER BY 5 DESC
+LIMIT $4;
             "#,
         )
         .bind(&shard_id) // $1
         .bind(time_in_the_past) //$2
         .bind(&min_num_files) // $3
         .bind(&num_partitions) // $4
+        .bind(CompactionLevel::Initial) // $5
         .fetch_all(&mut self.inner)
         .await
         .map_err(|e| Error::SqlxError { source: e })
     }
 
-    async fn most_level_0_files_partitions(
+    async fn most_cold_files_partitions(
         &mut self,
         shard_id: ShardId,
         time_in_the_past: Timestamp,
@@ -1742,24 +1822,32 @@ limit $4;
     ) -> Result<Vec<PartitionParam>> {
         let num_partitions = num_partitions as i32;
 
-        // The preliminary performance test says this query runs around 50ms
-        // We have index on (shard_id, comapction_level, to_delete)
+        // This query returns partitions with most L0+L1 files and all L0 files (both deleted and non deleted) are either created
+        // before the given time ($2) or not available (removed by garbage collector)
         sqlx::query_as::<_, PartitionParam>(
             r#"
-SELECT partition_id, shard_id, namespace_id, table_id, count(id), max(created_at)
+SELECT parquet_file.partition_id, parquet_file.shard_id, parquet_file.namespace_id,
+       parquet_file.table_id,
+       count(case when to_delete is null then 1 end) total_count,
+       max(case when compaction_level= $4 then parquet_file.created_at end)
 FROM   parquet_file
-WHERE  compaction_level = 0
-AND    to_delete IS NULL
+LEFT OUTER JOIN skipped_compactions ON parquet_file.partition_id = skipped_compactions.partition_id
+WHERE  (compaction_level = $4 OR compaction_level = $5)
 AND    shard_id = $1
+AND    skipped_compactions.partition_id IS NULL
 GROUP BY 1, 2, 3, 4
-HAVING max(created_at) < $2
-ORDER BY 5 DESC
+HAVING count(case when to_delete is null then 1 end) > 0
+       AND ( max(case when compaction_level= $4 then parquet_file.created_at end) < $2  OR
+             max(case when compaction_level= $4 then parquet_file.created_at end) is null)
+ORDER BY total_count DESC
 LIMIT $3;
             "#,
         )
         .bind(&shard_id) // $1
         .bind(time_in_the_past) // $2
         .bind(&num_partitions) // $3
+        .bind(CompactionLevel::Initial) // $4
+        .bind(CompactionLevel::FileNonOverlapped) // $5
         .fetch_all(&mut self.inner)
         .await
         .map_err(|e| Error::SqlxError { source: e })
@@ -1787,9 +1875,10 @@ WHERE parquet_file.partition_id = $1
         .map_err(|e| Error::SqlxError { source: e })
     }
 
-    async fn update_to_level_1(
+    async fn update_compaction_level(
         &mut self,
         parquet_file_ids: &[ParquetFileId],
+        compaction_level: CompactionLevel,
     ) -> Result<Vec<ParquetFileId>> {
         // If I try to do `.bind(parquet_file_ids)` directly, I get a compile error from sqlx.
         // See https://github.com/launchbadge/sqlx/issues/1744
@@ -1802,7 +1891,7 @@ WHERE id = ANY($2)
 RETURNING id;
         "#,
         )
-        .bind(CompactionLevel::FileNonOverlapped) // $1
+        .bind(compaction_level) // $1
         .bind(&ids[..]) // $2
         .fetch_all(&mut self.inner)
         .await
@@ -1850,7 +1939,7 @@ WHERE table_id = $1
   AND shard_id = $2
   AND max_sequence_number < $3
   AND parquet_file.to_delete IS NULL
-  AND compaction_level = 0
+  AND compaction_level = $6
   AND ((parquet_file.min_time <= $4 AND parquet_file.max_time >= $4)
   OR (parquet_file.min_time > $4 AND parquet_file.min_time <= $5));
             "#,
@@ -1860,6 +1949,7 @@ WHERE table_id = $1
         .bind(sequence_number) // $3
         .bind(min_time) // $4
         .bind(max_time) // $5
+        .bind(CompactionLevel::Initial) // $6
         .fetch_one(&mut self.inner)
         .await
         .map_err(|e| Error::SqlxError { source: e })?;
@@ -1881,7 +1971,7 @@ FROM parquet_file
 WHERE table_id = $1
   AND shard_id = $2
   AND parquet_file.to_delete IS NULL
-  AND compaction_level = 1
+  AND compaction_level = $5
   AND ((parquet_file.min_time <= $3 AND parquet_file.max_time >= $3)
   OR (parquet_file.min_time > $3 AND parquet_file.min_time <= $4));
             "#,
@@ -1890,6 +1980,7 @@ WHERE table_id = $1
         .bind(&shard_id) // $2
         .bind(min_time) // $3
         .bind(max_time) // $4
+        .bind(CompactionLevel::FileNonOverlapped) // $5
         .fetch_one(&mut self.inner)
         .await
         .map_err(|e| Error::SqlxError { source: e })?;
@@ -2041,6 +2132,7 @@ mod tests {
     use super::*;
     use crate::create_or_get_default_records;
     use assert_matches::assert_matches;
+    use data_types::{ColumnId, ColumnSet};
     use metric::{Attributes, DurationHistogram, Metric};
     use rand::Rng;
     use sqlx::migrate::MigrateDatabase;
@@ -2551,7 +2643,7 @@ mod tests {
         assert_eq!(application_name, TEST_APPLICATION_NAME_NEW);
     }
 
-    macro_rules! test_column_create_or_get_many {
+    macro_rules! test_column_create_or_get_many_unchecked {
         (
             $name:ident,
             calls = {$([$($col_name:literal => $col_type:expr),+ $(,)?]),+},
@@ -2559,7 +2651,7 @@ mod tests {
         ) => {
             paste::paste! {
                 #[tokio::test]
-                async fn [<test_column_create_or_get_many_ $name>]() {
+                async fn [<test_column_create_or_get_many_unchecked_ $name>]() {
                     // If running an integration test on your laptop, this requires that you have
                     // Postgres running and that you've done the sqlx migrations. See the README in
                     // this crate for info to set it up.
@@ -2597,7 +2689,6 @@ mod tests {
                             $(
                                 ColumnUpsertRequest {
                                     name: $col_name,
-                                    table_id,
                                     column_type: $col_type,
                                 },
                             )+
@@ -2606,7 +2697,7 @@ mod tests {
                             .repositories()
                             .await
                             .columns()
-                            .create_or_get_many(&insert)
+                            .create_or_get_many_unchecked(table_id, &insert)
                             .await;
 
                         // The returned columns MUST always match the requested
@@ -2615,13 +2706,13 @@ mod tests {
                             assert_eq!(insert.len(), got.len());
                             insert.iter().zip(got).for_each(|(req, got)| {
                                 assert_eq!(req.name, got.name);
-                                assert_eq!(req.table_id, got.table_id);
+                                assert_eq!(table_id, got.table_id);
                                 assert_eq!(
                                     req.column_type,
                                     ColumnType::try_from(got.column_type).expect("invalid column type")
                                 );
                             });
-                            assert_metric_hit(&metrics, "column_create_or_get_many");
+                            assert_metric_hit(&metrics, "column_create_or_get_many_unchecked");
                         }
                     )+
 
@@ -2633,7 +2724,7 @@ mod tests {
 
     // Issue a few calls to create_or_get_many that contain distinct columns and
     // covers the full set of column types.
-    test_column_create_or_get_many!(
+    test_column_create_or_get_many_unchecked!(
         insert,
         calls = {
             [
@@ -2655,7 +2746,7 @@ mod tests {
 
     // Issue two calls with overlapping columns - request should succeed (upsert
     // semantics).
-    test_column_create_or_get_many!(
+    test_column_create_or_get_many_unchecked!(
         partial_upsert,
         calls = {
             [
@@ -2679,7 +2770,7 @@ mod tests {
     );
 
     // Issue two calls with the same columns and types.
-    test_column_create_or_get_many!(
+    test_column_create_or_get_many_unchecked!(
         full_upsert,
         calls = {
             [
@@ -2700,7 +2791,7 @@ mod tests {
 
     // Issue two calls with overlapping columns with conflicting types and
     // observe a correctly populated ColumnTypeMismatch error.
-    test_column_create_or_get_many!(
+    test_column_create_or_get_many_unchecked!(
         partial_type_conflict,
         calls = {
             [
@@ -2723,15 +2814,15 @@ mod tests {
         want = Err(e) => {
             assert_matches!(e, Error::ColumnTypeMismatch { name, existing, new } => {
                 assert_eq!(name, "test2");
-                assert_eq!(existing, "string");
-                assert_eq!(new, "bool");
+                assert_eq!(existing, ColumnType::String);
+                assert_eq!(new, ColumnType::Bool);
             })
         }
     );
 
     // Issue one call containing a column specified twice, with differing types
     // and observe an error different from the above test case.
-    test_column_create_or_get_many!(
+    test_column_create_or_get_many_unchecked!(
         intra_request_type_conflict,
         calls = {
             [
@@ -2741,4 +2832,138 @@ mod tests {
         },
         want = Err(Error::SqlxError{ .. })
     );
+
+    #[tokio::test]
+    async fn test_billing_summary_on_parqet_file_creation() {
+        // If running an integration test on your laptop, this requires that you have Postgres running
+        //
+        // This is a command to run this test on your laptop
+        //    TEST_INTEGRATION=1 TEST_INFLUXDB_IOX_CATALOG_DSN=postgres:postgres://$USER@localhost/iox_shared RUST_BACKTRACE=1 cargo test --package iox_catalog --lib -- postgres::tests::test_billing_summary_on_parqet_file_creation --exact --nocapture
+        //
+        // If you do not have Postgres's iox_shared db, here are commands to install Postgres (on mac) and create iox_shared db
+        //    brew install postgresql
+        //    initdb pg
+        //    createdb iox_shared
+        //
+        // Or if you're on Linux or otherwise don't mind using Docker:
+        //    ./scripts/docker_catalog.sh
+
+        maybe_skip_integration!();
+
+        let postgres = setup_db().await;
+        let pool = postgres.pool.clone();
+
+        let postgres: Arc<dyn Catalog> = Arc::new(postgres);
+        let mut txn = postgres.start_transaction().await.expect("txn start");
+        let (kafka, query, shards) = create_or_get_default_records(1, txn.deref_mut())
+            .await
+            .expect("db init failed");
+        txn.commit().await.expect("txn commit");
+
+        let namespace_id = postgres
+            .repositories()
+            .await
+            .namespaces()
+            .create("ns4", crate::INFINITE_RETENTION_POLICY, kafka.id, query.id)
+            .await
+            .expect("namespace create failed")
+            .id;
+        let table_id = postgres
+            .repositories()
+            .await
+            .tables()
+            .create_or_get("table", namespace_id)
+            .await
+            .expect("create table failed")
+            .id;
+
+        let key = "bananas";
+        let shard_id = *shards.keys().next().expect("no shard");
+
+        let partition_id = postgres
+            .repositories()
+            .await
+            .partitions()
+            .create_or_get(key.into(), shard_id, table_id)
+            .await
+            .expect("should create OK")
+            .id;
+
+        // parquet file to create- all we care about here is the size, the rest is to satisfy DB
+        // constraints
+        let time_provider = Arc::new(SystemProvider::new());
+        let time_now = Timestamp::from(time_provider.now());
+        let mut p1 = ParquetFileParams {
+            shard_id,
+            namespace_id,
+            table_id,
+            partition_id,
+            object_store_id: Uuid::new_v4(),
+            max_sequence_number: SequenceNumber::new(100),
+            min_time: Timestamp::new(1),
+            max_time: Timestamp::new(5),
+            file_size_bytes: 1337,
+            row_count: 0,
+            compaction_level: CompactionLevel::Initial, // level of file of new writes
+            created_at: time_now,
+            column_set: ColumnSet::new([ColumnId::new(1), ColumnId::new(2)]),
+        };
+        let f1 = postgres
+            .repositories()
+            .await
+            .parquet_files()
+            .create(p1.clone())
+            .await
+            .expect("create parquet file should succeed");
+        // insert the same again with a different size; we should then have 3x1337 as total file size
+        p1.object_store_id = Uuid::new_v4();
+        p1.file_size_bytes *= 2;
+        let _f2 = postgres
+            .repositories()
+            .await
+            .parquet_files()
+            .create(p1.clone())
+            .await
+            .expect("create parquet file should succeed");
+
+        // after adding two files we should have 3x1337 in the summary
+        let total_file_size_bytes: i64 =
+            sqlx::query_scalar("SELECT total_file_size_bytes FROM billing_summary;")
+                .fetch_one(&pool)
+                .await
+                .expect("fetch total file size failed");
+        assert_eq!(total_file_size_bytes, 1337 * 3);
+
+        // flag f1 for deletion and assert that the total file size is reduced accordingly.
+        postgres
+            .repositories()
+            .await
+            .parquet_files()
+            .flag_for_delete(f1.id)
+            .await
+            .expect("flag parquet file for deletion should succeed");
+        let total_file_size_bytes: i64 =
+            sqlx::query_scalar("SELECT total_file_size_bytes FROM billing_summary;")
+                .fetch_one(&pool)
+                .await
+                .expect("fetch total file size failed");
+        // we marked the first file of size 1337 for deletion leaving only the second that was 2x that
+        assert_eq!(total_file_size_bytes, 1337 * 2);
+
+        // actually deleting shouldn't change the total
+        let now = Timestamp::from(time_provider.now());
+        postgres
+            .repositories()
+            .await
+            .parquet_files()
+            .delete_old(now)
+            .await
+            .expect("parquet file deletion should succeed");
+        let total_file_size_bytes: i64 =
+            sqlx::query_scalar("SELECT total_file_size_bytes FROM billing_summary;")
+                .fetch_one(&pool)
+                .await
+                .expect("fetch total file size failed");
+        assert_eq!(total_file_size_bytes, 1337 * 2);
+    }
 }

@@ -1,14 +1,16 @@
 [package]
 name = "service_grpc_object_store"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
 
 [dependencies]
 data_types = { path = "../data_types" }
 futures = "0.3"
 generated_types = { path = "../generated_types" }
 iox_catalog = { path = "../iox_catalog" }
-object_store = "0.4.0"
+object_store = "0.5.1"
 observability_deps = { path = "../observability_deps" }
 parquet_file = { path = "../parquet_file" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

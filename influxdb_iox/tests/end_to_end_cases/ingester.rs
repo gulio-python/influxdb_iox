@@ -29,7 +29,7 @@ async fn ingester_flight_api() {
 
     let mut querier_flight = influxdb_iox_client::flight::low_level::Client::<
         influxdb_iox_client::flight::generated_types::IngesterQueryRequest,
-    >::new(cluster.ingester().ingester_grpc_connection());
+    >::new(cluster.ingester().ingester_grpc_connection(), None);
 
     let query = IngesterQueryRequest::new(
         cluster.namespace().to_string(),
@@ -52,7 +52,6 @@ async fn ingester_flight_api() {
             partition_id,
             status: Some(PartitionStatus {
                 parquet_max_sequence_number: None,
-                tombstone_max_sequence_number: None
             })
         },
     );
@@ -99,7 +98,7 @@ async fn ingester_flight_api_namespace_not_found() {
 
     let mut querier_flight = influxdb_iox_client::flight::low_level::Client::<
         influxdb_iox_client::flight::generated_types::IngesterQueryRequest,
-    >::new(cluster.ingester().ingester_grpc_connection());
+    >::new(cluster.ingester().ingester_grpc_connection(), None);
 
     let query = IngesterQueryRequest::new(
         String::from("does_not_exist"),
@@ -138,7 +137,7 @@ async fn ingester_flight_api_table_not_found() {
 
     let mut querier_flight = influxdb_iox_client::flight::low_level::Client::<
         influxdb_iox_client::flight::generated_types::IngesterQueryRequest,
-    >::new(cluster.ingester().ingester_grpc_connection());
+    >::new(cluster.ingester().ingester_grpc_connection(), None);
 
     let query = IngesterQueryRequest::new(
         cluster.namespace().to_string(),

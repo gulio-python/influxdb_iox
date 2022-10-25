@@ -1,12 +1,30 @@
 //! This module contains plumbing to connect InfluxDB IOx extensions to
 //! DataFusion
 
-use async_trait::async_trait;
-use executor::DedicatedExecutor;
-use std::{convert::TryInto, fmt, sync::Arc};
-
+use super::{
+    non_null_checker::NonNullCheckerNode, seriesset::series::Either, split::StreamSplitNode,
+};
+use crate::{
+    exec::{
+        fieldlist::{FieldList, IntoFieldList},
+        non_null_checker::NonNullCheckerExec,
+        query_tracing::TracedStream,
+        schema_pivot::{SchemaPivotExec, SchemaPivotNode},
+        seriesset::{
+            converter::{GroupGenerator, SeriesSetConverter},
+            series::Series,
+        },
+        split::StreamSplitExec,
+        stringset::{IntoStringSet, StringSetRef},
+    },
+    plan::{
+        fieldlist::FieldListPlan,
+        seriesset::{SeriesSetPlan, SeriesSetPlans},
+        stringset::StringSetPlan,
+    },
+};
 use arrow::record_batch::RecordBatch;
-
+use async_trait::async_trait;
 use datafusion::{
     catalog::catalog::CatalogProvider,
     config::OPT_COALESCE_TARGET_BATCH_SIZE,
@@ -14,7 +32,7 @@ use datafusion::{
         context::{QueryPlanner, SessionState, TaskContext},
         runtime_env::RuntimeEnv,
     },
-    logical_plan::{LogicalPlan, UserDefinedLogicalNode},
+    logical_expr::{LogicalPlan, UserDefinedLogicalNode},
     physical_plan::{
         coalesce_partitions::CoalescePartitionsExec,
         displayable,
@@ -23,38 +41,19 @@ use datafusion::{
     },
     prelude::*,
 };
+use executor::DedicatedExecutor;
 use futures::TryStreamExt;
 use observability_deps::tracing::debug;
+use parquet_file::serialize::ROW_GROUP_WRITE_SIZE;
+use query_functions::selectors::register_selector_aggregates;
+use std::{convert::TryInto, fmt, sync::Arc};
 use trace::{
     ctx::SpanContext,
     span::{MetaValue, Span, SpanExt, SpanRecorder},
 };
 
-use crate::exec::{
-    fieldlist::{FieldList, IntoFieldList},
-    non_null_checker::NonNullCheckerExec,
-    query_tracing::TracedStream,
-    schema_pivot::{SchemaPivotExec, SchemaPivotNode},
-    seriesset::{
-        converter::{GroupGenerator, SeriesSetConverter},
-        series::Series,
-    },
-    split::StreamSplitExec,
-    stringset::{IntoStringSet, StringSetRef},
-};
-
-use crate::plan::{
-    fieldlist::FieldListPlan,
-    seriesset::{SeriesSetPlan, SeriesSetPlans},
-    stringset::StringSetPlan,
-};
-
 // Reuse DataFusion error and Result types for this module
 pub use datafusion::error::{DataFusionError as Error, Result};
-
-use super::{
-    non_null_checker::NonNullCheckerNode, seriesset::series::Either, split::StreamSplitNode,
-};
 
 // The default catalog name - this impacts what SQL queries use if not specified
 pub const DEFAULT_CATALOG: &str = "public";
@@ -179,6 +178,11 @@ impl fmt::Debug for IOxSessionConfig {
 const BATCH_SIZE: usize = 8 * 1024;
 const COALESCE_BATCH_SIZE: usize = BATCH_SIZE / 2;
 
+// ensure read and write work well together
+// Skip clippy due to <https://github.com/rust-lang/rust-clippy/issues/8159>.
+#[allow(clippy::assertions_on_constants)]
+const _: () = assert!(ROW_GROUP_WRITE_SIZE % BATCH_SIZE == 0);
+
 impl IOxSessionConfig {
     pub(super) fn new(exec: DedicatedExecutor, runtime: Arc<RuntimeEnv>) -> Self {
         let session_config = SessionConfig::new()
@@ -226,6 +230,8 @@ impl IOxSessionConfig {
     pub fn build(self) -> IOxSessionContext {
         let state = SessionState::with_config_rt(self.session_config, self.runtime)
             .with_query_planner(Arc::new(IOxQueryPlanner {}));
+
+        let state = register_selector_aggregates(state);
 
         let inner = SessionContext::with_state(state);
 
@@ -321,6 +327,24 @@ impl IOxSessionContext {
         debug!(text=%sql, "planning SQL query");
         let logical_plan = ctx.inner.create_logical_plan(sql)?;
         debug!(plan=%logical_plan.display_graphviz(), "logical plan");
+
+        // Handle unsupported SQL
+        match &logical_plan {
+            LogicalPlan::CreateMemoryTable(_) => {
+                return Err(Error::NotImplemented("CreateMemoryTable".to_string()));
+            }
+            LogicalPlan::DropTable(_) => {
+                return Err(Error::NotImplemented("DropTable".to_string()));
+            }
+            LogicalPlan::DropView(_) => {
+                return Err(Error::NotImplemented("DropView".to_string()));
+            }
+            LogicalPlan::CreateView(_) => {
+                return Err(Error::NotImplemented("CreateView".to_string()));
+            }
+            _ => (),
+        }
+
         ctx.create_physical_plan(&logical_plan).await
     }
 

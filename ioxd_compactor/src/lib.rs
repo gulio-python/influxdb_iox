@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use clap_blocks::compactor::CompactorConfig;
 use compactor::{
     handler::{CompactorHandler, CompactorHandlerImpl},
-    server::CompactorServer,
+    server::{grpc::GrpcDelegate, CompactorServer},
 };
 use data_types::ShardIndex;
 use hyper::{Body, Request, Response};
@@ -18,7 +18,6 @@ use ioxd_common::{
     setup_builder,
 };
 use metric::Registry;
-use object_store::DynObjectStore;
 use parquet_file::storage::ParquetStorage;
 use std::{
     fmt::{Debug, Display},
@@ -37,6 +36,9 @@ pub enum Error {
 
     #[error("shard_index_range_start must be <= shard_index_range_end")]
     ShardIndexRange,
+
+    #[error("split_percentage must be between 1 and 100, inclusive. Was: {split_percentage}")]
+    SplitPercentageRange { split_percentage: u16 },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -84,6 +86,7 @@ impl<C: CompactorHandler + std::fmt::Debug + 'static> ServerType for CompactorSe
     /// Provide a placeholder gRPC service.
     async fn server_grpc(self: Arc<Self>, builder_input: RpcBuilderInput) -> Result<(), RpcError> {
         let builder = setup_builder!(builder_input, self);
+        add_service!(builder, self.server.grpc().compaction_service());
         serve_builder!(builder);
 
         Ok(())
@@ -131,7 +134,7 @@ pub async fn create_compactor_server_type(
     common_state: &CommonServerState,
     metric_registry: Arc<metric::Registry>,
     catalog: Arc<dyn Catalog>,
-    object_store: Arc<DynObjectStore>,
+    parquet_store: ParquetStorage,
     exec: Arc<Executor>,
     time_provider: Arc<dyn TimeProvider>,
     compactor_config: CompactorConfig,
@@ -139,28 +142,37 @@ pub async fn create_compactor_server_type(
     let compactor = build_compactor_from_config(
         compactor_config,
         catalog,
-        object_store,
+        parquet_store,
         exec,
         time_provider,
         Arc::clone(&metric_registry),
     )
     .await?;
 
-    let compactor_handler = Arc::new(CompactorHandlerImpl::new(compactor));
-    let compactor = CompactorServer::new(metric_registry, compactor_handler);
+    let compactor_handler = Arc::new(CompactorHandlerImpl::new(Arc::new(compactor)));
+
+    let grpc = GrpcDelegate::new(Arc::clone(&compactor_handler));
+
+    let compactor = CompactorServer::new(metric_registry, grpc, compactor_handler);
     Ok(Arc::new(CompactorServerType::new(compactor, common_state)))
 }
 
 pub async fn build_compactor_from_config(
     compactor_config: CompactorConfig,
     catalog: Arc<dyn Catalog>,
-    object_store: Arc<DynObjectStore>,
+    parquet_store: ParquetStorage,
     exec: Arc<Executor>,
     time_provider: Arc<dyn TimeProvider>,
     metric_registry: Arc<Registry>,
 ) -> Result<compactor::compact::Compactor, Error> {
     if compactor_config.shard_index_range_start > compactor_config.shard_index_range_end {
         return Err(Error::ShardIndexRange);
+    }
+
+    if compactor_config.split_percentage < 1 || compactor_config.split_percentage > 100 {
+        return Err(Error::SplitPercentageRange {
+            split_percentage: compactor_config.split_percentage,
+        });
     }
 
     let mut txn = catalog.start_transaction().await?;
@@ -184,20 +196,30 @@ pub async fn build_compactor_from_config(
     }
     txn.commit().await?;
 
-    let parquet_store = ParquetStorage::new(object_store);
+    let CompactorConfig {
+        max_desired_file_size_bytes,
+        percentage_max_file_size,
+        split_percentage,
+        max_number_partitions_per_shard,
+        min_number_recent_ingested_files_per_partition,
+        hot_multiple,
+        memory_budget_bytes,
+        min_num_rows_allocated_per_record_batch_to_datafusion_plan,
+        max_num_compacting_files,
+        ..
+    } = compactor_config;
 
-    let compactor_config = compactor::handler::CompactorConfig::new(
-        compactor_config.max_desired_file_size_bytes,
-        compactor_config.percentage_max_file_size,
-        compactor_config.split_percentage,
-        compactor_config.max_cold_concurrent_size_bytes,
-        compactor_config.max_number_partitions_per_shard,
-        compactor_config.min_number_recent_ingested_files_per_partition,
-        compactor_config.cold_input_size_threshold_bytes,
-        compactor_config.cold_input_file_count_threshold,
-        compactor_config.hot_multiple,
-        compactor_config.memory_budget_bytes,
-    );
+    let compactor_config = compactor::handler::CompactorConfig {
+        max_desired_file_size_bytes,
+        percentage_max_file_size,
+        split_percentage,
+        max_number_partitions_per_shard,
+        min_number_recent_ingested_files_per_partition,
+        hot_multiple,
+        memory_budget_bytes,
+        min_num_rows_allocated_per_record_batch_to_datafusion_plan,
+        max_num_compacting_files,
+    };
 
     Ok(compactor::compact::Compactor::new(
         shards,

@@ -1,5 +1,5 @@
 use assert_matches::assert_matches;
-use data_types::{PartitionTemplate, QueryPoolId, ShardIndex, TemplatePart, TopicId};
+use data_types::{ColumnType, PartitionTemplate, QueryPoolId, ShardIndex, TemplatePart, TopicId};
 use dml::DmlOperation;
 use hashbrown::HashMap;
 use hyper::{Body, Request, StatusCode};
@@ -280,8 +280,8 @@ async fn test_schema_conflict() {
                 new,
             } => {
                 assert_eq!(name, "val");
-                assert_eq!(existing, "i64");
-                assert_eq!(new, "iox::column_type::field::float");
+                assert_eq!(*existing, ColumnType::I64);
+                assert_eq!(*new, ColumnType::F64);
             });
         }
     );
@@ -330,17 +330,14 @@ async fn test_schema_limit() {
         &err,
         router::server::http::Error::DmlHandler(
             DmlError::Schema(
-                SchemaError::ServiceLimit(
-                    iox_catalog::interface::Error::TableCreateLimitError {
-                        table_name,
-                        namespace_id,
-                    }
-                )
+                SchemaError::ServiceLimit(e)
             )
         ) => {
-            assert_eq!(table_name, "platanos2");
-            assert_eq!(namespace_id.to_string(), "1");
+            assert_eq!(
+                e.to_string(),
+                "couldn't create table platanos2; limit reached on namespace 1"
+            );
         }
     );
-    assert_eq!(err.as_status_code(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(err.as_status_code(), StatusCode::BAD_REQUEST);
 }

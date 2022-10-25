@@ -8,7 +8,9 @@
     missing_docs,
     clippy::explicit_iter_loop,
     clippy::future_not_send,
-    clippy::clone_on_ref_ptr
+    clippy::clone_on_ref_ptr,
+    clippy::todo,
+    clippy::dbg_macro
 )]
 
 use influxdb_line_protocol::FieldValue;
@@ -23,7 +25,7 @@ use snafu::{ResultExt, Snafu};
 use sqlx::postgres::PgHasArrayType;
 use std::{
     borrow::{Borrow, Cow},
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     convert::TryFrom,
     fmt::{Display, Write},
     mem::{self, size_of_val},
@@ -41,6 +43,9 @@ pub enum CompactionLevel {
     Initial = 0,
     /// Level of files persisted by a Compactor that do not overlap with non-level-0 files.
     FileNonOverlapped = 1,
+    /// Level of files persisted by a Compactor that are fully compacted and should not be
+    /// recompacted unless a new overlapping Initial level file arrives
+    Final = 2,
 }
 
 impl TryFrom<i32> for CompactionLevel {
@@ -50,7 +55,20 @@ impl TryFrom<i32> for CompactionLevel {
         match value {
             x if x == Self::Initial as i32 => Ok(Self::Initial),
             x if x == Self::FileNonOverlapped as i32 => Ok(Self::FileNonOverlapped),
+            x if x == Self::Final as i32 => Ok(Self::Final),
             _ => Err("invalid compaction level value".into()),
+        }
+    }
+}
+
+impl CompactionLevel {
+    /// When compacting files of this level, provide the level that the resulting file should be.
+    /// Does not exceed the maximum available level.
+    pub fn next(&self) -> Self {
+        match self {
+            Self::Initial => Self::FileNonOverlapped,
+            Self::FileNonOverlapped => Self::Final,
+            _ => Self::Final,
         }
     }
 }
@@ -62,7 +80,7 @@ pub struct NamespaceId(i64);
 
 #[allow(missing_docs)]
 impl NamespaceId {
-    pub fn new(v: i64) -> Self {
+    pub const fn new(v: i64) -> Self {
         Self(v)
     }
     pub fn get(&self) -> i64 {
@@ -119,7 +137,7 @@ pub struct TableId(i64);
 
 #[allow(missing_docs)]
 impl TableId {
-    pub fn new(v: i64) -> Self {
+    pub const fn new(v: i64) -> Self {
         Self(v)
     }
     pub fn get(&self) -> i64 {
@@ -162,7 +180,7 @@ pub struct ShardId(i64);
 
 #[allow(missing_docs)]
 impl ShardId {
-    pub fn new(v: i64) -> Self {
+    pub const fn new(v: i64) -> Self {
         Self(v)
     }
     pub fn get(&self) -> i64 {
@@ -229,7 +247,7 @@ pub struct PartitionId(i64);
 
 #[allow(missing_docs)]
 impl PartitionId {
-    pub fn new(v: i64) -> Self {
+    pub const fn new(v: i64) -> Self {
         Self(v)
     }
     pub fn get(&self) -> i64 {
@@ -328,8 +346,15 @@ impl Timestamp {
     pub fn new(v: i64) -> Self {
         Self(v)
     }
+
     pub fn get(&self) -> i64 {
         self.0
+    }
+}
+
+impl From<iox_time::Time> for Timestamp {
+    fn from(time: iox_time::Time) -> Self {
+        Self::new(time.timestamp_nanos())
     }
 }
 
@@ -439,16 +464,24 @@ pub struct NamespaceSchema {
     pub query_pool_id: QueryPoolId,
     /// the tables in the namespace by name
     pub tables: BTreeMap<String, TableSchema>,
+    /// the number of columns per table this namespace allows
+    pub max_columns_per_table: usize,
 }
 
 impl NamespaceSchema {
     /// Create a new `NamespaceSchema`
-    pub fn new(id: NamespaceId, topic_id: TopicId, query_pool_id: QueryPoolId) -> Self {
+    pub fn new(
+        id: NamespaceId,
+        topic_id: TopicId,
+        query_pool_id: QueryPoolId,
+        max_columns_per_table: i32,
+    ) -> Self {
         Self {
             id,
             tables: BTreeMap::new(),
             topic_id,
             query_pool_id,
+            max_columns_per_table: max_columns_per_table as usize,
         }
     }
 
@@ -497,13 +530,11 @@ impl TableSchema {
     /// # Panics
     ///
     /// This method panics if a column of the same name already exists in
-    /// `self`, or the provided [`Column`] cannot be converted into a valid
-    /// [`ColumnSchema`].
+    /// `self`.
     pub fn add_column(&mut self, col: &Column) {
-        let old = self.columns.insert(
-            col.name.clone(),
-            ColumnSchema::try_from(col).expect("column is invalid"),
-        );
+        let old = self
+            .columns
+            .insert(col.name.clone(), ColumnSchema::from(col));
         assert!(old.is_none());
     }
 
@@ -524,6 +555,12 @@ impl TableSchema {
             .map(|(name, c)| (c.id, name.as_str()))
             .collect()
     }
+
+    /// Return the set of column names for this table. Used in combination with a write operation's
+    /// column names to determine whether a write would exceed the max allowed columns.
+    pub fn column_names(&self) -> BTreeSet<&str> {
+        self.columns.keys().map(|name| name.as_str()).collect()
+    }
 }
 
 /// Data object for a column
@@ -536,23 +573,23 @@ pub struct Column {
     /// the name of the column, which is unique in the table
     pub name: String,
     /// the logical type of the column
-    pub column_type: i16,
+    pub column_type: ColumnType,
 }
 
 impl Column {
     /// returns true if the column type is a tag
     pub fn is_tag(&self) -> bool {
-        self.column_type == ColumnType::Tag as i16
+        self.column_type == ColumnType::Tag
     }
 
     /// returns true if the column type matches the line protocol field value type
     pub fn matches_field_type(&self, field_value: &FieldValue) -> bool {
         match field_value {
-            FieldValue::I64(_) => self.column_type == ColumnType::I64 as i16,
-            FieldValue::U64(_) => self.column_type == ColumnType::U64 as i16,
-            FieldValue::F64(_) => self.column_type == ColumnType::F64 as i16,
-            FieldValue::String(_) => self.column_type == ColumnType::String as i16,
-            FieldValue::Boolean(_) => self.column_type == ColumnType::Bool as i16,
+            FieldValue::I64(_) => self.column_type == ColumnType::I64,
+            FieldValue::U64(_) => self.column_type == ColumnType::U64,
+            FieldValue::F64(_) => self.column_type == ColumnType::F64,
+            FieldValue::String(_) => self.column_type == ColumnType::String,
+            FieldValue::Boolean(_) => self.column_type == ColumnType::Bool,
         }
     }
 }
@@ -590,20 +627,23 @@ impl ColumnSchema {
     }
 }
 
-impl TryFrom<&Column> for ColumnSchema {
-    type Error = Box<dyn std::error::Error>;
+impl From<&Column> for ColumnSchema {
+    fn from(c: &Column) -> Self {
+        let Column {
+            id, column_type, ..
+        } = c;
 
-    fn try_from(c: &Column) -> Result<Self, Self::Error> {
-        Ok(Self {
-            id: c.id,
-            column_type: ColumnType::try_from(c.column_type)?,
-        })
+        Self {
+            id: *id,
+            column_type: *column_type,
+        }
     }
 }
 
 /// The column data type
 #[allow(missing_docs)]
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, PartialOrd, Ord, Hash, sqlx::Type)]
+#[repr(i16)]
 pub enum ColumnType {
     I64 = 1,
     U64 = 2,
@@ -748,6 +788,14 @@ pub struct Shard {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PartitionKey(Arc<str>);
 
+impl PartitionKey {
+    /// Returns true if this instance of [`PartitionKey`] is backed by the same
+    /// string storage as other.
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
 impl Display for PartitionKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
@@ -832,9 +880,26 @@ pub struct Partition {
     /// of the existing columns relative to each other is NOT changed.
     ///
     /// For example, updating `A,B,C` to either `A,D,B,C` or `A,B,C,D`
-    /// is legal. Howver, updating to `A,C,D,B` is not because the
+    /// is legal. However, updating to `A,C,D,B` is not because the
     /// relative order of B and C have been reversed.
     pub sort_key: Vec<String>,
+
+    /// The inclusive maximum [`SequenceNumber`] of the most recently persisted
+    /// data for this partition.
+    ///
+    /// All writes with a [`SequenceNumber`] less than and equal to this
+    /// [`SequenceNumber`] have been persisted to the object store. The inverse
+    /// is not guaranteed to be true due to update ordering; some files for this
+    /// partition may exist in the `parquet_files` table that have a greater
+    /// [`SequenceNumber`] than is specified here - the system will converge so
+    /// long as the ingester progresses.
+    ///
+    /// It is a system invariant that this value monotonically increases over
+    /// time - wrote another way, it is an invariant that partitions are
+    /// persisted (or at least made visible) in sequence order.
+    ///
+    /// If [`None`] no data has been persisted for this partition.
+    pub persisted_sequence_number: Option<SequenceNumber>,
 }
 
 impl Partition {
@@ -848,15 +913,6 @@ impl Partition {
     }
 }
 
-/// Information for a partition from the catalog.
-#[derive(Debug)]
-#[allow(missing_docs)]
-pub struct PartitionInfo {
-    pub partition: Partition,
-    pub namespace_name: String,
-    pub table_name: String,
-}
-
 /// Data for a partition  chosen from its parquet files
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, sqlx::FromRow)]
 pub struct PartitionParam {
@@ -868,6 +924,25 @@ pub struct PartitionParam {
     pub namespace_id: NamespaceId,
     /// the partition's table
     pub table_id: TableId,
+}
+
+/// Data recorded when compaction skips a partition.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, sqlx::FromRow)]
+pub struct SkippedCompaction {
+    /// the partition
+    pub partition_id: PartitionId,
+    /// the reason compaction was skipped
+    pub reason: String,
+    /// when compaction was skipped
+    pub skipped_at: Timestamp,
+    /// estimated memory budget
+    pub estimated_bytes: i64,
+    /// limit on memory budget
+    pub limit_bytes: i64,
+    /// num files selected to compact
+    pub num_files: i64,
+    /// limit on num files
+    pub limit_num_files: i64,
 }
 
 /// Data object for a tombstone.
@@ -896,10 +971,10 @@ impl Tombstone {
     }
 }
 /// Map of a column type to its count
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, sqlx::FromRow)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, sqlx::FromRow)]
 pub struct ColumnTypeCount {
     /// column type
-    pub col_type: i16,
+    pub col_type: ColumnType,
     /// count of the column type
     pub count: i64,
 }
@@ -907,10 +982,7 @@ pub struct ColumnTypeCount {
 impl ColumnTypeCount {
     /// make a new ColumnTypeCount
     pub fn new(col_type: ColumnType, count: i64) -> Self {
-        Self {
-            col_type: col_type as i16,
-            count,
-        }
+        Self { col_type, count }
     }
 }
 
@@ -1086,7 +1158,7 @@ impl ChunkId {
 
     /// **TESTING ONLY:** Create new ID from integer.
     ///
-    /// Since this can easily lead to ID collissions (which in turn can lead to panics), this must
+    /// Since this can easily lead to ID collisions (which in turn can lead to panics), this must
     /// only be used for testing purposes!
     pub fn new_test(id: u128) -> Self {
         Self(Uuid::from_u128(id))
@@ -3309,12 +3381,14 @@ mod tests {
             topic_id: TopicId::new(2),
             query_pool_id: QueryPoolId::new(3),
             tables: BTreeMap::from([]),
+            max_columns_per_table: 4,
         };
         let schema2 = NamespaceSchema {
             id: NamespaceId::new(1),
             topic_id: TopicId::new(2),
             query_pool_id: QueryPoolId::new(3),
             tables: BTreeMap::from([(String::from("foo"), TableSchema::new(TableId::new(1)))]),
+            max_columns_per_table: 4,
         };
         assert!(schema1.size() < schema2.size());
     }

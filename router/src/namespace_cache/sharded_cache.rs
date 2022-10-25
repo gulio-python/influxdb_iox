@@ -60,6 +60,7 @@ mod tests {
             topic_id: TopicId::new(1),
             query_pool_id: QueryPoolId::new(1),
             tables: Default::default(),
+            max_columns_per_table: 7,
         }
     }
 
@@ -84,12 +85,12 @@ mod tests {
             .collect::<HashMap<_, _>>();
 
         // The cache should be empty.
-        for (name, _) in names.iter() {
+        for name in names.keys() {
             assert!(cache.get_schema(name).is_none());
         }
 
         // Populate the cache
-        for (name, id) in names.iter() {
+        for (name, id) in &names {
             let schema = schema_with_id(*id as _);
             assert!(cache.put_schema(name.clone(), schema).is_none());
         }

@@ -5,14 +5,16 @@
     clippy::explicit_iter_loop,
     clippy::use_self,
     clippy::clone_on_ref_ptr,
-    clippy::future_not_send
+    clippy::future_not_send,
+    clippy::todo,
+    clippy::dbg_macro
 )]
 
 use async_trait::async_trait;
 use data_types::{
     ChunkId, ChunkOrder, DeletePredicate, InfluxDbType, PartitionId, TableSummary, TimestampMinMax,
 };
-use datafusion::physical_plan::SendableRecordBatchStream;
+use datafusion::{error::DataFusionError, physical_plan::SendableRecordBatchStream};
 use exec::{stringset::StringSet, IOxSessionContext};
 use hashbrown::HashMap;
 use observability_deps::tracing::{debug, trace};
@@ -50,7 +52,7 @@ pub trait QueryChunkMeta {
     fn partition_sort_key(&self) -> Option<&SortKey>;
 
     /// Return partition id for this chunk
-    fn partition_id(&self) -> Option<PartitionId>;
+    fn partition_id(&self) -> PartitionId;
 
     /// return a reference to the sort key if any
     fn sort_key(&self) -> Option<&SortKey>;
@@ -139,9 +141,6 @@ impl Drop for QueryCompletedToken {
 /// This avoids storing potentially large strings
 pub type QueryText = Box<dyn std::fmt::Display + Send + Sync>;
 
-/// Error type for [`QueryDatabase`] operations.
-pub type QueryDatabaseError = Box<dyn std::error::Error + Send + Sync + 'static>;
-
 /// A `Database` is the main trait implemented by the IOx subsystems
 /// that store actual data.
 ///
@@ -150,14 +149,21 @@ pub type QueryDatabaseError = Box<dyn std::error::Error + Send + Sync + 'static>
 #[async_trait]
 pub trait QueryDatabase: QueryDatabaseMeta + Debug + Send + Sync {
     /// Returns a set of chunks within the partition with data that may match
-    /// the provided predicate. If possible, chunks which have no rows that can
+    /// the provided predicate.
+    ///
+    /// If possible, chunks which have no rows that can
     /// possibly match the predicate may be omitted.
+    ///
+    /// If projection is None, returned chunks will include all columns of its original data. Otherwise,
+    /// returned chunks will include PK columns (tags and time) and columns specified in the projection. Projecting
+    /// chunks here is optional and a mere optimization. The query subsystem does NOT rely on it.
     async fn chunks(
         &self,
         table_name: &str,
         predicate: &Predicate,
+        projection: &Option<Vec<usize>>,
         ctx: IOxSessionContext,
-    ) -> Result<Vec<Arc<dyn QueryChunk>>, QueryDatabaseError>;
+    ) -> Result<Vec<Arc<dyn QueryChunk>>, DataFusionError>;
 
     /// Record that particular type of query was run / planned
     fn record_query(
@@ -172,9 +178,6 @@ pub trait QueryDatabase: QueryDatabaseMeta + Debug + Send + Sync {
     /// This is required until <https://github.com/rust-lang/rust/issues/65991> is fixed.
     fn as_meta(&self) -> &dyn QueryDatabaseMeta;
 }
-
-/// Error type for [`QueryChunk`] operations.
-pub type QueryChunkError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
 /// Collection of data that shares the same partition key
 pub trait QueryChunk: QueryChunkMeta + Debug + Send + Sync + 'static {
@@ -198,7 +201,7 @@ pub trait QueryChunk: QueryChunkMeta + Debug + Send + Sync + 'static {
     fn apply_predicate_to_metadata(
         &self,
         predicate: &Predicate,
-    ) -> Result<PredicateMatch, QueryChunkError> {
+    ) -> Result<PredicateMatch, DataFusionError> {
         Ok(self
             .summary()
             .map(|summary| predicate.apply_to_table_summary(&summary, self.schema().as_arrow()))
@@ -214,7 +217,7 @@ pub trait QueryChunk: QueryChunkMeta + Debug + Send + Sync + 'static {
         ctx: IOxSessionContext,
         predicate: &Predicate,
         columns: Selection<'_>,
-    ) -> Result<Option<StringSet>, QueryChunkError>;
+    ) -> Result<Option<StringSet>, DataFusionError>;
 
     /// Return a set of Strings containing the distinct values in the
     /// specified columns. If the predicate can be evaluated entirely
@@ -226,7 +229,7 @@ pub trait QueryChunk: QueryChunkMeta + Debug + Send + Sync + 'static {
         ctx: IOxSessionContext,
         column_name: &str,
         predicate: &Predicate,
-    ) -> Result<Option<StringSet>, QueryChunkError>;
+    ) -> Result<Option<StringSet>, DataFusionError>;
 
     /// Provides access to raw `QueryChunk` data as an
     /// asynchronous stream of `RecordBatch`es filtered by a *required*
@@ -246,7 +249,7 @@ pub trait QueryChunk: QueryChunkMeta + Debug + Send + Sync + 'static {
         ctx: IOxSessionContext,
         predicate: &Predicate,
         selection: Selection<'_>,
-    ) -> Result<SendableRecordBatchStream, QueryChunkError>;
+    ) -> Result<SendableRecordBatchStream, DataFusionError>;
 
     /// Returns chunk type. Useful in tests and debug logs.
     fn chunk_type(&self) -> &str;
@@ -271,7 +274,7 @@ where
         self.as_ref().schema()
     }
 
-    fn partition_id(&self) -> Option<PartitionId> {
+    fn partition_id(&self) -> PartitionId {
         self.as_ref().partition_id()
     }
 
@@ -304,7 +307,7 @@ impl QueryChunkMeta for Arc<dyn QueryChunk> {
         self.as_ref().schema()
     }
 
-    fn partition_id(&self) -> Option<PartitionId> {
+    fn partition_id(&self) -> PartitionId {
         self.as_ref().partition_id()
     }
 
@@ -328,21 +331,24 @@ impl QueryChunkMeta for Arc<dyn QueryChunk> {
 }
 
 /// return true if all the chunks include statistics
-pub fn chunks_have_stats(chunks: &[Arc<dyn QueryChunk>]) -> bool {
+pub fn chunks_have_stats<'a>(chunks: impl IntoIterator<Item = &'a Arc<dyn QueryChunk>>) -> bool {
     // If at least one of the provided chunk cannot provide stats,
     // do not need to compute potential duplicates. We will treat
     // as all of them have duplicates
-    chunks.iter().all(|c| c.summary().is_some())
+    chunks.into_iter().all(|c| c.summary().is_some())
 }
 
-pub fn compute_sort_key_for_chunks(schema: &Schema, chunks: &[Arc<dyn QueryChunk>]) -> SortKey {
+pub fn compute_sort_key_for_chunks<'a>(
+    schema: &Schema,
+    chunks: impl Copy + IntoIterator<Item = &'a Arc<dyn QueryChunk>>,
+) -> SortKey {
     if !chunks_have_stats(chunks) {
         // chunks have not enough stats, return its pk that is
         // sorted lexicographically but time column always last
         SortKey::from_columns(schema.primary_key())
     } else {
         let summaries = chunks
-            .iter()
+            .into_iter()
             .map(|x| x.summary().expect("Chunk should have summary"));
         compute_sort_key(summaries)
     }

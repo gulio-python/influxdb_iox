@@ -1,6 +1,15 @@
 #![deny(rustdoc::broken_intra_doc_links, rustdoc::bare_urls, rust_2018_idioms)]
 #![allow(clippy::clone_on_ref_ptr)]
 
+//! This module contains various DataFusion utility functions.
+//!
+//! Almost everything for manipulating DataFusion `Expr`s IOx should be in DataFusion already
+//! (or if not it should be upstreamed).
+//!
+//! For example, check out
+//! [datafusion_optimizer::utils](https://docs.rs/datafusion-optimizer/13.0.0/datafusion_optimizer/utils/index.html)
+//! for expression manipulation functions.
+
 pub mod sender;
 pub mod watch;
 
@@ -9,21 +18,21 @@ use std::task::{Context, Poll};
 
 use datafusion::arrow::array::BooleanArray;
 use datafusion::arrow::compute::filter_record_batch;
+use datafusion::arrow::datatypes::DataType;
 use datafusion::common::DataFusionError;
 use datafusion::datasource::MemTable;
 use datafusion::execution::context::TaskContext;
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::common::SizedRecordBatchStream;
 use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MemTrackingMetrics};
-use datafusion::physical_plan::{collect, ExecutionPlan};
-use datafusion::prelude::SessionContext;
+use datafusion::physical_plan::{collect, EmptyRecordBatchStream, ExecutionPlan};
+use datafusion::prelude::{lit, Column, Expr, SessionContext};
 use datafusion::{
     arrow::{
         datatypes::{Schema, SchemaRef},
         error::Result as ArrowResult,
         record_batch::RecordBatch,
     },
-    logical_plan::{col, lit, Expr, Operator},
     physical_plan::{RecordBatchStream, SendableRecordBatchStream},
     scalar::ScalarValue,
 };
@@ -31,32 +40,6 @@ use futures::{Stream, StreamExt};
 use tokio::sync::mpsc::{Receiver, UnboundedReceiver};
 use tokio_stream::wrappers::{ReceiverStream, UnboundedReceiverStream};
 use watch::WatchedTask;
-
-/// Split an Expr up into its constituent parts
-///
-/// ```text
-/// A ==> Vec[A]
-/// A AND B AND C ==> Vec[A, B, C]
-/// ```
-pub fn disassemble_conjuct(expr: Expr) -> Vec<Expr> {
-    let mut exprs = vec![];
-    disassemble_conjuct_impl(expr, &mut exprs);
-    exprs
-}
-
-fn disassemble_conjuct_impl(expr: Expr, exprs: &mut Vec<Expr>) {
-    match expr {
-        Expr::BinaryExpr {
-            right,
-            op: Operator::And,
-            left,
-        } => {
-            disassemble_conjuct_impl(*left, exprs);
-            disassemble_conjuct_impl(*right, exprs);
-        }
-        other => exprs.push(other),
-    }
-}
 
 /// Traits to help creating DataFusion [`Expr`]s
 pub trait AsExpr {
@@ -75,13 +58,23 @@ pub trait AsExpr {
 
 impl AsExpr for Arc<str> {
     fn as_expr(&self) -> Expr {
-        col(self.as_ref())
+        self.as_ref().as_expr()
     }
 }
 
 impl AsExpr for str {
     fn as_expr(&self) -> Expr {
-        col(self)
+        // note using `col(<ident>)` will parse identifiers and try to
+        // split them on `.`.
+        //
+        // So it would treat 'foo.bar' as table 'foo', column 'bar'
+        //
+        // This is not correct for influxrpc, so instead treat it
+        // like the column "foo.bar"
+        Expr::Column(Column {
+            relation: None,
+            name: self.into(),
+        })
     }
 }
 
@@ -89,6 +82,16 @@ impl AsExpr for Expr {
     fn as_expr(&self) -> Expr {
         self.clone()
     }
+}
+
+/// Creates an `Expr` that represents a Dictionary encoded string (e.g
+/// the type of constant that a tag would be compared to)
+pub fn lit_dict(value: &str) -> Expr {
+    // expr has been type coerced
+    lit(ScalarValue::Dictionary(
+        Box::new(DataType::Int32),
+        Box::new(ScalarValue::new_utf8(value)),
+    ))
 }
 
 /// Creates expression like:
@@ -99,8 +102,9 @@ pub fn make_range_expr(start: i64, end: i64, time: impl AsRef<str>) -> Expr {
     let ts_start = ScalarValue::TimestampNanosecond(Some(start), None);
     let ts_end = ScalarValue::TimestampNanosecond(Some(end), None);
 
-    let ts_low = lit(ts_start).lt_eq(col(time.as_ref()));
-    let ts_high = col(time.as_ref()).lt(lit(ts_end));
+    let time_col = time.as_ref().as_expr();
+    let ts_low = lit(ts_start).lt_eq(time_col.clone());
+    let ts_high = time_col.lt(lit(ts_end));
 
     ts_low.and(ts_high)
 }
@@ -236,12 +240,19 @@ where
 }
 
 /// Create a SendableRecordBatchStream a RecordBatch
-pub fn stream_from_batch(batch: RecordBatch) -> SendableRecordBatchStream {
-    stream_from_batches(vec![Arc::new(batch)])
+pub fn stream_from_batch(schema: Arc<Schema>, batch: RecordBatch) -> SendableRecordBatchStream {
+    stream_from_batches(schema, vec![Arc::new(batch)])
 }
 
 /// Create a SendableRecordBatchStream from Vec of RecordBatches with the same schema
-pub fn stream_from_batches(batches: Vec<Arc<RecordBatch>>) -> SendableRecordBatchStream {
+pub fn stream_from_batches(
+    schema: Arc<Schema>,
+    batches: Vec<Arc<RecordBatch>>,
+) -> SendableRecordBatchStream {
+    if batches.is_empty() {
+        return Box::pin(EmptyRecordBatchStream::new(schema));
+    }
+
     let dummy_metrics = ExecutionPlanMetricsSet::new();
     let mem_metrics = MemTrackingMetrics::new(&dummy_metrics, 0);
     let stream = SizedRecordBatchStream::new(batches[0].schema(), batches, mem_metrics);
@@ -368,7 +379,7 @@ mod tests {
 
         let ts_predicate_expr = make_range_expr(101, 202, "time");
         let expected_string =
-            "TimestampNanosecond(101, None) <= #time AND #time < TimestampNanosecond(202, None)";
+            "TimestampNanosecond(101, None) <= time AND time < TimestampNanosecond(202, None)";
         let actual_string = format!("{:?}", ts_predicate_expr);
 
         assert_eq!(actual_string, expected_string);

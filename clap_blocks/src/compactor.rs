@@ -19,7 +19,7 @@ macro_rules! gen_compactor_config {
             /// Write buffer topic/database that the compactor will be compacting files for. It
             /// won't connect to Kafka, but uses this to get the shards out of the catalog.
             #[clap(
-                long = "--write-buffer-topic",
+                long = "write-buffer-topic",
                 env = "INFLUXDB_IOX_WRITE_BUFFER_TOPIC",
                 default_value = "iox-shared",
                 action
@@ -28,7 +28,7 @@ macro_rules! gen_compactor_config {
 
             /// Write buffer shard index to start (inclusive) range with
             #[clap(
-                long = "--shard-index-range-start",
+                long = "shard-index-range-start",
                 env = "INFLUXDB_IOX_SHARD_INDEX_RANGE_START",
                 action
             )]
@@ -36,7 +36,7 @@ macro_rules! gen_compactor_config {
 
             /// Write buffer shard index to end (inclusive) range with
             #[clap(
-                long = "--shard-index-range-end",
+                long = "shard-index-range-end",
                 env = "INFLUXDB_IOX_SHARD_INDEX_RANGE_END",
                 action
             )]
@@ -46,7 +46,7 @@ macro_rules! gen_compactor_config {
             /// It is a target desired value, rather than a guarantee.
             /// 1024 * 1024 * 25 =  26,214,400 (25MB)
             #[clap(
-                long = "--compaction-max-desired-size-bytes",
+                long = "compaction-max-desired-size-bytes",
                 env = "INFLUXDB_IOX_COMPACTION_MAX_DESIRED_FILE_SIZE_BYTES",
                 default_value = "26214400",
                 action
@@ -60,7 +60,7 @@ macro_rules! gen_compactor_config {
             /// This value must be between (0, 100)
             /// Default is 80
             #[clap(
-                long = "--compaction-percentage-max-file_size",
+                long = "compaction-percentage-max-file_size",
                 env = "INFLUXDB_IOX_COMPACTION_PERCENTAGE_MAX_FILE_SIZE",
                 default_value = "80",
                 action
@@ -77,33 +77,17 @@ macro_rules! gen_compactor_config {
             /// This value must be between (0, 100)
             /// Default is 80
             #[clap(
-                long = "--compaction-split-percentage",
+                long = "compaction-split-percentage",
                 env = "INFLUXDB_IOX_COMPACTION_SPLIT_PERCENTAGE",
                 default_value = "80",
                 action
             )]
             pub split_percentage: u16,
 
-            /// The compactor will limit the number of simultaneous cold partition compaction jobs
-            /// based on the size of the input files to be compacted. This number should be less
-            /// than 1/10th of the available memory to ensure compactions have enough space to run.
-            ///
-            /// Default is 1024 * 1024 * 900 = 943,718,400 bytes (900MB).
-            //
-            // The number of compact_cold_partititons run in parallel is determined by:
-            //    max_cold_concurrent_size_bytes/cold_input_size_threshold_bytes
-            #[clap(
-                long = "--compaction-cold-concurrent-size-bytes",
-                env = "INFLUXDB_IOX_COMPACTION_COLD_CONCURRENT_SIZE_BYTES",
-                default_value = "943718400",
-                action
-            )]
-            pub max_cold_concurrent_size_bytes: u64,
-
             /// Max number of partitions per shard we want to compact per cycle
             /// Default: 1
             #[clap(
-                long = "--compaction-max-number-partitions-per-shard",
+                long = "compaction-max-number-partitions-per-shard",
                 env = "INFLUXDB_IOX_COMPACTION_MAX_NUMBER_PARTITIONS_PER_SHARD",
                 default_value = "1",
                 action
@@ -115,40 +99,12 @@ macro_rules! gen_compactor_config {
             ///
             /// Default: 1
             #[clap(
-                long = "--compaction-min-number-recent-ingested-files-per-partition",
+                long = "compaction-min-number-recent-ingested-files-per-partition",
                 env = "INFLUXDB_IOX_COMPACTION_MIN_NUMBER_RECENT_INGESTED_FILES_PER_PARTITION",
                 default_value = "1",
                 action
             )]
             pub min_number_recent_ingested_files_per_partition: usize,
-
-            /// A compaction operation for cold partitions will gather as many L0 files with their
-            /// overlapping L1 files to compact together until the total size of input files
-            /// crosses this threshold. Later compactions will pick up the remaining L0 files.
-            ///
-            /// Default is 1024 * 1024 * 600 = 629,145,600 bytes (600MB).
-            #[clap(
-                long = "--compaction-cold-input-size-threshold-bytes",
-                env = "INFLUXDB_IOX_COMPACTION_COLD_INPUT_SIZE_THRESHOLD_BYTES",
-                default_value = "629145600",
-                action
-            )]
-            pub cold_input_size_threshold_bytes: u64,
-
-            /// A compaction operation for cold partitions  will gather as many L0 files with their 
-            /// overlapping L1 files to compact together until the total number of L0 + L1 files 
-            /// crosses this threshold.
-            /// Later compactions will pick up the remaining L0 files.
-            ///
-            /// A compaction operation will be limited by this or by the cold input size threshold,
-            /// whichever is hit first.
-            #[clap(
-                long = "--compaction-cold-input-file-count-threshold",
-                env = "INFLUXDB_IOX_COMPACTION_COLD_INPUT_FILE_COUNT_THRESHOLD",
-                default_value = "50",
-                action
-            )]
-            pub cold_input_file_count_threshold: usize,
 
             /// The multiple of times that compacting hot partitions should run for every one time
             /// that compacting cold partitions runs. Set to 1 to compact hot partitions and cold
@@ -157,30 +113,59 @@ macro_rules! gen_compactor_config {
             /// Default is
             #[doc = $hot_multiple_default]
             #[clap(
-                long = "--compaction-hot-multiple",
+                long = "compaction-hot-multiple",
                 env = "INFLUXDB_IOX_COMPACTION_HOT_MULTIPLE",
                 default_value = $hot_multiple_default,
                 action
             )]
             pub hot_multiple: usize,
 
-            /// The memory budget asigned to this compactor.
-            /// For each partition candidate, we will esimate the memory needed to compact each file
-            /// and only add more files if their needed estimated memory is below this memory budget.
-            /// Since we must compact L1 files that overlapped with L0 files, if their total estimated 
-            /// memory do not allow us to compact a part of a partition at all, we will not compact 
-            /// it and will log the partition and its related information in a table in our catalog for
-            /// further diagnosis of the issue.
-            /// How many candidates compacted concurrently are also decided using this estimation and
-            /// budget.
+            /// The memory budget assigned to this compactor.
+            ///
+            /// For each partition candidate, we will estimate the memory needed to compact each
+            /// file and only add more files if their needed estimated memory is below this memory
+            /// budget. Since we must compact L1 files that overlapped with L0 files, if their
+            /// total estimated memory does not allow us to compact a part of a partition at all,
+            /// we will not compact it and will log the partition and its related information in a
+            /// table in our catalog for further diagnosis of the issue.
+            ///
+            /// The number of candidates compacted concurrently is also decided using this
+            /// estimation and budget.
+            ///
             /// Default is 30 * 1024 * 1024 * 1024 = 32,212,254,720 bytes (30GB).
             #[clap(
-                long = "--compaction-memory-budget-bytes",
+                long = "compaction-memory-budget-bytes",
                 env = "INFLUXDB_IOX_COMPACTION_MEMORY_BUDGET_BYTES",
                 default_value = "32212254720",
                 action
             )]
             pub memory_budget_bytes: u64,
+
+            /// Minimum number of rows allocated for each record batch fed into DataFusion plan
+            /// 
+            /// We will use max(parquet_file's row_count, min_num_rows_allocated_per_record_batch_to_datafusion_plan)
+            /// to estimate number of rows allocated for each record batch fed into DataFusion plan.
+            /// 
+            #[clap(
+                long = "compaction-min-rows-allocated-per-record-batch-to-plan",
+                env = "INFLUXDB_IOX_COMPACTION_MIN_ROWS_PER_RECORD_BATCH_TO_PLAN",
+                default_value = "8192",
+                action
+            )]
+            pub min_num_rows_allocated_per_record_batch_to_datafusion_plan: u64,
+
+            /// Max number of files to compact per partition
+            /// 
+            /// Due to limitations of the implementation of the compaction plans
+            /// there is a hard maximum on the number of files that can be compacted
+            /// at once. This avoids a wide fan-in multi-way merge in the DataFusion plan
+            #[clap(
+                long = "compaction-max-num-compacting-files",
+                env = "INFLUXDB_IOX_COMPACTION_MAX_COMPACTING_FILES",
+                default_value = "20",
+                action
+            )]
+            pub max_num_compacting_files: usize,
         }
     };
 }
@@ -200,14 +185,14 @@ impl CompactorOnceConfig {
             max_desired_file_size_bytes: self.max_desired_file_size_bytes,
             percentage_max_file_size: self.percentage_max_file_size,
             split_percentage: self.split_percentage,
-            max_cold_concurrent_size_bytes: self.max_cold_concurrent_size_bytes,
             max_number_partitions_per_shard: self.max_number_partitions_per_shard,
             min_number_recent_ingested_files_per_partition: self
                 .min_number_recent_ingested_files_per_partition,
-            cold_input_size_threshold_bytes: self.cold_input_size_threshold_bytes,
-            cold_input_file_count_threshold: self.cold_input_file_count_threshold,
             hot_multiple: self.hot_multiple,
             memory_budget_bytes: self.memory_budget_bytes,
+            min_num_rows_allocated_per_record_batch_to_datafusion_plan: self
+                .min_num_rows_allocated_per_record_batch_to_datafusion_plan,
+            max_num_compacting_files: self.max_num_compacting_files,
         }
     }
 }

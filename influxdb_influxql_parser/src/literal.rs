@@ -1,14 +1,14 @@
-#![allow(dead_code)]
-
+use crate::internal::{map_fail, ParseResult};
+use crate::keywords::keyword;
 use crate::string::{regex, single_quoted_string, Regex};
-use crate::write_escaped;
+use crate::{impl_tuple_clause, write_escaped};
 use nom::branch::alt;
-use nom::bytes::complete::{tag, tag_no_case};
-use nom::character::complete::digit1;
-use nom::combinator::{map, map_res, recognize, value};
+use nom::bytes::complete::tag;
+use nom::character::complete::{char, digit0, digit1, multispace0};
+use nom::combinator::{map, opt, recognize, value};
 use nom::multi::fold_many1;
-use nom::sequence::{pair, separated_pair};
-use nom::IResult;
+use nom::sequence::{pair, preceded, separated_pair};
+use std::fmt;
 use std::fmt::{Display, Formatter, Write};
 
 /// Number of nanoseconds in a microsecond.
@@ -26,7 +26,7 @@ const NANOS_PER_DAY: i64 = 24 * NANOS_PER_HOUR;
 /// Number of nanoseconds in a week.
 const NANOS_PER_WEEK: i64 = 7 * NANOS_PER_DAY;
 
-// Primitive InfluxQL literal values, such as strings and regular expressions.
+/// Primitive InfluxQL literal values, such as strings and regular expressions.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Literal {
     /// Unsigned integer literal.
@@ -87,19 +87,17 @@ impl From<Regex> for Literal {
 impl Display for Literal {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Unsigned(v) => write!(f, "{}", v)?,
-            Self::Float(v) => write!(f, "{}", v)?,
+            Self::Unsigned(v) => write!(f, "{}", v),
+            Self::Float(v) => write!(f, "{}", v),
             Self::String(v) => {
                 f.write_char('\'')?;
                 write_escaped!(f, v, '\n' => "\\n", '\\' => "\\\\", '\'' => "\\'", '"' => "\\\"");
-                f.write_char('\'')?;
+                f.write_char('\'')
             }
-            Self::Boolean(v) => write!(f, "{}", if *v { "true" } else { "false" })?,
-            Self::Duration(v) => write!(f, "{}", v)?,
-            Self::Regex(v) => write!(f, "{}", v)?,
+            Self::Boolean(v) => write!(f, "{}", if *v { "true" } else { "false" }),
+            Self::Duration(v) => write!(f, "{}", v),
+            Self::Regex(v) => write!(f, "{}", v),
         }
-
-        Ok(())
     }
 }
 
@@ -110,8 +108,8 @@ impl Display for Literal {
 /// ```text
 /// INTEGER ::= [0-9]+
 /// ```
-fn integer(i: &str) -> IResult<&str, i64> {
-    map_res(digit1, |s: &str| s.parse())(i)
+fn integer(i: &str) -> ParseResult<&str, i64> {
+    map_fail("unable to parse integer", digit1, &str::parse)(i)
 }
 
 /// Parse an unsigned InfluxQL integer.
@@ -121,8 +119,8 @@ fn integer(i: &str) -> IResult<&str, i64> {
 /// ```text
 /// INTEGER ::= [0-9]+
 /// ```
-fn unsigned_integer(i: &str) -> IResult<&str, u64> {
-    map_res(digit1, |s: &str| s.parse())(i)
+pub(crate) fn unsigned_integer(i: &str) -> ParseResult<&str, u64> {
+    map_fail("unable to parse unsigned integer", digit1, &str::parse)(i)
 }
 
 /// Parse an unsigned InfluxQL floating point number.
@@ -133,19 +131,63 @@ fn unsigned_integer(i: &str) -> IResult<&str, u64> {
 /// float   ::= INTEGER "." INTEGER
 /// INTEGER ::= [0-9]+
 /// ```
-fn float(i: &str) -> IResult<&str, f64> {
-    map_res(
-        recognize(separated_pair(digit1, tag("."), digit1)),
-        |s: &str| s.parse(),
+fn float(i: &str) -> ParseResult<&str, f64> {
+    map_fail(
+        "unable to parse float",
+        recognize(separated_pair(digit0, tag("."), digit1)),
+        &str::parse,
     )(i)
 }
 
+/// Represents any signed number.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Number {
+    /// Contains a 64-bit integer.
+    Integer(i64),
+    /// Contains a 64-bit float.
+    Float(f64),
+}
+
+impl Display for Number {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Integer(v) => fmt::Display::fmt(v, f),
+            Self::Float(v) => fmt::Display::fmt(v, f),
+        }
+    }
+}
+
+impl From<f64> for Number {
+    fn from(v: f64) -> Self {
+        Self::Float(v)
+    }
+}
+
+impl From<i64> for Number {
+    fn from(v: i64) -> Self {
+        Self::Integer(v)
+    }
+}
+
+/// Parse a signed [`Number`].
+pub(crate) fn number(i: &str) -> ParseResult<&str, Number> {
+    let (remaining, sign) = opt(alt((char('-'), char('+'))))(i)?;
+    preceded(
+        multispace0,
+        alt((
+            map(float, move |v| {
+                Number::Float(v * if let Some('-') = sign { -1.0 } else { 1.0 })
+            }),
+            map(integer, move |v| {
+                Number::Integer(v * if let Some('-') = sign { -1 } else { 1 })
+            }),
+        )),
+    )(remaining)
+}
+
 /// Parse the input for an InfluxQL boolean, which must be the value `true` or `false`.
-fn boolean(i: &str) -> IResult<&str, bool> {
-    alt((
-        value(true, tag_no_case("true")),
-        value(false, tag_no_case("false")),
-    ))(i)
+fn boolean(i: &str) -> ParseResult<&str, bool> {
+    alt((value(true, keyword("TRUE")), value(false, keyword("FALSE"))))(i)
 }
 
 #[derive(Clone)]
@@ -162,13 +204,9 @@ enum DurationUnit {
 
 /// Represents an InfluxQL duration in nanoseconds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Duration(i64);
+pub struct Duration(pub(crate) i64);
 
-impl From<i64> for Duration {
-    fn from(v: i64) -> Self {
-        Self(v)
-    }
-}
+impl_tuple_clause!(Duration, i64);
 
 static DIVISORS: [(i64, &str); 8] = [
     (NANOS_PER_WEEK, "w"),
@@ -202,7 +240,7 @@ impl Display for Duration {
 }
 
 /// Parse the input for a InfluxQL duration fragment and returns the value in nanoseconds.
-fn single_duration(i: &str) -> IResult<&str, i64> {
+fn single_duration(i: &str) -> ParseResult<&str, i64> {
     use DurationUnit::*;
 
     map(
@@ -233,8 +271,8 @@ fn single_duration(i: &str) -> IResult<&str, i64> {
     )(i)
 }
 
-/// Parse the input for an InfluxQL duration and returns the value in nanoseconds.
-fn duration(i: &str) -> IResult<&str, Duration> {
+/// Parse the input for an InfluxQL duration.
+pub(crate) fn duration(i: &str) -> ParseResult<&str, Duration> {
     map(
         fold_many1(single_duration, || 0, |acc, fragment| acc + fragment),
         Duration,
@@ -243,8 +281,8 @@ fn duration(i: &str) -> IResult<&str, Duration> {
 
 /// Parse an InfluxQL literal, except a [`Regex`].
 ///
-/// See [`literal_regex`] for parsing literal regular expressions.
-pub fn literal(i: &str) -> IResult<&str, Literal> {
+/// Use [`literal`] for parsing any literals, excluding regular expressions.
+pub(crate) fn literal_no_regex(i: &str) -> ParseResult<&str, Literal> {
     alt((
         // NOTE: order is important, as floats should be tested before durations and integers.
         map(float, Literal::Float),
@@ -255,42 +293,55 @@ pub fn literal(i: &str) -> IResult<&str, Literal> {
     ))(i)
 }
 
+/// Parse any InfluxQL literal.
+pub(crate) fn literal(i: &str) -> ParseResult<&str, Literal> {
+    alt((literal_no_regex, map(regex, Literal::Regex)))(i)
+}
+
 /// Parse an InfluxQL literal regular expression.
-pub fn literal_regex(i: &str) -> IResult<&str, Literal> {
+pub(crate) fn literal_regex(i: &str) -> ParseResult<&str, Literal> {
     map(regex, Literal::Regex)(i)
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
+    use assert_matches::assert_matches;
+
+    #[test]
+    fn test_literal_no_regex() {
+        let (_, got) = literal_no_regex("42").unwrap();
+        assert_matches!(got, Literal::Unsigned(42));
+
+        let (_, got) = literal_no_regex("42.69").unwrap();
+        assert_matches!(got, Literal::Float(v) if v == 42.69);
+
+        let (_, got) = literal_no_regex("'quick draw'").unwrap();
+        assert_matches!(got, Literal::String(v) if v == "quick draw");
+
+        let (_, got) = literal_no_regex("false").unwrap();
+        assert_matches!(got, Literal::Boolean(false));
+
+        let (_, got) = literal_no_regex("true").unwrap();
+        assert_matches!(got, Literal::Boolean(true));
+
+        let (_, got) = literal_no_regex("3h25m").unwrap();
+        assert_matches!(got, Literal::Duration(v) if v == Duration(3 * NANOS_PER_HOUR + 25 * NANOS_PER_MIN));
+
+        // Fallible cases
+        literal_no_regex("/foo/").unwrap_err();
+    }
 
     #[test]
     fn test_literal() {
-        let (_, got) = literal("42").unwrap();
-        assert!(matches!(got, Literal::Unsigned(42)));
-
-        let (_, got) = literal("42.69").unwrap();
-        assert!(matches!(got, Literal::Float(v) if v == 42.69));
-
-        let (_, got) = literal("'quick draw'").unwrap();
-        assert!(matches!(got, Literal::String(v) if v == "quick draw"));
-
-        let (_, got) = literal("false").unwrap();
-        assert!(matches!(got, Literal::Boolean(false)));
-
-        let (_, got) = literal("true").unwrap();
-        assert!(matches!(got, Literal::Boolean(true)));
-
-        let (_, got) = literal("3h25m").unwrap();
-        assert!(
-            matches!(got, Literal::Duration(v) if v == Duration(3 * NANOS_PER_HOUR + 25 * NANOS_PER_MIN))
-        );
+        let (_, got) = literal("/^(match|this)$/").unwrap();
+        assert_matches!(got, Literal::Regex(v) if v == "^(match|this)$".into());
     }
 
     #[test]
     fn test_literal_regex() {
         let (_, got) = literal_regex("/^(match|this)$/").unwrap();
-        assert!(matches!(got, Literal::Regex(v) if v == "^(match|this)$".into() ));
+        assert_matches!(got, Literal::Regex(v) if v == "^(match|this)$".into());
     }
 
     #[test]
@@ -324,6 +375,9 @@ mod test {
         let (_, got) = float("42.69").unwrap();
         assert_eq!(got, 42.69);
 
+        let (_, got) = float(".25").unwrap();
+        assert_eq!(got, 0.25);
+
         let (_, got) = float(&format!("{:.1}", f64::MAX)[..]).unwrap();
         assert_eq!(got, f64::MAX);
 
@@ -342,6 +396,11 @@ mod test {
         assert!(got);
         let (_, got) = boolean("false").unwrap();
         assert!(!got);
+
+        // Fallible cases
+
+        boolean("truey").unwrap_err();
+        boolean("falsey").unwrap_err();
     }
 
     #[test]
@@ -409,5 +468,40 @@ mod test {
         );
         let got = format!("{}", d);
         assert_eq!(got, "20w6d13h11m10s9ms8us500ns");
+    }
+
+    #[test]
+    fn test_number() {
+        // Test floating point numbers
+        let (_, got) = number("55.3").unwrap();
+        assert_matches!(got, Number::Float(v) if v == 55.3);
+
+        let (_, got) = number("-18.9").unwrap();
+        assert_matches!(got, Number::Float(v) if v == -18.9);
+
+        let (_, got) = number("- 18.9").unwrap();
+        assert_matches!(got, Number::Float(v) if v == -18.9);
+
+        let (_, got) = number("+33.1").unwrap();
+        assert_matches!(got, Number::Float(v) if v == 33.1);
+
+        let (_, got) = number("+ 33.1").unwrap();
+        assert_matches!(got, Number::Float(v) if v == 33.1);
+
+        // Test integers
+        let (_, got) = number("42").unwrap();
+        assert_matches!(got, Number::Integer(v) if v == 42);
+
+        let (_, got) = number("-32").unwrap();
+        assert_matches!(got, Number::Integer(v) if v == -32);
+
+        let (_, got) = number("- 32").unwrap();
+        assert_matches!(got, Number::Integer(v) if v == -32);
+
+        let (_, got) = number("+501").unwrap();
+        assert_matches!(got, Number::Integer(v) if v == 501);
+
+        let (_, got) = number("+ 501").unwrap();
+        assert_matches!(got, Number::Integer(v) if v == 501);
     }
 }

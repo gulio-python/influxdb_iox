@@ -3,8 +3,8 @@
 use crate::handler::CompactorConfig;
 use backoff::BackoffConfig;
 use data_types::{
-    ColumnTypeCount, Namespace, NamespaceId, PartitionId, PartitionKey, PartitionParam, ShardId,
-    Table, TableId, TableSchema, Timestamp,
+    ColumnType, ColumnTypeCount, Namespace, NamespaceId, PartitionId, PartitionKey, PartitionParam,
+    ShardId, Table, TableId, TableSchema, Timestamp,
 };
 use iox_catalog::interface::{get_schema_by_id, Catalog};
 use iox_query::exec::Executor;
@@ -18,7 +18,7 @@ use parquet_file::storage::ParquetStorage;
 use schema::sort::SortKey;
 use snafu::{OptionExt, ResultExt, Snafu};
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, HashSet},
     sync::Arc,
     time::Duration,
 };
@@ -66,11 +66,11 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Error getting the most level 0 file partitions for shard {}. {}",
+        "Error getting the most level 0 + level 1 file cold partitions for shard {}. {}",
         shard_id,
         source
     ))]
-    MostL0Partitions {
+    MostColdPartitions {
         source: iox_catalog::interface::Error,
         shard_id: ShardId,
     },
@@ -83,7 +83,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[derive(Debug)]
 pub struct Compactor {
     /// Shards assigned to this compactor
-    shards: Vec<ShardId>,
+    pub(crate) shards: Vec<ShardId>,
 
     /// Object store for reading and persistence of parquet files
     pub(crate) store: ParquetStorage,
@@ -104,7 +104,7 @@ pub struct Compactor {
     pub(crate) config: CompactorConfig,
 
     /// Gauge for the number of compaction partition candidates before filtering
-    compaction_candidate_gauge: Metric<U64Gauge>,
+    pub(crate) compaction_candidate_gauge: Metric<U64Gauge>,
 
     /// Gauge for the number of Parquet file candidates after filtering. The recorded values have
     /// attributes for the compaction level of the file and whether the file was selected for
@@ -169,12 +169,15 @@ impl Compactor {
         );
 
         let file_size_buckets = U64HistogramOptions::new([
-            500 * 1024,       // 500 KB
-            1024 * 1024,      // 1 MB
-            3 * 1024 * 1024,  // 3 MB
-            10 * 1024 * 1024, // 10 MB
-            30 * 1024 * 1024, // 30 MB
-            u64::MAX,         // Inf
+            50 * 1024,         // 50KB
+            500 * 1024,        // 500 KB
+            1024 * 1024,       // 1 MB
+            3 * 1024 * 1024,   // 3 MB
+            10 * 1024 * 1024,  // 10 MB
+            30 * 1024 * 1024,  // 30 MB
+            100 * 1024 * 1024, // 100 MB
+            500 * 1024 * 1024, // 500 MB
+            u64::MAX,          // Inf
         ]);
 
         let parquet_file_candidate_bytes = registry.register_metric_with_options(
@@ -190,14 +193,15 @@ impl Compactor {
         );
 
         let duration_histogram_options = DurationHistogramOptions::new([
-            Duration::from_millis(100),
             Duration::from_millis(500),
-            Duration::from_micros(2_000),
+            Duration::from_millis(1_000), // 1 second
             Duration::from_millis(5_000),
             Duration::from_millis(15_000),
             Duration::from_millis(30_000),
             Duration::from_millis(60_000), // 1 minute
             Duration::from_millis(5 * 60_000),
+            Duration::from_millis(15 * 60_000),
+            Duration::from_millis(60 * 60_000),
             DURATION_MAX,
         ]);
         let compaction_duration: Metric<DurationHistogram> = registry.register_metric_with_options(
@@ -206,15 +210,18 @@ impl Compactor {
             || duration_histogram_options.clone(),
         );
 
-        let candidate_selection_duration: Metric<DurationHistogram> = registry.register_metric(
-            "compactor_candidate_selection_duration",
-            "Duration to select compaction partition candidates",
-        );
+        let candidate_selection_duration: Metric<DurationHistogram> = registry
+            .register_metric_with_options(
+                "compactor_candidate_selection_duration",
+                "Duration to select compaction partition candidates",
+                || duration_histogram_options.clone(),
+            );
 
         let partitions_extra_info_reading_duration: Metric<DurationHistogram> = registry
-            .register_metric(
+            .register_metric_with_options(
                 "compactor_partitions_extra_info_reading_duration",
                 "Duration to read and add extra information into selected partition candidates",
+                || duration_histogram_options.clone(),
             );
 
         let compaction_cycle_duration: Metric<DurationHistogram> = registry
@@ -243,117 +250,43 @@ impl Compactor {
         }
     }
 
-    /// Return a list of the most recent highest ingested throughput partitions.
-    /// The highest throughput partitions are prioritized as follows:
-    ///  1. If there are partitions with new ingested files within the last 4 hours, pick them.
-    ///  2. If no new ingested files in the last 4 hours, will look for partitions with new writes
-    ///     within the last 24 hours.
-    ///  3. If there are no ingested files within the last 24 hours, will look for partitions
-    ///     with any new ingested files in the past.
-    ///
-    /// * New ingested files means non-deleted L0 files
-    /// * In all cases above, for each shard, N partitions with the most new ingested files
-    ///   will be selected and the return list will include at most, P = N * S, partitions where S
-    ///   is the number of shards this compactor handles.
-    pub async fn hot_partitions_to_compact(
-        &self,
-        // Max number of the most recent highest ingested throughput partitions
-        // per shard we want to read
-        max_num_partitions_per_shard: usize,
-        // Minimum number of the most recent writes per partition we want to count
-        // to prioritize partitions
-        min_recent_ingested_files: usize,
-    ) -> Result<Vec<PartitionParam>> {
-        let mut candidates = Vec::with_capacity(self.shards.len() * max_num_partitions_per_shard);
-        let mut repos = self.catalog.repositories().await;
-
-        for shard_id in &self.shards {
-            let attributes = Attributes::from([
-                ("shard_id", format!("{}", *shard_id).into()),
-                ("partition_type", "hot".into()),
-            ]);
-
-            // Get the most recent highest ingested throughput partitions within
-            // the last 4 hours. If not, increase to 24 hours
-            let mut num_partitions = 0;
-            for num_hours in [4, 24] {
-                // convert "now() - num_hours" to timenanosecond
-                let time_at_num_hours_ago = Timestamp::new(
-                    (self.time_provider.now() - Duration::from_secs(60 * 60 * num_hours))
-                        .timestamp_nanos(),
-                );
-
-                let mut partitions = repos
-                    .parquet_files()
-                    .recent_highest_throughput_partitions(
-                        *shard_id,
-                        time_at_num_hours_ago,
-                        min_recent_ingested_files,
-                        max_num_partitions_per_shard,
-                    )
-                    .await
-                    .context(HighestThroughputPartitionsSnafu {
-                        shard_id: *shard_id,
-                    })?;
-
-                if !partitions.is_empty() {
-                    debug!(
-                        shard_id = shard_id.get(),
-                        num_hours,
-                        n = partitions.len(),
-                        "found high-throughput partitions"
-                    );
-                    num_partitions = partitions.len();
-                    candidates.append(&mut partitions);
-                    break;
-                }
-            }
-
-            // Record metric for candidates per shard
-            debug!(
-                shard_id = shard_id.get(),
-                n = num_partitions,
-                "hot compaction candidates",
-            );
-            let number_gauge = self.compaction_candidate_gauge.recorder(attributes);
-            number_gauge.set(num_partitions as u64);
-        }
-
-        Ok(candidates)
+    /// Access to the TimeProvider
+    pub fn time_provider(&self) -> Arc<dyn TimeProvider> {
+        Arc::clone(&self.time_provider) as _
     }
 
     /// Return a list of partitions that:
     ///
-    /// - Have not received any writes in 24 hours (determined by all parquet files having a
-    ///   created_at time older than 24 hours ago)
-    /// - Have some level 0 parquet files that need to be upgraded or compacted
+    /// - Have not received any writes in 8 hours (determined by all level 0 and level 1 parquet
+    ///   files having a created_at time older than 8 hours ago)
+    /// - Have some level 0 or level 1 parquet files that need to be upgraded or compacted
+    /// - Sorted by the number of level 0 files + number of level 1 files descending
     pub async fn cold_partitions_to_compact(
         &self,
         // Max number of cold partitions per shard we want to compact
         max_num_partitions_per_shard: usize,
-    ) -> Result<Vec<PartitionParam>> {
+    ) -> Result<Vec<Arc<PartitionCompactionCandidateWithInfo>>> {
+        let compaction_type = "cold";
         let mut candidates = Vec::with_capacity(self.shards.len() * max_num_partitions_per_shard);
-        let mut repos = self.catalog.repositories().await;
 
         for shard_id in &self.shards {
             let attributes = Attributes::from([
                 ("shard_id", format!("{}", *shard_id).into()),
-                ("partition_type", "cold".into()),
+                ("partition_type", compaction_type.into()),
             ]);
 
-            let time_24_hours_ago = Timestamp::new(
-                (self.time_provider.now() - Duration::from_secs(60 * 60 * 24)).timestamp_nanos(),
-            );
+            let time_8_hours_ago = Timestamp::from(self.time_provider.hours_ago(8));
 
+            let mut repos = self.catalog.repositories().await;
             let mut partitions = repos
                 .parquet_files()
-                .most_level_0_files_partitions(
+                .most_cold_files_partitions(
                     *shard_id,
-                    time_24_hours_ago,
+                    time_8_hours_ago,
                     max_num_partitions_per_shard,
                 )
                 .await
-                .context(MostL0PartitionsSnafu {
+                .context(MostColdPartitionsSnafu {
                     shard_id: *shard_id,
                 })?;
 
@@ -364,45 +297,72 @@ impl Compactor {
             debug!(
                 shard_id = shard_id.get(),
                 n = num_partitions,
-                "cold compaction candidates",
+                compaction_type,
+                "compaction candidates",
             );
             let number_gauge = self.compaction_candidate_gauge.recorder(attributes);
             number_gauge.set(num_partitions as u64);
+        }
+
+        // Get extra needed information for selected partitions
+        let start_time = self.time_provider.now();
+
+        // Column types and their counts of the tables of the partition candidates
+        debug!(
+            num_candidates=?candidates.len(),
+            compaction_type,
+            "start getting column types for the partition candidates"
+        );
+        let table_columns = self.table_columns(&candidates).await?;
+
+        // Add other compaction-needed info into selected partitions
+        debug!(
+            num_candidates=?candidates.len(),
+            compaction_type,
+            "start getting additional info for the partition candidates"
+        );
+        let candidates = self
+            .add_info_to_partitions(&candidates, &table_columns)
+            .await?;
+
+        if let Some(delta) = self.time_provider.now().checked_duration_since(start_time) {
+            let attributes = Attributes::from(&[("partition_type", compaction_type)]);
+            let duration = self
+                .partitions_extra_info_reading_duration
+                .recorder(attributes);
+            duration.record(delta);
         }
 
         Ok(candidates)
     }
 
     /// Get column types for tables of given partitions
-    pub async fn table_columns(
+    pub(crate) async fn table_columns(
         &self,
         partitions: &[PartitionParam],
     ) -> Result<HashMap<TableId, Vec<ColumnTypeCount>>> {
-        use std::collections::hash_map::Entry::Vacant; // this can be moved to the imports at the top if you want
         let mut repos = self.catalog.repositories().await;
 
-        let mut result = HashMap::with_capacity(partitions.len());
-
-        for table_id in partitions.iter().map(|p| p.table_id) {
-            let entry = result.entry(table_id);
-            if let Vacant(entry) = entry {
-                let cols = repos
-                    .columns()
-                    .list_type_count_by_table_id(table_id)
-                    .await
-                    .context(QueryingColumnSnafu)?;
-                entry.insert(cols);
-            }
+        let table_ids: HashSet<_> = partitions.iter().map(|p| p.table_id).collect();
+        let mut result = HashMap::with_capacity(table_ids.len());
+        for table_id in table_ids {
+            let cols = repos
+                .columns()
+                .list_type_count_by_table_id(table_id)
+                .await
+                .context(QueryingColumnSnafu)?;
+            result.insert(table_id, cols);
         }
 
         Ok(result)
     }
 
     /// Add namespace and table information to partition candidates.
-    pub async fn add_info_to_partitions(
+    pub(crate) async fn add_info_to_partitions(
         &self,
         partitions: &[PartitionParam],
-    ) -> Result<VecDeque<PartitionCompactionCandidateWithInfo>> {
+        table_columns: &HashMap<TableId, Vec<ColumnTypeCount>>,
+    ) -> Result<Vec<Arc<PartitionCompactionCandidateWithInfo>>> {
         let mut repos = self.catalog.repositories().await;
 
         let table_ids: HashSet<_> = partitions.iter().map(|p| p.table_id).collect();
@@ -459,19 +419,24 @@ impl Compactor {
             .map(|p| {
                 let (table, table_schema) = tables.get(&p.table_id).expect("just queried");
                 let part = parts.get(&p.partition_id).expect("just queried");
+                let column_type_counts = table_columns
+                    .get(&p.table_id)
+                    .expect("just queried")
+                    .clone();
 
-                PartitionCompactionCandidateWithInfo {
+                Arc::new(PartitionCompactionCandidateWithInfo {
                     table: Arc::clone(table),
                     table_schema: Arc::clone(table_schema),
+                    column_type_counts,
                     namespace: Arc::clone(
                         &namespaces.get(&p.namespace_id).expect("just queried").0,
                     ),
                     candidate: *p,
                     sort_key: part.sort_key(),
                     partition_key: part.partition_key.clone(),
-                }
+                })
             })
-            .collect::<VecDeque<_>>())
+            .collect())
     }
 }
 
@@ -489,6 +454,9 @@ pub struct PartitionCompactionCandidateWithInfo {
 
     /// Table schema
     pub table_schema: Arc<TableSchema>,
+
+    /// Counts of the number of columns of each type, used for estimating arrow size
+    pub column_type_counts: Vec<ColumnTypeCount>,
 
     /// Sort key of the partition
     pub sort_key: Option<SortKey>,
@@ -517,310 +485,210 @@ impl PartitionCompactionCandidateWithInfo {
     pub fn table_id(&self) -> TableId {
         self.candidate.table_id
     }
+
+    /// Estimate the amount of memory needed to work with this parquet file based on the count of
+    /// columns of different types in this partition and the number of rows in the parquet file.
+    pub fn estimated_arrow_bytes(
+        &self,
+        min_num_rows_allocated_per_record_batch_to_datafusion_plan: u64,
+    ) -> u64 {
+        estimate_arrow_bytes_for_file(
+            &self.column_type_counts,
+            min_num_rows_allocated_per_record_batch_to_datafusion_plan,
+        )
+    }
+}
+
+fn estimate_arrow_bytes_for_file(
+    columns: &[ColumnTypeCount],
+    min_num_rows_allocated_per_record_batch_to_datafusion_plan: u64,
+) -> u64 {
+    const AVERAGE_TAG_VALUE_LENGTH: i64 = 200;
+    const STRING_LENGTH: i64 = 1000;
+    const DICTIONARY_BYTE: i64 = 8;
+    const VALUE_BYTE: i64 = 8;
+    const BOOL_BYTE: i64 = 1;
+    const AVERAGE_ROW_COUNT_CARDINALITY_RATIO: i64 = 2;
+
+    // Since DataFusion streams files and allocates a fixed (configurable) number of rows per batch,
+    // we always use that number to estimate the memory usage per batch.
+    let row_count_per_batch = min_num_rows_allocated_per_record_batch_to_datafusion_plan as i64;
+
+    let average_cardinality = row_count_per_batch / AVERAGE_ROW_COUNT_CARDINALITY_RATIO;
+
+    // Bytes needed for number columns
+    let mut value_bytes = 0;
+    let mut string_bytes = 0;
+    let mut bool_bytes = 0;
+    let mut dictionary_key_bytes = 0;
+    let mut dictionary_value_bytes = 0;
+    for c in columns {
+        match c.col_type {
+            ColumnType::I64 | ColumnType::U64 | ColumnType::F64 | ColumnType::Time => {
+                value_bytes += c.count * row_count_per_batch * VALUE_BYTE;
+            }
+            ColumnType::String => {
+                string_bytes += row_count_per_batch * STRING_LENGTH;
+            }
+            ColumnType::Bool => {
+                bool_bytes += row_count_per_batch * BOOL_BYTE;
+            }
+            ColumnType::Tag => {
+                dictionary_key_bytes += average_cardinality * AVERAGE_TAG_VALUE_LENGTH;
+                dictionary_value_bytes = row_count_per_batch * DICTIONARY_BYTE;
+            }
+        }
+    }
+
+    let estimated_arrow_bytes_for_file =
+        value_bytes + string_bytes + bool_bytes + dictionary_key_bytes + dictionary_value_bytes;
+
+    estimated_arrow_bytes_for_file as u64
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
     use data_types::{
         ColumnId, ColumnSet, CompactionLevel, ParquetFileParams, SequenceNumber, ShardIndex,
         Timestamp,
     };
-    use iox_tests::util::TestCatalog;
+    use iox_tests::util::{TestCatalog, TestPartition};
     use iox_time::SystemProvider;
-    use std::time::Duration;
+    use parquet_file::storage::StorageId;
     use uuid::Uuid;
 
-    #[tokio::test]
-    async fn test_hot_partitions_to_compact() {
-        let catalog = TestCatalog::new();
+    impl PartitionCompactionCandidateWithInfo {
+        pub(crate) async fn from_test_partition(test_partition: &TestPartition) -> Self {
+            Self {
+                table: Arc::new(test_partition.table.table.clone()),
+                table_schema: Arc::new(test_partition.table.catalog_schema().await),
+                column_type_counts: Vec::new(), // not relevant
+                namespace: Arc::new(test_partition.namespace.namespace.clone()),
+                candidate: PartitionParam {
+                    partition_id: test_partition.partition.id,
+                    shard_id: test_partition.partition.shard_id,
+                    namespace_id: test_partition.namespace.namespace.id,
+                    table_id: test_partition.partition.table_id,
+                },
+                sort_key: test_partition.partition.sort_key(),
+                partition_key: test_partition.partition.partition_key.clone(),
+            }
+        }
+    }
 
-        // Create a db with 2 shards, one with 4 empty partitions and the other one with one
-        // empty partition
-        let mut txn = catalog.catalog.start_transaction().await.unwrap();
+    #[test]
+    fn test_estimate_arrow_bytes_for_file_small_row_count() {
+        // Always use this config param to estimate memory usage for each batch
+        // no matter it is larger or smaller than row_count
+        let min_num_rows_allocated_per_record_batch = 20;
 
-        let topic = txn.topics().create_or_get("foo").await.unwrap();
-        let pool = txn.query_pools().create_or_get("foo").await.unwrap();
-        let namespace = txn
-            .namespaces()
-            .create(
-                "namespace_hot_partitions_to_compact",
-                "inf",
-                topic.id,
-                pool.id,
-            )
-            .await
-            .unwrap();
-        let table = txn
-            .tables()
-            .create_or_get("test_table", namespace.id)
-            .await
-            .unwrap();
-        let shard = txn
-            .shards()
-            .create_or_get(&topic, ShardIndex::new(1))
-            .await
-            .unwrap();
-        let partition1 = txn
-            .partitions()
-            .create_or_get("one".into(), shard.id, table.id)
-            .await
-            .unwrap();
-        let partition2 = txn
-            .partitions()
-            .create_or_get("two".into(), shard.id, table.id)
-            .await
-            .unwrap();
-        let partition3 = txn
-            .partitions()
-            .create_or_get("three".into(), shard.id, table.id)
-            .await
-            .unwrap();
-        let partition4 = txn
-            .partitions()
-            .create_or_get("four".into(), shard.id, table.id)
-            .await
-            .unwrap();
-        // other shard
-        let another_table = txn
-            .tables()
-            .create_or_get("another_test_table", namespace.id)
-            .await
-            .unwrap();
-        let another_shard = txn
-            .shards()
-            .create_or_get(&topic, ShardIndex::new(2))
-            .await
-            .unwrap();
-        let another_partition = txn
-            .partitions()
-            .create_or_get(
-                "another_partition".into(),
-                another_shard.id,
-                another_table.id,
-            )
-            .await
-            .unwrap();
-        // update sort key for this another_partition
-        let another_partition = txn
-            .partitions()
-            .update_sort_key(another_partition.id, &["tag1", "time"])
-            .await
-            .unwrap();
-        txn.commit().await.unwrap();
+        // Time, U64, I64, F64
+        let columns = vec![
+            ColumnTypeCount::new(ColumnType::Time, 1),
+            ColumnTypeCount::new(ColumnType::U64, 2),
+            ColumnTypeCount::new(ColumnType::F64, 3),
+            ColumnTypeCount::new(ColumnType::I64, 4),
+        ];
+        let bytes =
+            estimate_arrow_bytes_for_file(&columns, min_num_rows_allocated_per_record_batch);
+        assert_eq!(bytes, 1600); // 20 * (1+2+3+4) * 8
 
-        // Create a compactor
-        let time_provider = Arc::new(SystemProvider::new());
-        let config = make_compactor_config();
-        let compactor = Compactor::new(
-            vec![shard.id, another_shard.id],
-            Arc::clone(&catalog.catalog),
-            ParquetStorage::new(Arc::clone(&catalog.object_store)),
-            Arc::new(Executor::new(1)),
-            time_provider,
-            BackoffConfig::default(),
-            config,
-            Arc::new(metric::Registry::new()),
-        );
+        // Tag
+        let columns = vec![ColumnTypeCount::new(ColumnType::Tag, 1)];
+        let bytes =
+            estimate_arrow_bytes_for_file(&columns, min_num_rows_allocated_per_record_batch);
+        assert_eq!(bytes, 2160); // 10 * 200 + 20 * 8
 
-        // Some times in the past to set to created_at of the files
-        let time_now = Timestamp::new(compactor.time_provider.now().timestamp_nanos());
-        let time_three_minutes_ago = Timestamp::new(
-            (compactor.time_provider.now() - Duration::from_secs(60 * 3)).timestamp_nanos(),
-        );
-        let time_five_hour_ago = Timestamp::new(
-            (compactor.time_provider.now() - Duration::from_secs(60 * 60 * 5)).timestamp_nanos(),
-        );
-        let time_38_hour_ago = Timestamp::new(
-            (compactor.time_provider.now() - Duration::from_secs(60 * 60 * 38)).timestamp_nanos(),
-        );
+        // String
+        let columns = vec![ColumnTypeCount::new(ColumnType::String, 1)];
+        let bytes =
+            estimate_arrow_bytes_for_file(&columns, min_num_rows_allocated_per_record_batch);
+        assert_eq!(bytes, 20000); // 20 * 1000
 
-        // Basic parquet info
-        let p1 = ParquetFileParams {
-            shard_id: shard.id,
-            namespace_id: namespace.id,
-            table_id: table.id,
-            partition_id: partition1.id,
-            object_store_id: Uuid::new_v4(),
-            max_sequence_number: SequenceNumber::new(100),
-            min_time: Timestamp::new(1),
-            max_time: Timestamp::new(5),
-            file_size_bytes: 1337,
-            row_count: 0,
-            compaction_level: CompactionLevel::Initial, // level of file of new writes
-            created_at: time_now,
-            column_set: ColumnSet::new([ColumnId::new(1), ColumnId::new(2)]),
-        };
+        // Bool
+        let columns = vec![ColumnTypeCount::new(ColumnType::Bool, 1)];
+        let bytes =
+            estimate_arrow_bytes_for_file(&columns, min_num_rows_allocated_per_record_batch);
+        assert_eq!(bytes, 20); // 20 * 1
 
-        // Note: The order of the test cases below is important and should not be changed
-        // because they depend on the order of the writes and their content. For example,
-        // in order to test `Case 3`, we do not need to add asserts for `Case 1` and `Case 2`,
-        // but all the writes, deletes and updates in Cases 1 and 2 are a must for testing Case 3.
-        // In order words, the last Case needs all content of previous tests.
-        // This shows the priority of selecting compaction candidates
+        // all types
+        let columns = vec![
+            ColumnTypeCount::new(ColumnType::Time, 1),
+            ColumnTypeCount::new(ColumnType::U64, 2),
+            ColumnTypeCount::new(ColumnType::F64, 3),
+            ColumnTypeCount::new(ColumnType::I64, 4),
+            ColumnTypeCount::new(ColumnType::Tag, 1),
+            ColumnTypeCount::new(ColumnType::String, 1),
+            ColumnTypeCount::new(ColumnType::Bool, 1),
+        ];
+        let bytes =
+            estimate_arrow_bytes_for_file(&columns, min_num_rows_allocated_per_record_batch);
+        assert_eq!(bytes, 23780); // 1600 + 2160 + 20000 + 20
+    }
 
-        // --------------------------------------
-        // Case 1: no files yet --> no partition candidates
-        //
-        let candidates = compactor.hot_partitions_to_compact(1, 1).await.unwrap();
-        assert!(candidates.is_empty());
+    #[test]
+    fn test_estimate_arrow_bytes_for_file_large_row_count() {
+        // Always use this config param to estimate memory usage for each batch
+        // even if it is smaller than row_count
+        let min_num_rows_allocated_per_record_batch = 10;
 
-        // --------------------------------------
-        // Case 2: no non-deleleted L0 files -->  no partition candidates
-        //
-        // partition1 has a deleted L0
-        let mut txn = catalog.catalog.start_transaction().await.unwrap();
-        let pf1 = txn.parquet_files().create(p1.clone()).await.unwrap();
-        txn.parquet_files().flag_for_delete(pf1.id).await.unwrap();
-        //
-        // partition2 has a non-L0 file
-        let p2 = ParquetFileParams {
-            object_store_id: Uuid::new_v4(),
-            partition_id: partition2.id,
-            ..p1.clone()
-        };
-        let pf2 = txn.parquet_files().create(p2).await.unwrap();
-        txn.parquet_files()
-            .update_to_level_1(&[pf2.id])
-            .await
-            .unwrap();
-        txn.commit().await.unwrap();
-        // No non-deleted level 0 files yet --> no candidates
-        let candidates = compactor.hot_partitions_to_compact(1, 1).await.unwrap();
-        assert!(candidates.is_empty());
+        // Time, U64, I64, F64
+        let columns = vec![
+            ColumnTypeCount::new(ColumnType::Time, 1),
+            ColumnTypeCount::new(ColumnType::U64, 2),
+            ColumnTypeCount::new(ColumnType::F64, 3),
+            ColumnTypeCount::new(ColumnType::I64, 4),
+        ];
+        let bytes =
+            estimate_arrow_bytes_for_file(&columns, min_num_rows_allocated_per_record_batch);
+        assert_eq!(bytes, 800); // 10 * (1+2+3+4) * 8
 
-        // --------------------------------------
-        // Case 3: no new recent writes (within the last 24 hours) --> no partition candidates
-        // (the cold case will pick them up)
-        //
-        // partition2 has an old (more than 24 hours ago) non-deleted level 0 file
-        let mut txn = catalog.catalog.start_transaction().await.unwrap();
-        let p3 = ParquetFileParams {
-            object_store_id: Uuid::new_v4(),
-            partition_id: partition2.id,
-            created_at: time_38_hour_ago,
-            ..p1.clone()
-        };
-        let _pf3 = txn.parquet_files().create(p3).await.unwrap();
-        txn.commit().await.unwrap();
+        // Tag
+        let columns = vec![ColumnTypeCount::new(ColumnType::Tag, 1)];
+        let bytes =
+            estimate_arrow_bytes_for_file(&columns, min_num_rows_allocated_per_record_batch);
+        assert_eq!(bytes, 1080); // 5 * 200 + 10 * 8
 
-        // No hot candidates
-        let candidates = compactor.hot_partitions_to_compact(1, 1).await.unwrap();
-        assert!(candidates.is_empty());
+        // String
+        let columns = vec![ColumnTypeCount::new(ColumnType::String, 1)];
+        let bytes =
+            estimate_arrow_bytes_for_file(&columns, min_num_rows_allocated_per_record_batch);
+        assert_eq!(bytes, 10000); // 10 * 1000
 
-        // --------------------------------------
-        // Case 4: has one partition with recent writes (5 hours ago) --> return that partition
-        //
-        // partition4 has a new write 5 hours ago
-        let mut txn = catalog.catalog.start_transaction().await.unwrap();
-        let p4 = ParquetFileParams {
-            object_store_id: Uuid::new_v4(),
-            partition_id: partition4.id,
-            created_at: time_five_hour_ago,
-            ..p1.clone()
-        };
-        let _pf4 = txn.parquet_files().create(p4).await.unwrap();
-        txn.commit().await.unwrap();
-        //
-        // Has at least one partition with a recent write --> make it a candidate
-        let candidates = compactor.hot_partitions_to_compact(1, 1).await.unwrap();
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].partition_id, partition4.id);
+        // Bool
+        let columns = vec![ColumnTypeCount::new(ColumnType::Bool, 1)];
+        let bytes =
+            estimate_arrow_bytes_for_file(&columns, min_num_rows_allocated_per_record_batch);
+        assert_eq!(bytes, 10); // 10 * 1
 
-        // --------------------------------------
-        // Case 5: has 2 partitions with 2 different groups of recent writes:
-        //  1. Within the last 4 hours
-        //  2. Within the last 24 hours but older than 4 hours ago
-        // When we have group 1, we will ignore partitions in group 2
-        //
-        // partition3 has a new write 3 hours ago
-        let mut txn = catalog.catalog.start_transaction().await.unwrap();
-        let p5 = ParquetFileParams {
-            object_store_id: Uuid::new_v4(),
-            partition_id: partition3.id,
-            created_at: time_three_minutes_ago,
-            ..p1.clone()
-        };
-        let _pf5 = txn.parquet_files().create(p5).await.unwrap();
-        txn.commit().await.unwrap();
-        //
-        // make partitions in the most recent group candidates
-        let candidates = compactor.hot_partitions_to_compact(1, 1).await.unwrap();
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].partition_id, partition3.id);
-
-        // --------------------------------------
-        // Case 6: has partition candidates for 2 shards
-        //
-        // The another_shard now has non-deleted level-0 file ingested 5 hours ago
-        let mut txn = catalog.catalog.start_transaction().await.unwrap();
-        let p6 = ParquetFileParams {
-            object_store_id: Uuid::new_v4(),
-            shard_id: another_shard.id,
-            table_id: another_table.id,
-            partition_id: another_partition.id,
-            created_at: time_five_hour_ago,
-            ..p1.clone()
-        };
-        let _pf6 = txn.parquet_files().create(p6).await.unwrap();
-        txn.commit().await.unwrap();
-        //
-        // Will have 2 candidates, one for each shard
-        let mut candidates = compactor.hot_partitions_to_compact(1, 1).await.unwrap();
-        candidates.sort();
-        assert_eq!(candidates.len(), 2);
-        assert_eq!(candidates[0].partition_id, partition3.id);
-        assert_eq!(candidates[0].shard_id, shard.id);
-        assert_eq!(candidates[1].partition_id, another_partition.id);
-        assert_eq!(candidates[1].shard_id, another_shard.id);
-
-        // Add info to partition
-        let partitions_with_info = compactor.add_info_to_partitions(&candidates).await.unwrap();
-        assert_eq!(partitions_with_info.len(), 2);
-        //
-        assert_eq!(*partitions_with_info[0].namespace, namespace);
-        assert_eq!(*partitions_with_info[0].table, table);
-        assert_eq!(
-            partitions_with_info[0].partition_key,
-            partition3.partition_key
-        );
-        assert_eq!(partitions_with_info[0].sort_key, partition3.sort_key()); // this sort key is None
-                                                                             //
-        assert_eq!(*partitions_with_info[1].namespace, namespace);
-        assert_eq!(*partitions_with_info[1].table, another_table);
-        assert_eq!(
-            partitions_with_info[1].partition_key,
-            another_partition.partition_key
-        );
-        assert_eq!(
-            partitions_with_info[1].sort_key,
-            another_partition.sort_key()
-        ); // this sort key is Some(tag1, time)
+        // all types
+        let columns = vec![
+            ColumnTypeCount::new(ColumnType::Time, 1),
+            ColumnTypeCount::new(ColumnType::U64, 2),
+            ColumnTypeCount::new(ColumnType::F64, 3),
+            ColumnTypeCount::new(ColumnType::I64, 4),
+            ColumnTypeCount::new(ColumnType::Tag, 1),
+            ColumnTypeCount::new(ColumnType::String, 1),
+            ColumnTypeCount::new(ColumnType::Bool, 1),
+        ];
+        let bytes =
+            estimate_arrow_bytes_for_file(&columns, min_num_rows_allocated_per_record_batch);
+        assert_eq!(bytes, 11890); // 800 + 1080 + 10000 + 10
     }
 
     fn make_compactor_config() -> CompactorConfig {
-        let max_desired_file_size_bytes = 10_000;
-        let percentage_max_file_size = 30;
-        let split_percentage = 80;
-        let max_cold_concurrent_size_bytes = 90_000;
-        let max_number_partitions_per_shard = 1;
-        let min_number_recent_ingested_per_partition = 1;
-        let cold_input_size_threshold_bytes = 600 * 1024 * 1024;
-        let cold_input_file_count_threshold = 100;
-        let hot_multiple = 4;
-        let memory_budget_bytes = 10 * 1024 * 1024;
-        CompactorConfig::new(
-            max_desired_file_size_bytes,
-            percentage_max_file_size,
-            split_percentage,
-            max_cold_concurrent_size_bytes,
-            max_number_partitions_per_shard,
-            min_number_recent_ingested_per_partition,
-            cold_input_size_threshold_bytes,
-            cold_input_file_count_threshold,
-            hot_multiple,
-            memory_budget_bytes,
-        )
+        CompactorConfig {
+            max_desired_file_size_bytes: 10_000,
+            percentage_max_file_size: 30,
+            split_percentage: 80,
+            max_number_partitions_per_shard: 1,
+            min_number_recent_ingested_files_per_partition: 1,
+            hot_multiple: 4,
+            memory_budget_bytes: 10 * 1024 * 1024,
+            min_num_rows_allocated_per_record_batch_to_datafusion_plan: 100,
+            max_num_compacting_files: 20,
+        }
     }
 
     #[tokio::test]
@@ -912,8 +780,8 @@ mod tests {
         let compactor = Compactor::new(
             vec![shard.id, another_shard.id],
             Arc::clone(&catalog.catalog),
-            ParquetStorage::new(Arc::clone(&catalog.object_store)),
-            Arc::new(Executor::new(1)),
+            ParquetStorage::new(Arc::clone(&catalog.object_store), StorageId::from("iox")),
+            catalog.exec(),
             time_provider,
             BackoffConfig::default(),
             config,
@@ -921,12 +789,8 @@ mod tests {
         );
 
         // Some times in the past to set to created_at of the files
-        let time_five_hour_ago = Timestamp::new(
-            (compactor.time_provider.now() - Duration::from_secs(60 * 60 * 5)).timestamp_nanos(),
-        );
-        let time_38_hour_ago = Timestamp::new(
-            (compactor.time_provider.now() - Duration::from_secs(60 * 60 * 38)).timestamp_nanos(),
-        );
+        let time_5_hour_ago = Timestamp::from(compactor.time_provider.hours_ago(5));
+        let time_9_hour_ago = Timestamp::from(compactor.time_provider.hours_ago(9));
 
         // Basic parquet info
         let p1 = ParquetFileParams {
@@ -941,7 +805,7 @@ mod tests {
             file_size_bytes: 1337,
             row_count: 0,
             compaction_level: CompactionLevel::Initial, // level of file of new writes
-            created_at: time_38_hour_ago,               // create cold files by default
+            created_at: time_9_hour_ago,                // create cold files by default
             column_set: ColumnSet::new([ColumnId::new(1), ColumnId::new(2)]),
         };
 
@@ -966,26 +830,23 @@ mod tests {
         let pf1 = txn.parquet_files().create(p1.clone()).await.unwrap();
         txn.parquet_files().flag_for_delete(pf1.id).await.unwrap();
         //
-        // partition2 has a cold non-L0 file
+        // partition2 has a cold L2 file
         let p2 = ParquetFileParams {
             object_store_id: Uuid::new_v4(),
             partition_id: partition2.id,
+            compaction_level: CompactionLevel::Final,
             ..p1.clone()
         };
-        let pf2 = txn.parquet_files().create(p2).await.unwrap();
-        txn.parquet_files()
-            .update_to_level_1(&[pf2.id])
-            .await
-            .unwrap();
+        let _pf2 = txn.parquet_files().create(p2).await.unwrap();
         txn.commit().await.unwrap();
         // No non-deleted level 0 files yet --> no candidates
         let candidates = compactor.cold_partitions_to_compact(1).await.unwrap();
         assert!(candidates.is_empty());
 
         // --------------------------------------
-        // Case 3: no new recent writes (within the last 24 hours) --> return that partition
+        // Case 3: no new recent writes (within the last 8 hours) --> return that partition
         //
-        // partition2 has a cold (more than 24 hours ago) non-deleted level 0 file
+        // partition2 has a cold (more than 8 hours ago) non-deleted level 0 file
         let mut txn = catalog.catalog.start_transaction().await.unwrap();
         let p3 = ParquetFileParams {
             object_store_id: Uuid::new_v4(),
@@ -998,7 +859,7 @@ mod tests {
         // Has at least one partition with a L0 file --> make it a candidate
         let candidates = compactor.cold_partitions_to_compact(1).await.unwrap();
         assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].partition_id, partition2.id);
+        assert_eq!(candidates[0].id(), partition2.id);
 
         // --------------------------------------
         // Case 4: has two cold partitions --> return the candidate with the most L0
@@ -1021,7 +882,7 @@ mod tests {
         // Partition with the most l0 files is the candidate
         let candidates = compactor.cold_partitions_to_compact(1).await.unwrap();
         assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].partition_id, partition4.id);
+        assert_eq!(candidates[0].id(), partition4.id);
 
         // --------------------------------------
         // Case 5: "warm" and "hot" partitions aren't returned
@@ -1038,14 +899,14 @@ mod tests {
         let p3_hot = ParquetFileParams {
             object_store_id: Uuid::new_v4(),
             partition_id: partition3.id,
-            created_at: time_five_hour_ago,
+            created_at: time_5_hour_ago,
             ..p1.clone()
         };
         let _pf3_hot = txn.parquet_files().create(p3_hot).await.unwrap();
         let p5_hot = ParquetFileParams {
             object_store_id: Uuid::new_v4(),
             partition_id: partition5.id,
-            created_at: time_five_hour_ago,
+            created_at: time_5_hour_ago,
             ..p1.clone()
         };
         let _pf5_hot = txn.parquet_files().create(p5_hot).await.unwrap();
@@ -1053,31 +914,31 @@ mod tests {
         // Partition4 is still the only candidate
         let candidates = compactor.cold_partitions_to_compact(1).await.unwrap();
         assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].partition_id, partition4.id);
+        assert_eq!(candidates[0].id(), partition4.id);
 
         // Ask for 2 partitions per shard; get partition4 and partition2
         let candidates = compactor.cold_partitions_to_compact(2).await.unwrap();
         assert_eq!(candidates.len(), 2);
-        assert_eq!(candidates[0].partition_id, partition4.id);
-        assert_eq!(candidates[1].partition_id, partition2.id);
+        assert_eq!(candidates[0].id(), partition4.id);
+        assert_eq!(candidates[1].id(), partition2.id);
 
         // Ask for 3 partitions per shard; still get only partition4 and partition2
         let candidates = compactor.cold_partitions_to_compact(3).await.unwrap();
         assert_eq!(candidates.len(), 2);
-        assert_eq!(candidates[0].partition_id, partition4.id);
-        assert_eq!(candidates[1].partition_id, partition2.id);
+        assert_eq!(candidates[0].id(), partition4.id);
+        assert_eq!(candidates[1].id(), partition2.id);
 
         // --------------------------------------
         // Case 6: has partition candidates for 2 shards
         //
-        // The another_shard now has non-deleted level-0 file ingested 38 hours ago
+        // The another_shard now has non-deleted level-0 file ingested 18 hours ago
         let mut txn = catalog.catalog.start_transaction().await.unwrap();
         let p6 = ParquetFileParams {
             object_store_id: Uuid::new_v4(),
             shard_id: another_shard.id,
             table_id: another_table.id,
             partition_id: another_partition.id,
-            created_at: time_38_hour_ago,
+            created_at: time_9_hour_ago,
             ..p1.clone()
         };
         let _pf6 = txn.parquet_files().create(p6).await.unwrap();
@@ -1085,23 +946,23 @@ mod tests {
 
         // Will have 2 candidates, one for each shard
         let mut candidates = compactor.cold_partitions_to_compact(1).await.unwrap();
-        candidates.sort();
+        candidates.sort_by_key(|c| c.candidate);
         assert_eq!(candidates.len(), 2);
-        assert_eq!(candidates[0].partition_id, partition4.id);
-        assert_eq!(candidates[0].shard_id, shard.id);
-        assert_eq!(candidates[1].partition_id, another_partition.id);
-        assert_eq!(candidates[1].shard_id, another_shard.id);
+        assert_eq!(candidates[0].id(), partition4.id);
+        assert_eq!(candidates[0].shard_id(), shard.id);
+        assert_eq!(candidates[1].id(), another_partition.id);
+        assert_eq!(candidates[1].shard_id(), another_shard.id);
 
         // Ask for 2 candidates per shard; get back 3: 2 from shard and 1 from
         // another_shard
         let mut candidates = compactor.cold_partitions_to_compact(2).await.unwrap();
-        candidates.sort();
+        candidates.sort_by_key(|c| c.candidate);
         assert_eq!(candidates.len(), 3);
-        assert_eq!(candidates[0].partition_id, partition2.id);
-        assert_eq!(candidates[0].shard_id, shard.id);
-        assert_eq!(candidates[1].partition_id, partition4.id);
-        assert_eq!(candidates[1].shard_id, shard.id);
-        assert_eq!(candidates[2].partition_id, another_partition.id);
-        assert_eq!(candidates[2].shard_id, another_shard.id);
+        assert_eq!(candidates[0].id(), partition2.id);
+        assert_eq!(candidates[0].shard_id(), shard.id);
+        assert_eq!(candidates[1].id(), partition4.id);
+        assert_eq!(candidates[1].shard_id(), shard.id);
+        assert_eq!(candidates[2].id(), another_partition.id);
+        assert_eq!(candidates[2].shard_id(), another_shard.id);
     }
 }

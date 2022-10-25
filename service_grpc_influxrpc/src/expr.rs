@@ -10,13 +10,9 @@ use std::string::FromUtf8Error;
 use std::{convert::TryFrom, fmt};
 
 use datafusion::error::DataFusionError;
-use datafusion::logical_expr::binary_expr;
-use datafusion::logical_plan::when;
-use datafusion::{
-    logical_plan::{Expr, Operator},
-    prelude::*,
-    scalar::ScalarValue,
-};
+use datafusion::logical_expr::{binary_expr, Operator};
+use datafusion::{prelude::*, scalar::ScalarValue};
+use datafusion_util::AsExpr;
 use generated_types::{
     aggregate::AggregateType as RPCAggregateType, node::Comparison as RPCComparison,
     node::Logical as RPCLogical, node::Value as RPCValue, read_group_request::Group as RPCGroup,
@@ -504,7 +500,7 @@ fn build_node(value: RPCValue, inputs: Vec<Expr>) -> Result<Expr> {
         RPCValue::FloatValue(f) => Ok(lit(f)),
         RPCValue::RegexValue(pattern) => Ok(lit(pattern)),
         RPCValue::TagRefValue(tag_name) => build_tag_ref(tag_name),
-        RPCValue::FieldRefValue(field_name) => Ok(col(&field_name)),
+        RPCValue::FieldRefValue(field_name) => Ok(field_name.as_expr()),
         RPCValue::Logical(logical) => build_logical_node(logical, inputs),
         RPCValue::Comparison(comparison) => build_comparison_node(comparison, inputs),
     }
@@ -530,10 +526,13 @@ fn build_tag_ref(tag_name: Vec<u8>) -> Result<Expr> {
         .to_string();
 
     match tag_name.as_str() {
-        MEASUREMENT_COLUMN_NAME | FIELD_COLUMN_NAME => Ok(col(&tag_name)),
-        _ => when(col(&tag_name).is_null(), lit(""))
-            .otherwise(col(&tag_name))
-            .context(InternalCaseConversionSnafu { tag_name }),
+        MEASUREMENT_COLUMN_NAME | FIELD_COLUMN_NAME => Ok(tag_name.as_str().as_expr()),
+        _ => {
+            let tag = tag_name.as_str().as_expr();
+            when(tag.clone().is_null(), lit(""))
+                .otherwise(tag)
+                .context(InternalCaseConversionSnafu { tag_name })
+        }
     }
 }
 
@@ -877,6 +876,7 @@ fn format_comparison(v: i32, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 #[cfg(test)]
 mod tests {
     use arrow::datatypes::DataType;
+    use datafusion_util::lit_dict;
     use generated_types::node::Type as RPCNodeType;
     use predicate::{rpc_predicate::QueryDatabaseMeta, Predicate};
     use schema::{Schema, SchemaBuilder};
@@ -906,8 +906,11 @@ mod tests {
                     let schema = SchemaBuilder::new()
                         .tag("t1")
                         .tag("t2")
+                        .tag("host")
                         .field("foo", DataType::Int64)
+                        .unwrap()
                         .field("bar", DataType::Int64)
+                        .unwrap()
                         .build()
                         .unwrap();
 
@@ -917,6 +920,7 @@ mod tests {
                     let schema = SchemaBuilder::new()
                         .tag("t3")
                         .field("baz", DataType::Int64)
+                        .unwrap()
                         .build()
                         .unwrap();
 
@@ -1293,9 +1297,9 @@ mod tests {
         make_tag_ref_node(TAG_KEY_MEASUREMENT, field_name)
     }
 
-    /// returns (RPCNode, and expected_expr for the "host > 5.0")
+    /// returns (RPCNode, and expected_expr for the "host = 'h'")
     fn make_host_comparison() -> (RPCNode, Vec<Expr>) {
-        // host > 5.0
+        // host = "h"
         let field_ref = RPCNode {
             node_type: RPCNodeType::FieldRef as i32,
             children: vec![],
@@ -1304,15 +1308,15 @@ mod tests {
         let iconst = RPCNode {
             node_type: RPCNodeType::Literal as i32,
             children: vec![],
-            value: Some(RPCValue::FloatValue(5.0)),
+            value: Some(RPCValue::StringValue("h".into())),
         };
         let comparison = RPCNode {
             node_type: RPCNodeType::ComparisonExpression as i32,
             children: vec![field_ref, iconst],
-            value: Some(RPCValue::Comparison(RPCComparison::Gt as i32)),
+            value: Some(RPCValue::Comparison(RPCComparison::Equal as i32)),
         };
 
-        let expected_expr = col("host").gt(lit(5.0));
+        let expected_expr = col("host").eq(lit_dict("h"));
 
         (comparison, vec![expected_expr])
     }
@@ -1631,7 +1635,7 @@ mod tests {
             root: Some(comparison),
         });
         assert_eq!(
-            "(FieldRef:host > 5)",
+            r#"(FieldRef:host == "h")"#,
             format!("{}", displayable_predicate(rpc_pred.as_ref()))
         );
     }

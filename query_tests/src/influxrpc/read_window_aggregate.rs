@@ -30,7 +30,7 @@ async fn run_read_window_aggregate_test_case<D>(
 
         let plan = planner
             .read_window_aggregate(
-                db.as_query_database(),
+                db.as_query_database_arc(),
                 predicate.clone(),
                 agg,
                 every,
@@ -170,47 +170,6 @@ async fn test_grouped_series_set_plan_group_aggregate_min_defect_2697() {
     .await;
 }
 
-#[tokio::test]
-async fn test_grouped_series_set_plan_group_aggregate_min_defect_2697_with_delete() {
-    let predicate = Predicate::default()
-        // time >= '2021-01-01T00:00:01.000000001Z' AND time <= '2021-01-01T00:00:01.000000031Z'
-        .with_range(1609459201000000001, 1609459201000000031);
-    let predicate = InfluxRpcPredicate::new(None, predicate);
-
-    let agg = Aggregate::Min;
-    let every = WindowDuration::from_nanoseconds(10);
-    let offset = WindowDuration::from_nanoseconds(0);
-
-    // one row deleted
-    let expected_results = vec![
-        "Series tags={_field=bar, _measurement=mm, section=1a}\n  FloatPoints timestamps: [1609459201000000011], values: [5.0]",
-        "Series tags={_field=foo, _measurement=mm, section=1a}\n  FloatPoints timestamps: [1609459201000000001, 1609459201000000024], values: [1.0, 11.24]",
-        "Series tags={_field=bar, _measurement=mm, section=2b}\n  FloatPoints timestamps: [1609459201000000009, 1609459201000000015], values: [4.0, 6.0]",
-        "Series tags={_field=foo, _measurement=mm, section=2b}\n  FloatPoints timestamps: [1609459201000000002], values: [2.0]",
-    ];
-    run_read_window_aggregate_test_case(
-        MeasurementForDefect2697WithDelete {},
-        predicate.clone(),
-        agg,
-        every,
-        offset,
-        expected_results,
-    )
-    .await;
-
-    // all rows deleted
-    let expected_results = vec![];
-    run_read_window_aggregate_test_case(
-        MeasurementForDefect2697WithDeleteAll {},
-        predicate,
-        agg,
-        every,
-        offset,
-        expected_results,
-    )
-    .await;
-}
-
 // See https://github.com/influxdata/influxdb_iox/issues/2697
 #[tokio::test]
 async fn test_grouped_series_set_plan_group_aggregate_sum_defect_2697() {
@@ -277,50 +236,6 @@ async fn test_grouped_series_set_plan_group_aggregate_filter_on_field() {
 }
 
 #[tokio::test]
-async fn test_grouped_series_set_plan_group_aggregate_sum_defect_2697_with_delete() {
-    let predicate = Predicate::default()
-        // time >= '2021-01-01T00:00:01.000000001Z' AND time <= '2021-01-01T00:00:01.000000031Z'
-        .with_range(1609459201000000001, 1609459201000000031);
-    let predicate = InfluxRpcPredicate::new(None, predicate);
-
-    let agg = Aggregate::Sum;
-    let every = WindowDuration::from_nanoseconds(10);
-    let offset = WindowDuration::from_nanoseconds(0);
-
-    // one row deleted
-
-    // The windowed aggregate is using a non-selector aggregate (SUM, COUNT, MEAD).
-    // For each distinct series the window defines the `time` column
-    let expected_results = vec![
-        "Series tags={_field=bar, _measurement=mm, section=1a}\n  FloatPoints timestamps: [1609459201000000020], values: [5.0]",
-        "Series tags={_field=foo, _measurement=mm, section=1a}\n  FloatPoints timestamps: [1609459201000000010, 1609459201000000030], values: [4.0, 11.24]",
-        "Series tags={_field=bar, _measurement=mm, section=2b}\n  FloatPoints timestamps: [1609459201000000010, 1609459201000000020], values: [4.0, 6.0]",
-        "Series tags={_field=foo, _measurement=mm, section=2b}\n  FloatPoints timestamps: [1609459201000000010], values: [2.0]",
-    ];
-    run_read_window_aggregate_test_case(
-        MeasurementForDefect2697WithDelete {},
-        predicate.clone(),
-        agg,
-        every,
-        offset,
-        expected_results,
-    )
-    .await;
-
-    // all rows deleted
-    let expected_results = vec![];
-    run_read_window_aggregate_test_case(
-        MeasurementForDefect2697WithDeleteAll {},
-        predicate,
-        agg,
-        every,
-        offset,
-        expected_results,
-    )
-    .await;
-}
-
-#[tokio::test]
 async fn test_read_window_aggregate_overflow() {
     let predicate = Predicate::default().with_range(1609459201000000001, 1609459201000000024);
     let predicate = InfluxRpcPredicate::new(None, predicate);
@@ -336,6 +251,32 @@ async fn test_read_window_aggregate_overflow() {
     ];
     run_read_window_aggregate_test_case(
         MeasurementForDefect2890 {},
+        predicate,
+        agg,
+        every,
+        offset,
+        expected_results,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_read_window_aggregate_with_periods() {
+    let predicate = Predicate::default().with_range(0, 1700000001000000000);
+    let predicate = InfluxRpcPredicate::new(None, predicate);
+
+    let agg = Aggregate::Max;
+    let every = WindowDuration::from_nanoseconds(500000000000);
+    let offset = WindowDuration::from_nanoseconds(0);
+
+    let expected_results = vec![
+        "Series tags={_field=field.one, _measurement=measurement.one, tag.one=value, tag.two=other}\n  FloatPoints timestamps: [1609459201000000001], values: [1.0]",
+        "Series tags={_field=field.two, _measurement=measurement.one, tag.one=value, tag.two=other}\n  BooleanPoints timestamps: [1609459201000000001], values: [true]",
+        "Series tags={_field=field.one, _measurement=measurement.one, tag.one=value2, tag.two=other2}\n  FloatPoints timestamps: [1609459201000000002], values: [1.0]",
+        "Series tags={_field=field.two, _measurement=measurement.one, tag.one=value2, tag.two=other2}\n  BooleanPoints timestamps: [1609459201000000002], values: [false]",
+    ];
+    run_read_window_aggregate_test_case(
+        PeriodsInNames {},
         predicate,
         agg,
         every,

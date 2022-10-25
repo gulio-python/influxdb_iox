@@ -4,12 +4,14 @@ use super::FIELD_COLUMN_NAME;
 use arrow::array::{as_boolean_array, as_string_array, ArrayRef, StringArray};
 use arrow::compute::kernels;
 use arrow::record_batch::RecordBatch;
+use datafusion::common::DFSchema;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
-use datafusion::logical_plan::{lit, DFSchema, Expr, ExprVisitable, ExpressionVisitor, Recursion};
+use datafusion::logical_expr::expr_visitor::{ExprVisitable, ExpressionVisitor, Recursion};
+use datafusion::optimizer::utils::split_conjunction_owned;
 use datafusion::physical_expr::create_physical_expr;
 use datafusion::physical_expr::execution_props::ExecutionProps;
 use datafusion::physical_plan::ColumnarValue;
-use datafusion_util::disassemble_conjuct;
+use datafusion::prelude::{lit, Expr};
 use schema::Schema;
 use std::sync::Arc;
 
@@ -55,12 +57,12 @@ impl FieldProjectionRewriter {
         }
     }
 
-    // Rewrites the predicate. See the description on
-    // [`FieldProjectionRewriter`] for more details.
+    /// Rewrites the predicate. See the description on
+    /// [`FieldProjectionRewriter`] for more details.
     pub(crate) fn rewrite_field_exprs(&mut self, expr: Expr) -> DataFusionResult<Expr> {
         // for predicates like `A AND B AND C`
         // rewrite `A`, `B` and `C` separately and put them back together
-        let rewritten_expr = disassemble_conjuct(expr)
+        let rewritten_expr = split_conjunction_owned(expr)
             .into_iter()
             // apply the rewrite individually
             .map(|expr| self.rewrite_single_conjunct(expr))
@@ -245,7 +247,7 @@ impl ExpressionVisitor for ColumnReferencesFinder {
 mod tests {
     use super::*;
     use arrow::datatypes::DataType;
-    use datafusion::logical_plan::{case, col};
+    use datafusion::prelude::{case, col};
     use schema::builder::SchemaBuilder;
     use test_helpers::assert_contains;
 
@@ -461,12 +463,6 @@ mod tests {
                     .and(field_ref().eq(lit("f2")).or(col("f2").eq(lit(5.0)))),
                 "Unsupported _field predicate",
             ),
-            (
-                // incorrect type
-                // _field % "gg"
-                field_ref().modulus(lit("gg")),
-                "Unsupported _field predicate",
-            ),
         ];
 
         for (input, exp_error) in cases {
@@ -509,9 +505,13 @@ mod tests {
             .tag("foo")
             .tag("bar")
             .field("f1", DataType::Float64)
+            .unwrap()
             .field("f2", DataType::Float64)
+            .unwrap()
             .field("f3", DataType::Float64)
+            .unwrap()
             .field("f4", DataType::Float64)
+            .unwrap()
             .build()
             .map(Arc::new)
             .unwrap()

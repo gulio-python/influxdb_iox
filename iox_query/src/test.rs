@@ -8,14 +8,15 @@ use crate::{
         stringset::{StringSet, StringSetRef},
         ExecutionContextProvider, Executor, ExecutorType, IOxSessionContext,
     },
-    Predicate, PredicateMatch, QueryChunk, QueryChunkError, QueryChunkMeta, QueryCompletedToken,
-    QueryDatabase, QueryDatabaseError, QueryText,
+    Predicate, PredicateMatch, QueryChunk, QueryChunkMeta, QueryCompletedToken, QueryDatabase,
+    QueryText,
 };
 use arrow::{
     array::{
         ArrayRef, DictionaryArray, Int64Array, StringArray, TimestampNanosecondArray, UInt64Array,
     },
     datatypes::{DataType, Int32Type, TimeUnit},
+    error::ArrowError,
     record_batch::RecordBatch,
 };
 use async_trait::async_trait;
@@ -23,7 +24,7 @@ use data_types::{
     ChunkId, ChunkOrder, ColumnSummary, DeletePredicate, InfluxDbType, PartitionId, StatValues,
     Statistics, TableSummary, TimestampMinMax,
 };
-use datafusion::physical_plan::SendableRecordBatchStream;
+use datafusion::{error::DataFusionError, physical_plan::SendableRecordBatchStream};
 use datafusion_util::stream_from_batches;
 use futures::StreamExt;
 use hashbrown::HashSet;
@@ -107,18 +108,27 @@ impl QueryDatabase for TestDatabase {
         &self,
         table_name: &str,
         predicate: &Predicate,
+        _projection: &Option<Vec<usize>>,
         _ctx: IOxSessionContext,
-    ) -> Result<Vec<Arc<dyn QueryChunk>>, QueryDatabaseError> {
+    ) -> Result<Vec<Arc<dyn QueryChunk>>, DataFusionError> {
         // save last predicate
         *self.chunks_predicate.lock() = predicate.clone();
 
-        let partitions = self.partitions.lock();
+        let partitions = self.partitions.lock().clone();
         Ok(partitions
             .values()
             .flat_map(|x| x.values())
-            .filter(|x| x.table_name == table_name)
-            .map(|x| Arc::clone(x) as _)
-            .collect())
+            // filter by table
+            .filter(|c| c.table_name == table_name)
+            // only keep chunks if their statistics overlap
+            .filter(|c| {
+                !matches!(
+                    predicate.apply_to_table_summary(&c.table_summary, c.schema.as_arrow()),
+                    PredicateMatch::Zero
+                )
+            })
+            .map(|x| Arc::clone(x) as Arc<dyn QueryChunk>)
+            .collect::<Vec<_>>())
     }
 
     fn record_query(
@@ -189,7 +199,7 @@ pub struct TestChunk {
 
     id: ChunkId,
 
-    partition_id: Option<PartitionId>,
+    partition_id: PartitionId,
 
     /// Set the flag if this chunk might contain duplicates
     may_contain_pk_duplicates: bool,
@@ -230,6 +240,7 @@ macro_rules! impl_with_column {
 
             let new_column_schema = SchemaBuilder::new()
                 .field(&column_name, DataType::$DATA_TYPE)
+                .unwrap()
                 .build()
                 .unwrap();
             self.add_schema_to_table(new_column_schema, true, None)
@@ -245,6 +256,7 @@ macro_rules! impl_with_column_no_stats {
 
             let new_column_schema = SchemaBuilder::new()
                 .field(&column_name, DataType::$DATA_TYPE)
+                .unwrap()
                 .build()
                 .unwrap();
 
@@ -266,6 +278,7 @@ macro_rules! impl_with_column_with_stats {
 
             let new_column_schema = SchemaBuilder::new()
                 .field(&column_name, DataType::$DATA_TYPE)
+                .unwrap()
                 .build()
                 .unwrap();
 
@@ -298,7 +311,7 @@ impl TestChunk {
             sort_key: None,
             partition_sort_key: None,
             timestamp_min_max: None,
-            partition_id: None,
+            partition_id: PartitionId::new(0),
         }
     }
 
@@ -308,7 +321,7 @@ impl TestChunk {
     }
 
     pub fn with_partition_id(mut self, id: i64) -> Self {
-        self.partition_id = Some(PartitionId::new(id));
+        self.partition_id = PartitionId::new(id);
         self
     }
 
@@ -326,9 +339,9 @@ impl TestChunk {
     }
 
     /// Checks the saved error, and returns it if any, otherwise returns OK
-    fn check_error(&self) -> Result<(), QueryChunkError> {
+    fn check_error(&self) -> Result<(), DataFusionError> {
         if let Some(message) = self.saved_error.as_ref() {
-            Err(message.clone().into())
+            Err(DataFusionError::External(message.clone().into()))
         } else {
             Ok(())
         }
@@ -488,6 +501,7 @@ impl TestChunk {
         // merge it in to any existing schema
         let new_column_schema = SchemaBuilder::new()
             .field(&column_name, DataType::Utf8)
+            .unwrap()
             .build()
             .unwrap();
 
@@ -508,12 +522,8 @@ impl TestChunk {
         mut self,
         new_column_schema: Schema,
         add_column_summary: bool,
-        stats: Option<Statistics>,
+        input_stats: Option<Statistics>,
     ) -> Self {
-        // assume the new schema has exactly a single table
-        assert_eq!(new_column_schema.len(), 1);
-        let (col_type, new_field) = new_column_schema.field(0);
-
         let mut merger = SchemaMerger::new();
         merger = merger.merge(&new_column_schema).unwrap();
         merger = merger
@@ -521,34 +531,38 @@ impl TestChunk {
             .expect("merging was successful");
         self.schema = merger.build();
 
-        if add_column_summary {
-            let influxdb_type = col_type.map(|t| match t {
-                InfluxColumnType::Tag => InfluxDbType::Tag,
-                InfluxColumnType::Field(_) => InfluxDbType::Field,
-                InfluxColumnType::Timestamp => InfluxDbType::Timestamp,
-            });
+        for i in 0..new_column_schema.len() {
+            let (col_type, new_field) = new_column_schema.field(i);
+            if add_column_summary {
+                let influxdb_type = col_type.map(|t| match t {
+                    InfluxColumnType::Tag => InfluxDbType::Tag,
+                    InfluxColumnType::Field(_) => InfluxDbType::Field,
+                    InfluxColumnType::Timestamp => InfluxDbType::Timestamp,
+                });
 
-            let stats = stats.unwrap_or_else(|| match new_field.data_type() {
-                DataType::Boolean => Statistics::Bool(StatValues::default()),
-                DataType::Int64 => Statistics::I64(StatValues::default()),
-                DataType::UInt64 => Statistics::U64(StatValues::default()),
-                DataType::Utf8 => Statistics::String(StatValues::default()),
-                DataType::Dictionary(_, value_type) => {
-                    assert!(matches!(**value_type, DataType::Utf8));
-                    Statistics::String(StatValues::default())
-                }
-                DataType::Float64 => Statistics::F64(StatValues::default()),
-                DataType::Timestamp(_, _) => Statistics::I64(StatValues::default()),
-                _ => panic!("Unsupported type in TestChunk: {:?}", new_field.data_type()),
-            });
+                let stats = input_stats.clone();
+                let stats = stats.unwrap_or_else(|| match new_field.data_type() {
+                    DataType::Boolean => Statistics::Bool(StatValues::default()),
+                    DataType::Int64 => Statistics::I64(StatValues::default()),
+                    DataType::UInt64 => Statistics::U64(StatValues::default()),
+                    DataType::Utf8 => Statistics::String(StatValues::default()),
+                    DataType::Dictionary(_, value_type) => {
+                        assert!(matches!(**value_type, DataType::Utf8));
+                        Statistics::String(StatValues::default())
+                    }
+                    DataType::Float64 => Statistics::F64(StatValues::default()),
+                    DataType::Timestamp(_, _) => Statistics::I64(StatValues::default()),
+                    _ => panic!("Unsupported type in TestChunk: {:?}", new_field.data_type()),
+                });
 
-            let column_summary = ColumnSummary {
-                name: new_field.name().clone(),
-                influxdb_type,
-                stats,
-            };
+                let column_summary = ColumnSummary {
+                    name: new_field.name().clone(),
+                    influxdb_type,
+                    stats,
+                };
 
-            self.table_summary.columns.push(column_summary);
+                self.table_summary.columns.push(column_summary);
+            }
         }
 
         self
@@ -919,15 +933,30 @@ impl QueryChunk for TestChunk {
         &self,
         _ctx: IOxSessionContext,
         predicate: &Predicate,
-        _selection: Selection<'_>,
-    ) -> Result<SendableRecordBatchStream, QueryChunkError> {
+        selection: Selection<'_>,
+    ) -> Result<SendableRecordBatchStream, DataFusionError> {
         self.check_error()?;
 
         // save the predicate
         self.predicates.lock().push(predicate.clone());
 
-        let batches = self.table_data.clone();
-        Ok(stream_from_batches(batches))
+        let batches = match self
+            .schema
+            .df_projection(selection)
+            .map_err(|e| DataFusionError::External(Box::new(e)))?
+        {
+            None => self.table_data.clone(),
+            Some(projection) => self
+                .table_data
+                .iter()
+                .map(|batch| {
+                    let batch = batch.project(&projection)?;
+                    Ok(Arc::new(batch))
+                })
+                .collect::<std::result::Result<Vec<_>, ArrowError>>()?,
+        };
+
+        Ok(stream_from_batches(self.schema().as_arrow(), batches))
     }
 
     fn chunk_type(&self) -> &str {
@@ -937,7 +966,7 @@ impl QueryChunk for TestChunk {
     fn apply_predicate_to_metadata(
         &self,
         predicate: &Predicate,
-    ) -> Result<PredicateMatch, QueryChunkError> {
+    ) -> Result<PredicateMatch, DataFusionError> {
         self.check_error()?;
 
         // save the predicate
@@ -956,7 +985,7 @@ impl QueryChunk for TestChunk {
         _ctx: IOxSessionContext,
         _column_name: &str,
         _predicate: &Predicate,
-    ) -> Result<Option<StringSet>, QueryChunkError> {
+    ) -> Result<Option<StringSet>, DataFusionError> {
         // Model not being able to get column values from metadata
         Ok(None)
     }
@@ -966,7 +995,7 @@ impl QueryChunk for TestChunk {
         _ctx: IOxSessionContext,
         predicate: &Predicate,
         selection: Selection<'_>,
-    ) -> Result<Option<StringSet>, QueryChunkError> {
+    ) -> Result<Option<StringSet>, DataFusionError> {
         self.check_error()?;
 
         // save the predicate
@@ -1003,7 +1032,7 @@ impl QueryChunkMeta for TestChunk {
         self.partition_sort_key.as_ref()
     }
 
-    fn partition_id(&self) -> Option<PartitionId> {
+    fn partition_id(&self) -> PartitionId {
         self.partition_id
     }
 
